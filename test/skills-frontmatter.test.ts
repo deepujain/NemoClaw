@@ -118,7 +118,7 @@ describe("repo skill markdown files", () => {
     const skill = fs.readFileSync(path.join(skillRoot, "SKILL.md"), "utf8");
     const evals = JSON.parse(
       fs.readFileSync(path.join(skillRoot, "evals", "evals.json"), "utf8"),
-    ) as Array<{ id: string; expected_skill: string | null }>;
+    ) as Array<{ id: string; expected_skill: string | null; expected_behavior: string[] }>;
 
     expect(skill).toContain("../_shared/implementation-discovery.md");
     expect(skill).toContain("../_shared/code-change-considerations.md");
@@ -166,6 +166,27 @@ describe("repo skill markdown files", () => {
     expect(evals.find(({ id }) => id === "positive-bare-plan-trigger")?.expected_skill).toBe(
       "nemoclaw-contributor-plan-issue",
     );
+    const barePlanBehavior = evals
+      .find(({ id }) => id === "positive-bare-plan-trigger")
+      ?.expected_behavior.join("\n");
+    expect(barePlanBehavior).toContain("# Issue #8378:");
+    const requiredReportHeadings = [
+      "## Requested outcome, confirmed scope, and current owner",
+      "## Related work and delivery constraints",
+      "## Current state and decisions",
+      "## Observable acceptance examples",
+      "## Capability slices",
+      "## Delivery order",
+      "## GitHub writes",
+    ];
+    let previousHeadingIndex = skill.indexOf("# Issue #<number>: <title>");
+    expect(previousHeadingIndex).toBeGreaterThanOrEqual(0);
+    for (const heading of requiredReportHeadings) {
+      expect(barePlanBehavior).toContain(heading);
+      const headingIndex = skill.indexOf(heading, previousHeadingIndex + 1);
+      expect(headingIndex).toBeGreaterThan(previousHeadingIndex);
+      previousHeadingIndex = headingIndex;
+    }
     expect(evals.find(({ id }) => id === "clean-context-refinement")?.expected_skill).toBe(
       "nemoclaw-contributor-plan-issue",
     );

@@ -19,7 +19,7 @@
     "ground_truth": "The documented bare trigger loads the planning workflow and returns the exact structured report rather than free-form prose or implementation code.",
     "expected_behavior": [
       "Uses `nemoclaw-contributor-plan-issue`.",
-      "Starts with `# Issue #8378:` and preserves every required level-two report heading through `## GitHub writes`.",
+      "Starts with `# Issue #8378:` and preserves these ordered headings: `## Requested outcome, confirmed scope, and current owner`, `## Related work and delivery constraints`, `## Current state and decisions`, `## Observable acceptance examples`, `## Capability slices`, `## Delivery order`, and `## GitHub writes`.",
       "Names the requested outcome, confirmed scope authority, current behavior owner, and assigned implementation owner.",
       "Provides security-boundary risks, controls, and required negative evidence rather than leaving the section empty.",
       "Provides Allowed, Denied, Ambiguous, and Failure or recovery acceptance examples with observable results and test evidence, or states why a category does not apply.",
