@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+name: Observe rebased commit associations
+on:
+  pull_request_target:
+    branches: [ws-14253-association-observation]
+    types: [closed]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  observe:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Capture every rewritten commit without checkout
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_COMMIT_COUNT: ${{ github.event.pull_request.commits }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$PR_COMMIT_COUNT" =~ ^[1-9][0-9]{0,8}$ ]]
+          [[ "$MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          evidence="$RUNNER_TEMP/association-observation"
+          mkdir -p "$evidence"
+          cp "$GITHUB_EVENT_PATH" "$evidence/closed-event.json"
+          parent="$MERGE_SHA"
+          false_negatives=0
+          : > "$evidence/introduced.jsonl"
+          for ((index=0; index<PR_COMMIT_COUNT; index++)); do
+            gh api "repos/$GITHUB_REPOSITORY/commits/$parent" > "$evidence/commit-$index.json"
+            next="$(jq -er --arg sha "$parent" 'if .sha == $sha and (.parents | type == "array" and length == 1 and all(.[]; (.sha | type == "string" and test("^[0-9a-f]{40}$")))) then .parents[0].sha else error("Expected one valid rebase parent") end' "$evidence/commit-$index.json")"
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$parent/pulls?per_page=100" > "$evidence/associations-$index.json"
+            associated="$(jq -er --argjson pr "$PR_NUMBER" 'if type == "array" and length > 0 and all(.[]; type == "array" and all(.[]; (.number | type) == "number" and .number > 0 and .number == (.number | floor))) then {associated:any(.[][]; .number == $pr)} else error("Invalid association pages") end | .associated | tostring' "$evidence/associations-$index.json")"
+            jq -nc --argjson index "$index" --arg sha "$parent" --argjson associated "$associated" '{index:$index,sha:$sha,associated:$associated}' >> "$evidence/introduced.jsonl"
+            if [ "$associated" = false ]; then false_negatives=$((false_negatives+1)); fi
+            parent="$next"
+          done
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$parent/pulls?per_page=100" > "$evidence/boundary-associations.json"
+          jq -n --arg repository "$GITHUB_REPOSITORY" --argjson pr "$PR_NUMBER" --arg merge "$MERGE_SHA" \
+            --arg boundary "$parent" --arg workflow "$GITHUB_WORKFLOW_SHA" --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" --arg observed "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson false_negatives "$false_negatives" --slurpfile introduced "$evidence/introduced.jsonl" \
+            '{repository:$repository,pr:$pr,merge:$merge,boundary:$boundary,workflow_revision:$workflow,run_id:$run,run_attempt:$attempt,observed_at:$observed,introduced:$introduced,false_negatives:$false_negatives,candidate_reporter_executed:false}' > "$evidence/receipt.json"
+          cat "$evidence/receipt.json" >> "$GITHUB_STEP_SUMMARY"
+          test "$false_negatives" -eq 0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: association-observation-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/association-observation
+          retention-days: 90
