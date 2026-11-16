@@ -973,3 +973,5 @@ mod tests {
         assert!(render(&report).contains("| skipped | unavailable |"));
     }
 }
+
+// Hosted observation: report this change with the trusted pre-merge reporter.
