@@ -9,7 +9,14 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 import YAML from "yaml";
+import {
+  FULL_E2E_STANDARD_PROFILE_JOB_TIMEOUT_MINUTES,
+  FULL_E2E_STANDARD_PROFILE_POST_TEST_MINUTES,
+  FULL_E2E_STANDARD_PROFILE_PRE_TEST_MINUTES,
+  FULL_E2E_TEST_TIMEOUT_MINUTES,
+} from "../../../tools/e2e/full-e2e-timeout-contract.mts";
 import { validateStandardProfileWorkflowBoundary } from "../../../tools/e2e/standard-profile-workflow-boundary.mts";
+import { catalogueTarget } from "../../../tools/e2e/target-catalogue.mts";
 import { readWorkflow } from "../../helpers/e2e-workflow-contract";
 
 const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -17,6 +24,90 @@ const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", 
 describe("standard E2E execution profile", () => {
   it("accepts the catalogue callers and reusable profile", () => {
     expect(validateStandardProfileWorkflowBoundary(readWorkflow())).toEqual([]);
+  });
+
+  it.each<
+    [string, (steps: Array<{ name: string; with?: Record<string, string>; if?: string }>) => void]
+  >([
+    [
+      "early install",
+      (steps) => {
+        steps.find((step) => step.name === "Prepare E2E workspace")!.with!["install-dependencies"] =
+          "true";
+      },
+    ],
+    [
+      "late archive",
+      (steps) => {
+        const index = steps.findIndex(
+          (step) => step.name === "Download reviewed OpenShell SDK archive",
+        );
+        const [archive] = steps.splice(index, 1);
+        steps.push(archive);
+      },
+    ],
+    [
+      "conditional install",
+      (steps) => {
+        steps.find(
+          (step) =>
+            step.name === "Install reviewed OpenShell SDK archive without package credentials",
+        )!.if = "${{ false }}";
+      },
+    ],
+  ])("rejects %s in the reviewed SDK handoff", (_scenario, mutate) => {
+    const profile = YAML.parse(
+      fs.readFileSync(path.join(REPO_ROOT, ".github/workflows/e2e-standard-profile.yaml"), "utf8"),
+    );
+    mutate(profile.jobs.run.steps);
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "sdk-profile-order-"));
+    try {
+      const profilePath = path.join(directory, "profile.yaml");
+      fs.writeFileSync(profilePath, YAML.stringify(profile));
+      expect(validateStandardProfileWorkflowBoundary(readWorkflow(), profilePath)).not.toEqual([]);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { field: "uses", value: "actions/setup-python@v7" },
+    { field: "if", value: "true" },
+    { field: "with", value: { "python-version": "3.14" } },
+    { field: "env", value: { UNREVIEWED_INPUT: "present" } },
+    { field: "run", value: "python3 --version" },
+  ])("rejects reintroduced Model Router Python $field", ({ field, value }) => {
+    const profile = YAML.parse(
+      fs.readFileSync(path.join(REPO_ROOT, ".github/workflows/e2e-standard-profile.yaml"), "utf8"),
+    ) as { jobs: { run: { steps: Array<Record<string, unknown>> } } };
+    const python: Record<string, unknown> = {
+      name: "Set up supported Model Router Python",
+      [field]: value,
+    };
+    profile.jobs.run.steps.push(python);
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-router-python-"));
+    const profilePath = path.join(directory, "profile.yaml");
+    try {
+      fs.writeFileSync(profilePath, YAML.stringify(profile));
+      expect(validateStandardProfileWorkflowBoundary(readWorkflow(), profilePath)).toContain(
+        "standard E2E profile must keep its reviewed step set and order",
+      );
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reserves the standard full-E2E setup, test, and artifact envelope", () => {
+    // The original 70-minute path now includes native configuration and plugin lifecycle work.
+    expect(FULL_E2E_TEST_TIMEOUT_MINUTES).toBeGreaterThanOrEqual(100);
+    expect(catalogueTarget("full-e2e").timeoutMinutes).toBe(
+      FULL_E2E_STANDARD_PROFILE_JOB_TIMEOUT_MINUTES,
+    );
+    expect(FULL_E2E_STANDARD_PROFILE_JOB_TIMEOUT_MINUTES).toBe(
+      FULL_E2E_STANDARD_PROFILE_PRE_TEST_MINUTES +
+        FULL_E2E_TEST_TIMEOUT_MINUTES +
+        FULL_E2E_STANDARD_PROFILE_POST_TEST_MINUTES,
+    );
   });
 
   it("rejects a cloudflared PATH shortcut before package verification", () => {
@@ -58,8 +149,7 @@ describe("standard E2E execution profile", () => {
     const workflow = readWorkflow() as {
       jobs: Record<string, { secrets: Record<string, string> }>;
     };
-    workflow.jobs["catalogue-nvidia-api"]!.secrets.NVIDIA_API_KEY =
-      "${{ secrets.NVIDIA_API_KEY }}";
+    workflow.jobs["catalogue-nvidia-api"]!.secrets.NVIDIA_API_KEY = "${{ secrets.NVIDIA_API_KEY }}";
 
     expect(validateStandardProfileWorkflowBoundary(workflow)).toContain(
       "catalogue-nvidia-api must receive only its profile secrets",
@@ -70,11 +160,11 @@ describe("standard E2E execution profile", () => {
     const workflow = readWorkflow() as {
       jobs: Record<string, { with: Record<string, string> }>;
     };
-    workflow.jobs["catalogue-brave-nvidia-inference"]!.with.trusted_main =
+    workflow.jobs["catalogue-nvidia-inference"]!.with.trusted_main =
       "${{ github.repository == 'NVIDIA/NemoClaw' && github.ref == 'refs/heads/main' }}";
 
     expect(validateStandardProfileWorkflowBoundary(workflow)).toContain(
-      "catalogue-brave-nvidia-inference must pass trusted_main from the catalogue matrix",
+      "catalogue-nvidia-inference must pass trusted_main from the catalogue matrix",
     );
   });
 
@@ -92,6 +182,55 @@ describe("standard E2E execution profile", () => {
         "catalogue-standard must pass risk_signal_expected_sha from the catalogue matrix",
         "catalogue-standard must pass risk_signal_correlation_id from the catalogue matrix",
       ]),
+    );
+  });
+
+  it("passes the reusable managed-image revision through every catalogue profile", () => {
+    const workflow = readWorkflow() as {
+      jobs: Record<string, { needs: string[]; with: Record<string, string> }>;
+    };
+    workflow.jobs["catalogue-nvidia-inference"]!.needs = ["generate-matrix"];
+    workflow.jobs["catalogue-nvidia-inference"]!.with.managed_image_revision =
+      "${{ inputs.checkout_sha }}";
+
+    expect(validateStandardProfileWorkflowBoundary(workflow)).toEqual(
+      expect.arrayContaining([
+        "catalogue-nvidia-inference must call the standard E2E profile after matrix generation, base-image publication, and SDK packaging",
+        "catalogue-nvidia-inference must pass managed_image_revision from the catalogue matrix",
+      ]),
+    );
+  });
+
+  it("rejects a catalogue SDK dependency that is restricted to another target", () => {
+    const workflow = readWorkflow() as { jobs: Record<string, { if?: string }> };
+    workflow.jobs["package-openshell-sdk"]!.if = "${{ inputs.jobs == 'external-gateway-health' }}";
+    expect(validateStandardProfileWorkflowBoundary(workflow)).toContain(
+      "catalogue profiles require SDK packaging with package-read permission whenever candidate compilation is selected",
+    );
+  });
+
+  it("requires the SDK producer to include an available reviewed transition replacement", () => {
+    const workflow = readWorkflow() as {
+      jobs: Record<string, { steps: Array<{ run?: string; name?: string }> }>;
+    };
+    const packageStep = workflow.jobs["package-openshell-sdk"]!.steps.find(
+      (step) => step.name === "Download and verify reviewed OpenShell SDK packages",
+    )!;
+    packageStep.run = packageStep.run!.replace(
+      "packageReviewedOpenShellSdk(output, 'if-present'",
+      "packageReviewedOpenShellSdk(output, 'exclude'",
+    );
+
+    expect(validateStandardProfileWorkflowBoundary(workflow)).toContain(
+      "catalogue SDK packaging must admit candidate identities and retain reviewed main and exact-base packages",
+    );
+  });
+
+  it("rejects a catalogue caller that does not consume its SDK artifact", () => {
+    const workflow = readWorkflow() as { jobs: Record<string, { with: Record<string, string> }> };
+    workflow.jobs["catalogue-nvidia-inference"]!.with.openshell_sdk_artifact_name = "unrelated";
+    expect(validateStandardProfileWorkflowBoundary(workflow)).toContain(
+      "catalogue-nvidia-inference must pass openshell_sdk_artifact_name from the catalogue matrix",
     );
   });
 
@@ -131,6 +270,7 @@ describe("standard E2E execution profile", () => {
             if?: string;
             name?: string;
             run?: string;
+            uses?: string;
             with?: Record<string, string>;
           }>;
         };
@@ -140,10 +280,13 @@ describe("standard E2E execution profile", () => {
     steps.find((step) => step.name === "Validate catalogue execution plan")!.run = "echo skipped";
     steps.find((step) => step.name === "Provision trusted Hermes E2E swap")!.run +=
       "\necho candidate-controlled";
-    steps.find((step) => step.name === "Add swap for Hermes image rebuild")!.run =
-      "echo unsafe swap";
     steps.find((step) => step.name === "Install reviewed cloudflared")!.run =
       "sudo apt-get install cloudflared";
+    steps.find((step) => step.name === "Download reviewed OpenShell SDK archive")!.with!.name =
+      "unrelated";
+    steps.find(
+      (step) => step.name === "Install reviewed OpenShell SDK archive without package credentials",
+    )!.uses = "./.github/actions/install-reviewed-openshell-sdk";
     steps.find((step) => step.name === "Initialize runner comparison telemetry")!.run =
       "echo skipped";
     steps.find((step) => step.name === "Run catalogue E2E target")!.env!.COMPATIBLE_API_KEY =
@@ -161,8 +304,9 @@ describe("standard E2E execution profile", () => {
         expect.arrayContaining([
           "standard E2E profile must derive validated execution paths before candidate checkout",
           "standard E2E profile must preserve trusted Hermes swap before candidate checkout",
-          "standard E2E profile must add the reviewed Hermes rebuild swap after CLI restore",
           "standard E2E profile must install only the reviewed cloudflared package",
+          "standard E2E profile must download the run-scoped reviewed SDK archive",
+          "standard E2E profile must install one reviewed SDK archive without credentials or package scripts",
           "standard E2E profile must initialize only planned trusted-main runner telemetry",
           "standard E2E profile must run the planned catalogue target with guarded secrets",
           "standard E2E profile must upload only the fixed skill-agent artifact set with the reviewed action",
@@ -193,7 +337,9 @@ describe("standard E2E execution profile", () => {
       CANDIDATE_REPOSITORY: "NVIDIA/NemoClaw",
       CANDIDATE_SHA: "a".repeat(40),
       CATALOGUE_ID: "hermes-inference-switch",
+      COVERAGE_VARIANT: "anthropic-podman",
       ENV: "/dev/null",
+      EXECUTION_ID: "hermes-inference-switch-anthropic-podman",
       GITHUB_ENV: githubEnvironment,
       GITHUB_OUTPUT: githubOutput,
       GITHUB_WORKSPACE_VALUE: directory,
@@ -202,6 +348,7 @@ describe("standard E2E execution profile", () => {
       INSTALL_MODE: "credential-free",
       LC_ALL: "C",
       PATH: process.env.PATH ?? "",
+      RUNTIME_PROVIDER: "podman",
       SHARD: "anthropic",
       TARGET_ID: "hermes-inference-switch",
       TEST_FILE: "test/e2e/live/hermes-inference-switch.test.ts",
@@ -216,11 +363,12 @@ describe("standard E2E execution profile", () => {
       expect(valid.status, valid.stderr).toBe(0);
       expect(fs.readFileSync(githubOutput, "utf8")).toBe(
         "artifact_directory=e2e-artifacts/live/hermes-inference-switch/anthropic\n" +
-          "upload_name=e2e-hermes-inference-switch-anthropic\n",
+          "upload_name=e2e-hermes-inference-switch-anthropic-podman\n",
       );
       expect(fs.readFileSync(githubEnvironment, "utf8")).toBe(
         `E2E_ARTIFACT_DIR=${directory}/e2e-artifacts/live/hermes-inference-switch/anthropic\n` +
-          "NEMOCLAW_E2E_SHARD=anthropic\n",
+          "NEMOCLAW_E2E_SHARD=anthropic\n" +
+          "NEMOCLAW_GATEWAY_RUNTIME=podman\n",
       );
 
       const unsafe = spawnSync("bash", [...shellArguments, planScript], {
@@ -245,16 +393,19 @@ describe("standard E2E execution profile", () => {
       (step) => step.name === "Write E2E evidence manifest",
     )!.run!;
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-evidence-manifest-"));
-    const artifactDirectory = path.join("e2e-artifacts", "live", "snapshot-commands");
+    const artifactDirectory = path.join("e2e-artifacts", "live", "onboard-resume");
     const environment = {
       ...process.env,
       ARTIFACT_DIRECTORY: artifactDirectory,
       CANDIDATE_REPOSITORY: "NVIDIA/NemoClaw",
       CANDIDATE_SHA: "a".repeat(40),
+      COVERAGE_VARIANT: "default-podman",
+      EXECUTION_ID: "onboard-resume-default-podman",
       JOB_STATUS: "success",
+      RUNTIME_PROVIDER: "podman",
       RUN_ATTEMPT: "2",
       RUN_ID: "123",
-      TARGET_ID: "snapshot-commands",
+      TARGET_ID: "onboard-resume",
       WORKFLOW_REPOSITORY: "NVIDIA/NemoClaw",
       WORKFLOW_SHA: "b".repeat(40),
     };
@@ -277,7 +428,10 @@ describe("standard E2E execution profile", () => {
         ),
       ).toEqual({
         kind: "nemoclaw-e2e-evidence-v1",
-        targetId: "snapshot-commands",
+        targetId: "onboard-resume",
+        executionId: "onboard-resume-default-podman",
+        coverageVariant: "default-podman",
+        runtimeProvider: "podman",
         candidate: { repository: "NVIDIA/NemoClaw", sha: "a".repeat(40) },
         workflow: {
           repository: "NVIDIA/NemoClaw",

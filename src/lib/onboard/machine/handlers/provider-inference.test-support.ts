@@ -119,6 +119,11 @@ export function createDeps(
       }),
     ),
     recoverManagedLlamaCpp: vi.fn(async () => false),
+    probeLlamaCppSandboxReachability: vi.fn(async () => ({
+      ok: true as const,
+      reason: "ok" as const,
+      networkName: "openshell",
+    })),
     surfaceReady: vi.fn(() => true),
     recordSkip: vi.fn(async () => createSession()),
     repairEvent: vi.fn(async () => createSession()),
@@ -126,18 +131,9 @@ export function createDeps(
     repair: vi.fn(),
     routeReady: vi.fn((_gatewayName: string, _provider: string, _model: string) => false),
     reconcileRouter: vi.fn(async () => undefined),
-    reupsertRoutedProvider: vi.fn(
-      (
-        _gatewayName: string,
-        _provider: string,
-        endpointUrl: string | null,
-        _credentialEnv: string | null,
-      ) => ({
-        ok: true as const,
-        endpointUrl: "http://host.openshell.internal:4000/v1",
-      }),
-    ),
+
     reserveRoute: vi.fn(() => true),
+    hasSandboxLifecycleAuthority: vi.fn(() => false),
     updateSandbox: vi.fn(),
     checkpointSandboxIdentity: vi.fn(async () => undefined),
     prepareLocalProviderForInference: vi.fn(async () => null),
@@ -156,6 +152,8 @@ export function createDeps(
       checkGatewayRouteCompatibility: calls.checkGatewayRouteCompatibility,
       preflightGatewayRouteDiscovery: calls.preflightGatewayRouteDiscovery,
       getSandboxRecoveryAuthority: (): "missing" => "missing",
+      withSandboxMutationLock: async <T>(_sandboxName: string, operation: () => Promise<T> | T) =>
+        await operation(),
       withGatewayRouteMutationLock: async <T>(
         _gatewayName: string,
         operation: () => Promise<T> | T,
@@ -174,6 +172,7 @@ export function createDeps(
       toSessionUpdates: (updates: Record<string, unknown>) => updates as SessionUpdates,
       skippedStepMessage: calls.skipped,
       ensureManagedLlamaCppResumeReady: calls.recoverManagedLlamaCpp,
+      probeLlamaCppSandboxReachability: calls.probeLlamaCppSandboxReachability,
       ensureResumeProviderReady: calls.recoverProvider,
       isResumeProviderSurfaceReady: calls.surfaceReady,
       recordStateSkipped: calls.recordSkip,
@@ -203,10 +202,10 @@ export function createDeps(
       getOpenshellBinary: () => "/usr/bin/openshell",
       needsBedrockRuntimeAdapter: () => false,
       isInferenceRouteReady: calls.routeReady,
-      isRoutedInferenceProvider: (provider: string) => provider === "nvidia-router",
-      reconcileModelRouter: calls.reconcileRouter,
-      reupsertRoutedProvider: calls.reupsertRoutedProvider,
+      hasNativeLocalProviderAuthority: vi.fn(() => true),
+
       reserveSandboxInferenceRoute: calls.reserveRoute,
+      hasSandboxLifecycleAuthority: calls.hasSandboxLifecycleAuthority,
       registryUpdateSandbox: calls.updateSandbox,
       checkpointSandboxIdentity: calls.checkpointSandboxIdentity,
       prepareLocalProviderForInference: calls.prepareLocalProviderForInference,

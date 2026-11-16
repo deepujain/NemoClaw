@@ -75,7 +75,7 @@ function versionedResolutionOptions(localBuild: "0" | "1" | undefined = undefine
       NEMOCLAW_INSTALL_REF: "v0.0.76",
       ...(localBuild === undefined ? {} : { NEMOCLAW_SANDBOX_BASE_LOCAL_BUILD: localBuild }),
     },
-    validationDescription: "deepagents-code==0.1.34",
+    validationDescription: "deepagents-code==0.1.55",
   };
 }
 
@@ -231,8 +231,12 @@ describe("sandbox base-image release resolution", () => {
       suppressOutput: true,
     });
     expect(dockerMocks.pull).toHaveBeenCalledTimes(1);
-    expect(state.validateImage).toHaveBeenNthCalledWith(1, RELEASE_REF);
-    expect(state.validateImage).toHaveBeenNthCalledWith(2, RELEASE_REF);
+    expect(state.validateImage).toHaveBeenNthCalledWith(1, RELEASE_REF, {
+      source: "version-tag",
+    });
+    expect(state.validateImage).toHaveBeenNthCalledWith(2, RELEASE_REF, {
+      source: "version-tag",
+    });
     expect(dockerMocks.build).toHaveBeenCalledTimes(1);
   });
 

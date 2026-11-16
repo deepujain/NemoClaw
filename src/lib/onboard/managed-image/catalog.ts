@@ -4,6 +4,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 
+import { CorporateCaValidationError } from "../corporate-ca-types";
 import {
   isManagedImagePlatform,
   MANAGED_IMAGE_CAPABILITY_CONTRACT_VERSION,
@@ -120,6 +121,7 @@ async function withRegistryFetch<T>(
     const { createManagedImageRegistryFetchSession } = await import("./registry-fetch");
     session = createManagedImageRegistryFetchSession({ environment });
   } catch (error) {
+    if (error instanceof CorporateCaValidationError) throw error;
     return invalid("registry transport could not be configured", { cause: error });
   }
   try {
@@ -442,8 +444,11 @@ function validateImageLabels(
   agent: ShippedManagedImageAgent,
   imageConfig: OciImageConfig,
   platform: ManagedImagePlatform,
+  expectedRelease?: string,
+  revisionPinnedRelease?: string,
 ): {
   readonly cohort: ManagedImagePublicationCohort;
+  readonly release: string;
   readonly revision: string;
 } {
   if (imageConfig.os !== "linux" || imageConfig.architecture !== platformArchitecture(platform)) {
@@ -473,8 +478,24 @@ function validateImageLabels(
   if (typeof cohort !== "string" || !COHORT_PATTERN.test(cohort)) {
     return invalid(`'${agent}' image publication cohort is not a supported identity`);
   }
+  const imageRelease = labels["org.opencontainers.image.version"];
+  // Older main publications used `latest` as metadata. Only an exact source
+  // revision can bind that legacy label to the requested release.
+  const release =
+    typeof imageRelease === "string" && RELEASE_PATTERN.test(imageRelease)
+      ? imageRelease
+      : imageRelease === "latest" && revisionPinnedRelease !== undefined
+        ? revisionPinnedRelease
+        : null;
+  if (release === null) {
+    return invalid(`'${agent}' image release is not a supported release version`);
+  }
+  if (expectedRelease !== undefined && release !== expectedRelease) {
+    return invalid(`'${agent}' image release does not match the expected release`);
+  }
   return {
     cohort: cohort as ManagedImagePublicationCohort,
+    release,
     revision,
   };
 }
@@ -493,6 +514,7 @@ async function resolveManagedImageContractAtReferenceFromGhcr(options: {
   readonly release: string;
   readonly fetchImpl: Fetch;
   readonly expectedCohort?: ManagedImagePublicationCohort;
+  readonly expectedRelease?: string;
   readonly expectedRevision?: string;
   readonly platform: ManagedImagePlatform;
 }): Promise<ManagedImageContractV1> {
@@ -513,7 +535,13 @@ async function resolveManagedImageContractAtReferenceFromGhcr(options: {
     configDigest(imageManifest),
     root.token,
   );
-  const identity = validateImageLabels(agent, imageConfig, options.platform);
+  const identity = validateImageLabels(
+    agent,
+    imageConfig,
+    options.platform,
+    options.expectedRelease,
+    options.expectedRevision === undefined ? undefined : release,
+  );
   if (options.expectedCohort !== undefined && identity.cohort !== options.expectedCohort) {
     return invalid(`'${agent}' image publication cohort does not match the OpenClaw cohort`);
   }
@@ -531,7 +559,7 @@ async function resolveManagedImageContractAtReferenceFromGhcr(options: {
     source: {
       repository: MANAGED_IMAGE_SOURCE_REPOSITORY,
       revision: identity.revision,
-      release,
+      release: identity.release,
       cohort: identity.cohort,
     },
     startupProfileContractVersion: MANAGED_IMAGE_STARTUP_PROFILE_CONTRACT_VERSION,
@@ -566,6 +594,7 @@ export async function resolveManagedImageContractFromGhcr(options: {
       release,
       platform,
       fetchImpl,
+      expectedRelease: release,
     }),
   );
 }
@@ -593,6 +622,7 @@ export async function resolveManagedImageCatalogFromGhcr(options: {
       platform,
       fetchImpl,
       ...(revision === undefined ? {} : { expectedRevision: revision }),
+      ...(revision === undefined ? { expectedRelease: release } : {}),
     });
     const cohortReference = `cohort-${openclaw.source.cohort}`;
     const dependentResults = await Promise.allSettled(
@@ -603,10 +633,11 @@ export async function resolveManagedImageCatalogFromGhcr(options: {
             await resolveManagedImageContractAtReferenceFromGhcr({
               agent,
               reference: cohortReference,
-              release,
+              release: openclaw.source.release,
               platform,
               fetchImpl,
               expectedCohort: openclaw.source.cohort,
+              expectedRelease: openclaw.source.release,
               expectedRevision: openclaw.source.revision,
             }),
           ] as const,

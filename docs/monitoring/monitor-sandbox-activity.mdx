@@ -27,8 +27,10 @@ Run the status command to view sandbox state, gateway health, and the active inf
 $$nemoclaw <name> status
 ```
 
-`$$nemoclaw <name> status` probes `https://inference.local/v1/models` from inside the sandbox as the authoritative inference check.
+On a normal read with verified gateway and sandbox state, `$$nemoclaw <name> status` checks an available selected provider path from inside the sandbox as the authoritative inference check. Shared providers use `https://inference.local/v1/models`. NVIDIA Endpoints, supported fixed hosted providers, new hosted compatible endpoints outside the Personal tier, and qualified new local selections verify the recorded sandbox-attached OpenShell provider with an inference request to its native endpoint. A fresh Personal-tier hosted compatible selection verifies the shared route and has no native attachment.
 For local Ollama and local vLLM routes, it also prints labeled host-side backend diagnostics that help identify which hop failed.
+
+During ordinary lifecycle contention, status can return a read-only snapshot only when receipt and registry checks confirm that no conflicting lifecycle authority exists before and after the read. The snapshot shows `Inference: not probed (another lifecycle operation is in progress)` and `inferenceProbeSuppressed: true` in JSON. If a conflicting authority exists, cannot be checked, or appears during the read, status rejects the snapshot and reports lifecycle contention. A snapshot can still observe a shared route, but it does not verify inference health. Wait for the lifecycle operation to finish and rerun status before using the result as inference evidence.
 
 Review these output fields.
 
@@ -57,6 +59,11 @@ $$nemoclaw <name> logs --follow
 The `logs` command shows lifecycle and gateway output.
 It does not export the structured per-session agent state that OpenClaw stores under `.openclaw/agents/`.
 
+<AgentOnly variant="openclaw">
+OpenClaw gateway log lines use the `[gateway]` prefix unless the gateway already supplied that prefix.
+OpenShell log lines keep their existing source tags.
+</AgentOnly>
+
 ## Inspect Agent Session State
 
 OpenClaw stores structured session state inside the sandbox.
@@ -74,14 +81,16 @@ Inspect the session directory from the host by running a sandbox command.
 $$nemoclaw <name> exec -- ls -lh /sandbox/.openclaw/agents/main/sessions
 ```
 
-Copy a session log for offline review with the OpenShell sandbox download command.
+List the stored session keys, then export the session you need for offline review.
 
 ```bash
-openshell sandbox download <name> /sandbox/.openclaw/agents/main/sessions/<session-id>.jsonl .
+$$nemoclaw <name> sessions list
+$$nemoclaw <name> sessions export <key>
 ```
 
 Handle exported session logs as sensitive data.
 They can contain prompts, tool inputs, tool outputs, file paths, and cost metadata from the agent run.
+The export command copies only the selected session files and writes them owner-only (`0600`).
 
 ## Monitor Network Activity in the TUI
 
@@ -123,7 +132,9 @@ If the request fails, check these items.
 1. Run `$$nemoclaw <name> status` to confirm the active provider and endpoint.
    Check the main `Inference` line first.
    If it shows `unauthorized`, `unhealthy`, `unreachable`, or `not probed`, inspect the labeled upstream, local-backend, and auth-proxy diagnostics to identify the failing hop.
+   Refresh the provider credential when the main result is `unauthorized`.
    Restart a local backend only when its own diagnostic fails.
+   For auth-proxy diagnostics and topology-specific recovery, follow [Inference requests time out](../reference/troubleshooting#inference-requests-time-out).
 2. Run `$$nemoclaw <name> logs --follow` to view error messages from the blueprint runner.
 3. Verify that the host can reach the inference endpoint.
 4. If the agent reports a context-overflow or token-limit error, clear the conversation with `/reset` (or start a fresh one with `/new`) in the TUI before retrying.

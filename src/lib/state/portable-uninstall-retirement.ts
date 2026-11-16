@@ -4,13 +4,17 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { TextDecoder } from "node:util";
 import { isErrnoException } from "../core/errno";
+import { shellQuote } from "../core/shell-quote";
 import {
   acquireProcessBoundLockAt,
   releaseProcessBoundLock,
+  tryAcquireProcessBoundLockAt,
   type ProcessBoundLockHandle,
+  type RegistryLockDeps,
 } from "./registry/lock";
 
 const NAMES = {
@@ -32,6 +36,11 @@ const MAX_UINT64 = (1n << 64n) - 1n;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
 
 export const PORTABLE_RETIREMENT_STATE_ENTRIES = Object.values(NAMES);
+
+export function isPortableUninstallMissingPathError(error: unknown): boolean {
+  return isErrnoException(error) && error.code === "ENOENT";
+}
+
 type Role = "config" | "receipt" | "registry";
 type Target = readonly [
   Role,
@@ -98,6 +107,49 @@ const tails = new Map<string, Promise<void>>();
 
 export const portableHostFencePath = (homeDir: string): string =>
   path.join(homeDir, ".nemoclaw-portable-host.lock");
+export const PORTABLE_HOST_FENCE_BUSY_MESSAGE =
+  "Host maintenance is in progress. Retry this command after it completes.";
+
+/** Require the current asynchronous operation to own the exact Portable host fence. */
+export function assertCurrentPortableHostFenceHeld(homeDir: string): void {
+  if (!isCurrentPortableHostFenceHeld(homeDir)) {
+    throw new Error("Portable host authority mutation requires the current HOME fence");
+  }
+}
+
+/** Report whether the current asynchronous operation owns the exact host fence. */
+export function isCurrentPortableHostFenceHeld(homeDir: string): boolean {
+  const owner = owners.getStore();
+  return owner?.active === true && owner.path === portableHostFencePath(homeDir);
+}
+
+/** Resolve the portable state root while admitting only the isolated Vitest override. */
+export function defaultPortableStateDir(env: NodeJS.ProcessEnv): string {
+  if (
+    env.VITEST === "true" &&
+    (env.HOME ?? "") === env.NEMOCLAW_TEST_BASE_HOME &&
+    env.NEMOCLAW_TEST_STATE_DIR &&
+    path.isAbsolute(env.NEMOCLAW_TEST_STATE_DIR)
+  ) {
+    return env.NEMOCLAW_TEST_STATE_DIR;
+  }
+  return path.join(env.HOME || os.homedir(), ".nemoclaw");
+}
+
+/** Count bounded schema-5 authority leaves while the caller holds the host fence. */
+export function getHermesPortableHostAuthorityEntryCount(stateDir: string): number {
+  return readPortableAuthorityDirectory(path.join(stateDir, "hermes-portable-lifecycle"), false)
+    .entries.length;
+}
+
+/** Reject host-wide legacy work while schema-5 receipt authority exists. */
+export function assertNoHermesPortableHostAuthority(stateDir: string, commandId: string): void {
+  if (getHermesPortableHostAuthorityEntryCount(stateDir) > 0) {
+    throw new Error(
+      `Command '${commandId}' is not supported while an experimental Hermes portable lifecycle receipt exists. No legacy Docker or OpenShell action was attempted.`,
+    );
+  }
+}
 
 function releaseFenceReference(owner: FenceOwner): void {
   owner.references -= 1;
@@ -107,6 +159,7 @@ function releaseFenceReference(owner: FenceOwner): void {
 export async function withPortableHostFence<T>(
   homeDir: string,
   operation: () => Promise<T> | T,
+  lockDeps: RegistryLockDeps = {},
 ): Promise<T> {
   const lockPath = portableHostFencePath(homeDir);
   const inherited = owners.getStore();
@@ -132,7 +185,7 @@ export async function withPortableHostFence<T>(
     const drained = new Promise<void>((resolve) => (resolveDrained = resolve));
     owner = {
       active: true,
-      handle: acquireProcessBoundLockAt(lockPath),
+      handle: acquireProcessBoundLockAt(lockPath, lockDeps),
       path: lockPath,
       references: 1,
       released: false,
@@ -172,6 +225,93 @@ export async function withPortableHostFence<T>(
   }
 }
 
+/**
+ * Run a short critical operation only if the host fence is immediately
+ * available. This is for callers that already hold narrower lifecycle locks:
+ * waiting here could invert the host -> sandbox lock order. Contention fails
+ * closed so the caller can release its locks and retry the command.
+ */
+export async function withPortableHostFenceTry<T>(
+  homeDir: string,
+  operation: () => Promise<T> | T,
+): Promise<T> {
+  const lockPath = portableHostFencePath(homeDir);
+  const inherited = owners.getStore();
+  if (inherited?.path === lockPath) {
+    if (!inherited.active) throw new Error("Portable host fence owner is inactive");
+    inherited.references += 1;
+    try {
+      return await operation();
+    } finally {
+      releaseFenceReference(inherited);
+    }
+  }
+  if (tails.has(lockPath)) {
+    throw new Error(PORTABLE_HOST_FENCE_BUSY_MESSAGE);
+  }
+
+  let finish!: () => void;
+  const turn = new Promise<void>((resolve) => (finish = resolve));
+  tails.set(lockPath, turn);
+  let owner: FenceOwner | null = null;
+  let onExit: (() => void) | null = null;
+  try {
+    const handle = tryAcquireProcessBoundLockAt(lockPath);
+    if (!handle) {
+      throw new Error(PORTABLE_HOST_FENCE_BUSY_MESSAGE);
+    }
+    let resolveDrained!: () => void;
+    const drained = new Promise<void>((resolve) => (resolveDrained = resolve));
+    owner = {
+      active: true,
+      handle,
+      path: lockPath,
+      references: 1,
+      released: false,
+      drained,
+      resolveDrained,
+    };
+    onExit = () => {
+      if (!owner?.active) return;
+      owner.active = false;
+      owner.released = true;
+      try {
+        releaseProcessBoundLock(owner.handle);
+      } catch {
+        // Exit cannot recover; generation-safe release preserves ambiguity.
+      }
+    };
+    process.once("exit", onExit);
+    return await owners.run(owner, operation);
+  } finally {
+    try {
+      if (owner?.active) owner.active = false;
+      if (owner) {
+        releaseFenceReference(owner);
+        await owner.drained;
+      }
+      if (onExit) process.removeListener("exit", onExit);
+      if (owner && !owner.released) {
+        owner.released = true;
+        releaseProcessBoundLock(owner.handle);
+      }
+    } finally {
+      if (tails.get(lockPath) === turn) tails.delete(lockPath);
+      finish();
+    }
+  }
+}
+
+/** Hold the portable host fence for the current process home without a second state owner. */
+export function withCurrentPortableHostFence<T>(operation: () => Promise<T> | T): Promise<T> {
+  return withPortableHostFence(process.env.HOME || os.homedir(), operation);
+}
+
+/** Try the portable host fence for the current process home without waiting. */
+export function withCurrentPortableHostFenceTry<T>(operation: () => Promise<T> | T): Promise<T> {
+  return withPortableHostFenceTry(process.env.HOME || os.homedir(), operation);
+}
+
 const root = (homeDir: string): string => path.join(homeDir, ".nemoclaw");
 const paths = (homeDir: string) =>
   Object.fromEntries(
@@ -205,9 +345,52 @@ function sameStat(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
     (key) => left[key as keyof fs.BigIntStats] === right[key as keyof fs.BigIntStats],
   );
 }
+
+/**
+ * Name the property that makes a portable authority directory unsafe.
+ *
+ * One message covered all six conditions, so an operator could not tell which
+ * check failed or how to correct it. The mode check is the one an ordinary
+ * `mkdir -p` reaches, so it carries its own remedy (#10740).
+ */
+function unsafeAuthorityDirectoryReason(
+  before: fs.BigIntStats,
+  named: fs.BigIntStats,
+  uid: number | undefined,
+  permitAnyMode: boolean,
+  directory: string,
+): string | null {
+  if (uid === undefined)
+    return "The process cannot identify the current user. Run NemoClaw in a process that reports a current user id.";
+  if (!before.isDirectory())
+    return "The path is not a directory. Use a current-user directory at this path with mode 0700.";
+  if (named.isSymbolicLink())
+    return "The path is a symbolic link. Use a current-user directory at this path with mode 0700; symbolic links are not accepted.";
+  if (!sameStat(before, named))
+    return "The path changed while it was being read. Retry after other processes stop changing this path.";
+  if (before.uid !== BigInt(uid))
+    return "The directory is not owned by the current user. Run NemoClaw as the directory owner, or correct the directory owner before retrying.";
+  if (!permitAnyMode && (before.mode & 0o777n) !== 0o700n) {
+    const mode = (before.mode & 0o777n).toString(8).padStart(4, "0");
+    return `The directory must be owner-private (mode 0700) but is ${mode}. Run \`chmod 700 ${shellQuote(directory)}\`.`;
+  }
+  if (before.nlink < 1n)
+    return "The directory must remain linked at this path. Restore a current-user directory with mode 0700, then retry.";
+  return null;
+}
+
+/**
+ * Read one portable authority directory.
+ *
+ * `permitAnyMode` is for the uninstall leftover check alone, which reads a
+ * directory an abandoned run left behind rather than one NemoClaw created, so
+ * the owner-private requirement cannot apply to it. The owner, symlink, link
+ * count, identity and entry-count checks still bound what it can read.
+ */
 export function readPortableAuthorityDirectory(
   directory: string,
   required: boolean,
+  permitAnyMode = false,
 ): PortableAuthorityDirectorySnapshot {
   let descriptor: number | null = null;
   try {
@@ -218,16 +401,8 @@ export function readPortableAuthorityDirectory(
     const before = fs.fstatSync(descriptor, { bigint: true });
     const named = fs.lstatSync(directory, { bigint: true });
     const uid = process.getuid?.();
-    if (
-      uid === undefined ||
-      !before.isDirectory() ||
-      named.isSymbolicLink() ||
-      !sameStat(before, named) ||
-      before.uid !== BigInt(uid) ||
-      (before.mode & 0o777n) !== 0o700n ||
-      before.nlink < 1n
-    )
-      throw new Error(`Unsafe portable authority directory: ${directory}`);
+    const reason = unsafeAuthorityDirectoryReason(before, named, uid, permitAnyMode, directory);
+    if (reason) throw new Error(`Unsafe portable authority directory: ${directory}. ${reason}`);
     const entries = fs.readdirSync(directory).sort();
     if (entries.length > MAX_DIRECTORY_ENTRIES)
       throw new Error(`Portable authority directory has too many entries: ${directory}`);

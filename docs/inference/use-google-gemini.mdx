@@ -10,7 +10,8 @@ content:
   type: "how_to"
 ---
 The Google Gemini provider routes NemoClaw to Google's OpenAI-compatible Chat Completions endpoint.
-The sandbox continues to use the managed `inference.local` route.
+The agent calls `https://generativelanguage.googleapis.com/v1beta/openai/` through a sandbox-attached OpenShell provider.
+OpenShell injects the credential; the sandbox receives only a placeholder.
 
 ## Credential
 
@@ -21,12 +22,14 @@ NemoClaw keeps the credential on the host and uses provider-aware validation dur
 
 The onboarding wizard offers these curated model IDs.
 
+- `gemini-3.6-flash`.
 - `gemini-3.1-pro-preview`.
 - `gemini-3.1-flash-lite-preview`.
 - `gemini-3-flash-preview`.
 - `gemini-2.5-pro`.
-- `gemini-2.5-flash`.
 - `gemini-2.5-flash-lite`.
+
+The wizard selects `gemini-3.6-flash` by default.
 
 ## Onboard
 
@@ -74,6 +77,12 @@ Model validation can fail with these messages:
   The validation request failed.
   The output shows the provider, model, and API base URL.
   Compare these values with your configuration.
+- `Validation probe summary: Chat Completions API: HTTP 400.`
+  This result comes from Google's OpenAI-compatible `/v1beta/openai/chat/completions` runtime route.
+  NemoClaw omits the provider response because it can contain credentials.
+  If the error identifies a credential failure, verify or rotate `GEMINI_API_KEY`, then retry onboarding.
+  If you selected another model, set `NEMOCLAW_MODEL=gemini-3.6-flash` in the original onboarding command and retry.
+  If you already selected the default, verify that the selected model has OpenAI-compatible function-calling access for this API key in Google AI Studio.
 - `Validation probe summary: Chat Completions API: HTTP 404.`
   This result comes from Google's OpenAI-compatible `/v1beta/openai/chat/completions` runtime route, not the native `/v1beta/models` catalog.
   A model appearing in the native catalog does not prove that the runtime route can serve it.

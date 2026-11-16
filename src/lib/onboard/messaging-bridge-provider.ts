@@ -1,28 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Generic messaging-channel "bridge provider" wiring.
+// Messaging-channel custom provider-profile wiring.
 //
-// A messaging channel that mints its outbound token gateway-side (so the
-// secret never enters the sandbox) declares an OpenShell provider profile
+// A messaging channel that needs a custom OpenShell credential boundary or
+// mints its outbound token gateway-side declares an OpenShell provider profile
 // co-located with the channel at
 //   src/lib/messaging/channels/<channel>/provider-profile/<agent>.yaml
 // (the same per-channel convention as policy presets, <channel>/policy/<agent>.yaml).
 //
-// The profile YAML is the single source of truth: it declares the provider `id`
-// (used as `provider create --type <id>`), the injectable credential env var, and
-// the credential-refresh strategy + material shape. This module discovers those
-// profiles by convention and drives the two OpenShell steps that bracket provider
-// creation — `provider profile import` (before) and `provider refresh configure`
-// (after) — for ANY channel that has one, so no channel-specific logic lives in
-// the generic provider-upsert path. Today only Google Chat uses this; a second
-// minted-token channel needs only its own profile YAML.
+// The profile YAML is the single source of truth for the provider type and
+// injectable credential env var. A refresh block additionally marks a
+// gateway-minted bridge credential. The messaging applier owns profile import,
+// provider mutation, refresh configuration, and refresh observation.
 
 import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
 
-import { compactText } from "../core/url-utils";
+import { OPENSHELL_OPERATION_TIMEOUT_MS } from "../adapters/openshell/provider-command";
+import {
+  exportedProviderProfileMatchesContract,
+  parseCheckedInProviderProfileContract,
+} from "../adapters/openshell/provider-profile";
 import { createBuiltInChannelManifestRegistry } from "../messaging/channels";
 import type {
   ChannelManifest,
@@ -47,11 +47,8 @@ type RunOpenshell = (
   // The runner accepts a wider options shape; we only set ignoreError + stdio
   // here, so erase the type at the boundary to keep this module free of the
   // runner.ts internals.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   opts: any,
 ) => { status: number | null; stderr?: string | Buffer | null; stdout?: string | Buffer | null };
-
-type TokenDefShape = { name: string; providerType?: string; token: string | null };
 
 /** Discovered bridge profile for one channel/agent, parsed from its profile YAML. */
 export interface MessagingBridgeProfile {
@@ -62,14 +59,24 @@ export interface MessagingBridgeProfile {
   readonly profileId: string;
   /** Injectable credential env var the gateway mints + the L7 proxy injects. */
   readonly credentialKey: string;
-  /** Credential-refresh strategy (OpenShell kebab-case, e.g. google-service-account-jwt). */
-  readonly strategy: string;
+  /** Credential-refresh strategy, or null for a caller-supplied static credential. */
+  readonly strategy: string | null;
   /** OAuth scope(s) declared in the profile's refresh block. */
   readonly scopes: readonly string[];
   /** Material names the profile marks `secret: true` (ingested through --secret-material-env). */
   readonly secretMaterialKeys: readonly string[];
   /** Env var holding the pasted secret material (the channel's primary required secret). */
   readonly sourceSecretEnv: string;
+}
+
+export type RefreshingMessagingBridgeProfile = MessagingBridgeProfile & {
+  readonly strategy: string;
+};
+
+function hasRefreshStrategy(
+  profile: MessagingBridgeProfile,
+): profile is RefreshingMessagingBridgeProfile {
+  return profile.strategy !== null;
 }
 
 export interface ListMessagingBridgeProfilesDeps {
@@ -87,38 +94,77 @@ export interface MessagingBridgeSecretResolveDeps {
 
 export interface CollectMessagingBridgeTokenDefsInput extends MessagingBridgeSecretResolveDeps {
   readonly sandboxName: string;
+  /**
+   * Recorded sandbox agent, unnormalized. Bridge profiles are per-agent and a
+   * channel may ship both (Google Chat does), so the profile filter selects the
+   * matching one and rejects an agent no profile declares.
+   */
+  readonly agent: string | null | undefined;
   readonly enabledChannels: readonly string[] | null;
   readonly disabledChannelNames: ReadonlySet<string>;
   /** Injected for tests; defaults to convention discovery. */
   readonly profiles?: readonly MessagingBridgeProfile[];
 }
 
-export interface EnsureMessagingBridgeProfilesDeps {
+export interface MatchRegisteredMessagingBridgeProfileDeps {
   readonly root: string;
   readonly runOpenshell: RunOpenshell;
-  readonly redact: (input: string) => string;
-  readonly log?: (message?: string) => void;
-  readonly exit?: (code?: number) => never;
   readonly profiles?: readonly MessagingBridgeProfile[];
+  readonly readFileSync?: (file: string) => string;
 }
-
-export interface ConfigureMessagingBridgeRefreshesDeps extends MessagingBridgeSecretResolveDeps {
-  readonly runOpenshell: RunOpenshell;
-  readonly redact: (input: string) => string;
-  readonly log?: (message?: string) => void;
-  readonly profiles?: readonly MessagingBridgeProfile[];
-}
-
-// Result of gateway-refresh configuration. `ok:false` when a bridge token def is
-// present but minting could not be configured, so the caller fails onboarding
-// instead of leaving the channel able to receive but not reply.
-export type MessagingBridgeRefreshResult = { ok: boolean; reason?: string };
 
 function bufferOrStringToText(value: string | Buffer | null | undefined): string {
   if (typeof value === "string") return value;
   if (value && typeof (value as Buffer).toString === "function")
     return (value as Buffer).toString();
   return "";
+}
+
+function profileMatchesCheckedInBoundary(
+  profile: MessagingBridgeProfile,
+  exported: string,
+  readFileSync: (file: string) => string,
+): boolean {
+  try {
+    const expected = parseCheckedInProviderProfileContract(readFileSync(profile.profilePath));
+    return (
+      expected !== null &&
+      expected.profileId === profile.profileId &&
+      (profile.strategy !== null ||
+        (expected.boundary.endpoints.length === 0 &&
+          expected.boundary.binaries.length === 0 &&
+          expected.boundary.inference_capable === false)) &&
+      exportedProviderProfileMatchesContract(exported, expected)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Compare a registered bridge profile with its checked-in credential boundary. */
+export function matchesRegisteredMessagingBridgeProfile(
+  providerType: string,
+  deps: MatchRegisteredMessagingBridgeProfileDeps,
+): boolean | null {
+  const profile = (deps.profiles ?? listMessagingBridgeProfiles({ root: deps.root })).find(
+    (candidate) => candidate.profileId === providerType,
+  );
+  if (!profile) return null;
+  const exported = deps.runOpenshell(
+    ["provider", "profile", "export", profile.profileId, "--output", "json"],
+    {
+      ignoreError: true,
+      suppressOutput: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: OPENSHELL_OPERATION_TIMEOUT_MS,
+    },
+  );
+  if (exported.status !== 0) return false;
+  return profileMatchesCheckedInBoundary(
+    profile,
+    bufferOrStringToText(exported.stdout),
+    deps.readFileSync ?? ((file: string) => fs.readFileSync(file, "utf-8")),
+  );
 }
 
 function isSafeChannelId(value: string): boolean {
@@ -164,14 +210,17 @@ function parseProfileYaml(
   if (!credential) return null;
   const envVars = Array.isArray(credential.env_vars) ? credential.env_vars : [];
   const credentialKey = typeof envVars[0] === "string" ? envVars[0] : null;
+  if (!credentialKey) return null;
   const refresh = credential.refresh as Record<string, unknown> | undefined;
-  if (!credentialKey || !refresh) return null;
-  const strategy = refresh.strategy;
-  if (typeof strategy !== "string" || !strategy) return null;
-  const scopes = Array.isArray(refresh.scopes)
+  const strategy =
+    typeof refresh?.strategy === "string" && refresh.strategy ? refresh.strategy : null;
+  if (strategy === null && (!Array.isArray(doc?.endpoints) || doc.endpoints.length !== 0)) {
+    return null;
+  }
+  const scopes = Array.isArray(refresh?.scopes)
     ? refresh.scopes.filter((s): s is string => typeof s === "string")
     : [];
-  const material = Array.isArray(refresh.material) ? refresh.material : [];
+  const material = Array.isArray(refresh?.material) ? refresh.material : [];
   const secretMaterialKeys = material
     .filter(
       (m): m is { name: string; secret: true } =>
@@ -217,7 +266,7 @@ export function listMessagingBridgeProfiles(
  * key resolution). Using `getCredential` alone misses non-interactive runs where
  * the value arrives through the passed-in env.
  */
-function resolveBridgeSecret(
+export function resolveMessagingBridgeSecret(
   envKey: string,
   deps: MessagingBridgeSecretResolveDeps,
 ): string | null {
@@ -230,14 +279,17 @@ function resolveBridgeSecret(
   return null;
 }
 
-function bridgeProfilesForTokenDefs(
-  tokenDefs: readonly TokenDefShape[],
-  profiles: readonly MessagingBridgeProfile[],
-): MessagingBridgeProfile[] {
-  const presentProfileIds = new Set(
-    tokenDefs.filter(({ token }) => Boolean(token)).map(({ providerType }) => providerType),
+/** Static custom provider type for one channel in the selected agent, if declared. */
+export function staticMessagingProviderTypeForChannel(
+  channelId: string,
+  agent: string | null | undefined,
+  profiles: readonly MessagingBridgeProfile[] = listMessagingBridgeProfiles(),
+): string | null {
+  return (
+    messagingBridgeProfilesForAgent(agent, profiles).find(
+      (profile) => profile.channelId === channelId && profile.strategy === null,
+    )?.profileId ?? null
   );
-  return profiles.filter((profile) => presentProfileIds.has(profile.profileId));
 }
 
 /** Gateway-minted bridge provider name for a channel (sandbox-scoped). */
@@ -248,20 +300,23 @@ function bridgeProviderNameFor(sandboxName: string, channelId: string): string {
 /**
  * Build the messaging token definitions for every enabled bridge channel whose
  * source secret was captured. Mirrors how the Brave provider is pushed in
- * messaging-prep: the value is a non-empty sentinel (overwritten by the first
- * refresh) and the real material is supplied separately by
- * {@link configureMessagingBridgeRefreshes}.
+ * messaging-prep: the value is a non-empty sentinel used only to create a
+ * missing provider. An exact existing provider keeps its working credential
+ * until refresh succeeds. The real material is built as ephemeral input for
+ * the messaging applier.
  */
 export function collectMessagingBridgeTokenDefs(
   input: CollectMessagingBridgeTokenDefsInput,
 ): { name: string; envKey: string; token: string; providerType: string }[] {
-  const profiles = input.profiles ?? listMessagingBridgeProfiles();
+  const profiles = messagingBridgeProfilesForAgent(input.agent, input.profiles).filter(
+    hasRefreshStrategy,
+  );
   const defs: { name: string; envKey: string; token: string; providerType: string }[] = [];
   for (const profile of profiles) {
     if (input.disabledChannelNames.has(profile.channelId)) continue;
     if (input.enabledChannels != null && !input.enabledChannels.includes(profile.channelId))
       continue;
-    const secret = resolveBridgeSecret(profile.sourceSecretEnv, input);
+    const secret = resolveMessagingBridgeSecret(profile.sourceSecretEnv, input);
     if (!secret) continue;
     defs.push({
       name: bridgeProviderNameFor(input.sandboxName, profile.channelId),
@@ -271,6 +326,19 @@ export function collectMessagingBridgeTokenDefs(
     });
   }
   return defs;
+}
+
+/**
+ * Single authority for which bridge profiles an agent may use. An unset agent is
+ * OpenClaw, matching `toMessagingAgentId`; a recorded agent no profile declares
+ * selects nothing, so it mints and reuses no bridge.
+ */
+export function messagingBridgeProfilesForAgent(
+  agent: string | null | undefined,
+  profiles: readonly MessagingBridgeProfile[] = listMessagingBridgeProfiles(),
+): MessagingBridgeProfile[] {
+  const name = agent?.trim().toLowerCase() || "openclaw";
+  return profiles.filter((profile) => profile.agent === name);
 }
 
 /**
@@ -288,7 +356,7 @@ export function bridgeProviderNamesForChannel(
   return [
     ...new Set(
       profiles
-        .filter((profile) => profile.channelId === channelName)
+        .filter((profile) => profile.channelId === channelName && hasRefreshStrategy(profile))
         .map((profile) => bridgeProviderNameFor(sandboxName, profile.channelId)),
     ),
   ];
@@ -305,80 +373,19 @@ export function bridgeSecretEnvsForChannel(
   return [
     ...new Set(
       profiles
-        .filter((profile) => profile.channelId === channelName)
+        .filter((profile) => profile.channelId === channelName && hasRefreshStrategy(profile))
         .map((profile) => profile.sourceSecretEnv),
     ),
   ];
 }
 
-/**
- * Register each active bridge provider profile with OpenShell before providers
- * are created (they are created with `--type <profileId>`). Idempotent: tolerates
- * OpenShell reporting the custom profile already exists. Self-gates when no bridge
- * token def is present.
- */
-export function ensureMessagingBridgeProfiles(
-  tokenDefs: readonly TokenDefShape[],
-  deps: EnsureMessagingBridgeProfilesDeps,
-): void {
-  const profiles = deps.profiles ?? listMessagingBridgeProfiles({ root: deps.root });
-  const active = bridgeProfilesForTokenDefs(tokenDefs, profiles);
-  if (active.length === 0) return;
-
-  const errorLog = deps.log ?? console.error;
-  const exit = deps.exit ?? ((code?: number) => process.exit(code));
-
-  for (const profile of active) {
-    // Onboard registers each bridge provider twice: once up front so an
-    // interrupted run can resume, then again during create-plan materialization.
-    // Probe first and skip the re-import so the second pass never hits OpenShell's
-    // "already exists" error. A fresh gateway answers the probe with a harmless
-    // "not found" that suppressOutput hides — only the exit status says whether
-    // the profile already exists.
-    const alreadyRegistered = deps.runOpenshell(
-      ["provider", "profile", "export", profile.profileId],
-      { ignoreError: true, suppressOutput: true, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    if (alreadyRegistered.status === 0) continue;
-    // Probe failed for something other than "not found" (gateway down, auth, …):
-    // surface it instead of masking a real problem.
-    const probeDiagnostic = `${bufferOrStringToText(alreadyRegistered.stderr)} ${bufferOrStringToText(
-      alreadyRegistered.stdout,
-    )}`;
-    if (probeDiagnostic.trim() && !/not found/i.test(probeDiagnostic)) {
-      errorLog(`\n  ⚠ Unexpected error probing the ${profile.channelId} bridge provider profile:`);
-      const probeText = compactText(deps.redact(probeDiagnostic));
-      if (probeText) errorLog(`    ${probeText.slice(0, 500)}`);
-    }
-
-    const result = deps.runOpenshell(
-      ["provider", "profile", "import", "--file", profile.profilePath],
-      { ignoreError: true, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    if (result.status === 0) continue;
-
-    // Tolerate a lost race: the probe saw no profile but a concurrent import made it.
-    const rawDiagnostic = `${bufferOrStringToText(result.stderr)} ${bufferOrStringToText(result.stdout)}`;
-    if (/already exists/i.test(rawDiagnostic)) continue;
-
-    const diagnostic = compactText(deps.redact(rawDiagnostic));
-    errorLog(
-      `\n  ✗ Failed to register the ${profile.channelId} bridge provider profile with OpenShell.`,
-    );
-    if (diagnostic) errorLog(`    ${diagnostic.slice(0, 500)}`);
-    errorLog("    Update OpenShell with scripts/install-openshell.sh and re-run onboarding.");
-    exit(result.status || 1);
-    return;
-  }
-}
-
-function buildRefreshMaterial(
-  profile: MessagingBridgeProfile,
+export function buildMessagingBridgeRefreshMaterial(
+  profile: RefreshingMessagingBridgeProfile,
   secret: string,
 ):
   | { ok: true; material: { key: string; value: string }[]; secretKeys: string[] }
   | { ok: false; reason: string } {
-  if (profile.strategy === "google-service-account-jwt") {
+  if (profile.strategy === "google_service_account_jwt") {
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(secret) as Record<string, unknown>;
@@ -399,8 +406,12 @@ function buildRefreshMaterial(
       { key: "client_email", value: clientEmail },
       { key: "private_key", value: privateKey },
     ];
-    // Scope comes from the profile's declared refresh scopes (single source of truth).
-    if (profile.scopes[0]) material.push({ key: "scope", value: profile.scopes[0] });
+    // Join every declared scope space-separated so ONE minted token carries all
+    // of them. Hermes Google Chat needs chat.bot AND pubsub in a single
+    // credential; taking only scopes[0] made `:pull` fail with 403.
+    if (profile.scopes.length > 0) {
+      material.push({ key: "scope", value: profile.scopes.join(" ") });
+    }
     // This strategy always emits private_key as material, so force it into the
     // secret set (delivered via --secret-material-env, never argv) regardless of
     // what the profile declares. A profile whose secretMaterialKeys omitted it
@@ -409,97 +420,4 @@ function buildRefreshMaterial(
     return { ok: true, material, secretKeys };
   }
   return { ok: false, reason: `unsupported refresh strategy '${profile.strategy}'` };
-}
-
-/**
- * Configure gateway-side credential refresh for every active bridge provider:
- * the gateway mints (and rotates) the token from the pasted secret material. Must
- * run AFTER the providers are created. Fail-closed: when a bridge token def is
- * present but minting cannot be configured, returns { ok:false } so the caller
- * aborts rather than leaving the channel able to receive but not reply. The secret
- * material is never logged.
- */
-export function configureMessagingBridgeRefreshes(
-  tokenDefs: readonly TokenDefShape[],
-  deps: ConfigureMessagingBridgeRefreshesDeps,
-): MessagingBridgeRefreshResult {
-  const profiles = deps.profiles ?? listMessagingBridgeProfiles();
-  const active = bridgeProfilesForTokenDefs(tokenDefs, profiles);
-  if (active.length === 0) return { ok: true };
-
-  const warn = deps.log ?? console.error;
-  for (const profile of active) {
-    const bridge = tokenDefs.find(
-      ({ providerType, token }) => providerType === profile.profileId && Boolean(token),
-    );
-    if (!bridge) continue;
-
-    const secret = resolveBridgeSecret(profile.sourceSecretEnv, deps);
-    if (!secret) {
-      warn(
-        `\n  ✗ ${profile.channelId} bridge: secret material unavailable; cannot configure gateway token minting.`,
-      );
-      return { ok: false, reason: "secret material unavailable" };
-    }
-
-    const built = buildRefreshMaterial(profile, secret);
-    if (!built.ok) {
-      warn(
-        `\n  ✗ ${profile.channelId} bridge: ${built.reason}; cannot configure gateway token minting.`,
-      );
-      return { ok: false, reason: built.reason };
-    }
-
-    // OpenShell reads secret refresh material from its own process environment,
-    // so private keys never appear in argv. Reuse the same ephemeral variable
-    // names safely: each profile is configured by a separate child process.
-    const secretKeys = new Set(built.secretKeys);
-    const materialArgs: string[] = [];
-    const secretMaterialEnv: NodeJS.ProcessEnv = {};
-    let secretIndex = 0;
-    for (const { key, value } of built.material) {
-      if (secretKeys.has(key)) {
-        const envName = `MESSAGING_BRIDGE_SECRET_${secretIndex}`;
-        secretIndex += 1;
-        secretMaterialEnv[envName] = value;
-        materialArgs.push("--secret-material-env", `${key}=${envName}`);
-        continue;
-      }
-      materialArgs.push("--material", `${key}=${value}`);
-    }
-    const result = deps.runOpenshell(
-      [
-        "provider",
-        "refresh",
-        "configure",
-        "--credential-key",
-        profile.credentialKey,
-        "--strategy",
-        profile.strategy,
-        ...materialArgs,
-        bridge.name,
-      ],
-      {
-        env: secretMaterialEnv,
-        ignoreError: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
-    if (result.status === 0) continue;
-
-    // Redact before logging — never echo secret material.
-    const diagnostic = compactText(
-      deps.redact(`${bufferOrStringToText(result.stderr)} ${bufferOrStringToText(result.stdout)}`),
-    );
-    warn(
-      `\n  ✗ ${profile.channelId} bridge: failed to configure gateway token minting for '${bridge.name}'.`,
-    );
-    if (diagnostic) warn(`    ${diagnostic.slice(0, 500)}`);
-    warn("    Outbound replies for this channel will not authenticate until this is resolved.");
-    return {
-      ok: false,
-      reason: diagnostic || `provider refresh configure exited with status ${result.status}`,
-    };
-  }
-  return { ok: true };
 }

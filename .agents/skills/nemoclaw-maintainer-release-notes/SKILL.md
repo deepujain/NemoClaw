@@ -1,6 +1,6 @@
 ---
 name: nemoclaw-maintainer-release-notes
-description: Drafts the post-tag NemoClaw Announcement from tag, compare, and release-entry data. Use after tagging or when asked to summarize vX.Y.Z.
+description: "Draft a post-tag NemoClaw Announcement from the verified release range and shipped PRs. Use when summarizing a release."
 user_invocable: true
 ---
 
@@ -31,7 +31,7 @@ Create a local Markdown draft. Do not create or update a GitHub Discussion; the 
 - The release tag should already exist. If the user is still cutting the tag, use `nemoclaw-maintainer-cut-release-tag` first.
 - The tagged commit should already contain exactly one `## <current-version>` entry in `docs/changelog/YYYY-MM-DD.mdx`. This skill drafts the post-tag Announcement and does not replace or create that canonical entry.
 - Use live GitHub and remote tag state, not memory or a stale local branch.
-- Read the signed tag annotation or its exact `release-brief.md` source for release-range facts. Do not
+- Read the signed tag annotation or its `release-brief.md` source for release-range facts. Do not
   copy internal test results or exception details into the public Announcement.
 
 ## Step 1: Verify the Release Range
@@ -163,7 +163,8 @@ Create a Markdown draft outside the checkout root so the repo stays clean, for e
 
 The Markdown body is the source the maintainer can paste into GitHub Discussions.
 
-Stop here. The maintainer creates the GitHub Discussion and shares the announcement link.
+Return the draft path to the calling release workflow. The maintainer creates the GitHub Discussion
+and shares the Announcement link.
 
 ## Output
 

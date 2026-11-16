@@ -8,14 +8,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { makeAgent, withMockedDocker } from "../../../test/helpers/base-image-test-harness";
 import { testTimeout } from "../../../test/helpers/timeouts";
-import { createCuaRuntimeTestFixture } from "../cua/runtime-test-fixture";
-
 import { tmpDir, writeCa } from "../onboard/__test-helpers__/corporate-ca-fixtures";
 import {
   createSandboxBaseImageBuildProvenanceKey,
   type SandboxBaseImageResolutionMetadata,
 } from "../sandbox-base-image";
 import { loadAgent } from "./defs";
+import { loadManifestRecord, readString } from "./manifest-readers";
 
 function makeResolutionMetadata(
   overrides: Partial<SandboxBaseImageResolutionMetadata> = {},
@@ -55,20 +54,17 @@ function makeDifferingImageInspection(
 
 const AGENTS_DIR = path.resolve(import.meta.dirname, "../../../agents");
 
-function declaresCorporateCaBuildArg(dockerfilePath: string): boolean {
-  return (
-    fs.existsSync(dockerfilePath) &&
-    fs.readFileSync(dockerfilePath, "utf8").includes("ARG NEMOCLAW_CORPORATE_CA_B64")
-  );
+function readManifestExpectedVersion(agentName: string): string {
+  const manifestPath = path.join(AGENTS_DIR, agentName, "manifest.yaml");
+  const expectedVersion = readString(loadManifestRecord(manifestPath), "expected_version");
+  expect(
+    expectedVersion,
+    `agent '${agentName}' must declare expected_version in ${manifestPath}`,
+  ).toBeTruthy();
+  return expectedVersion ?? "";
 }
 
-// Read the agent names from the checked-in Dockerfiles so a base image that
-// starts consuming the corporate CA cannot ship without the build argument.
-const CORPORATE_CA_BASE_IMAGE_AGENTS = fs
-  .readdirSync(AGENTS_DIR)
-  .filter((agentName) =>
-    declaresCorporateCaBuildArg(path.join(AGENTS_DIR, agentName, "Dockerfile.base")),
-  );
+const CORPORATE_CA_BASE_IMAGE_AGENTS = ["langchain-deepagents-code", "pi"] as const;
 
 describe("agent base image provisioning", () => {
   beforeEach(() => {
@@ -81,115 +77,110 @@ describe("agent base image provisioning", () => {
   });
 
   it(
-    "validates the complete external NemoCUA payload before resolving or building an image (#7755)",
+    "requires an operator-prepared NemoCUA sandbox image (#9649)",
     () => {
-      const runtime = createCuaRuntimeTestFixture();
-      try {
-        Object.entries(runtime.env).filter(
-          (entry): entry is [string, string] => entry[1] !== undefined,
-        ).forEach(([name, value]) => {
-          vi.stubEnv(name, value);
-        });
-        const agent = loadAgent("nemocua");
-        const dockerfile = agent.dockerfileBasePath!;
-        fs.chmodSync(dockerfile, 0o644);
-        fs.writeFileSync(dockerfile, "FROM mutable:latest\n");
-        fs.chmodSync(dockerfile, 0o444);
+      const agent = loadAgent("nemocua", { NEMOCLAW_CUA_ENABLED: "1" });
+      vi.stubEnv("NEMOCLAW_CUA_ENABLED", "1");
 
-        withMockedDocker(
-          ({ ensureAgentBaseImage, dockerBuildMock, resolveSandboxBaseImageMock }) => {
-            expect(() => ensureAgentBaseImage(agent)).toThrow(/declared size|content identity/);
-            expect(resolveSandboxBaseImageMock).not.toHaveBeenCalled();
-            expect(dockerBuildMock).not.toHaveBeenCalled();
-          },
-        );
-      } finally {
-        runtime.cleanup();
-      }
+      withMockedDocker(({ ensureAgentBaseImage, dockerBuildMock, resolveSandboxBaseImageMock }) => {
+        expect(() => ensureAgentBaseImage(agent)).toThrow("NEMOCLAW_CUA_SANDBOX_IMAGE_REF");
+        expect(resolveSandboxBaseImageMock).not.toHaveBeenCalled();
+        expect(dockerBuildMock).not.toHaveBeenCalled();
+      });
     },
     testTimeout(15_000),
   );
 
-  it("cannot resolve or stage NemoCUA image inputs after the feature is disabled (#7755)", () => {
-    const runtime = createCuaRuntimeTestFixture();
-    try {
-      const agent = loadAgent("nemocua", runtime.env);
-      vi.stubEnv("NEMOCLAW_CUA_ENABLED", "");
+  it("uses the prepared NemoCUA image without a nested base build (#9649)", () => {
+    vi.stubEnv("NEMOCLAW_CUA_ENABLED", "1");
+    vi.stubEnv("NEMOCLAW_CUA_SANDBOX_IMAGE_REF", "nemocua-scenario:staged");
+    const agent = loadAgent("nemocua");
 
-      withMockedDocker(({ ensureAgentBaseImage, dockerBuildMock, resolveSandboxBaseImageMock }) => {
-        expect(() => ensureAgentBaseImage(agent)).toThrow(
-          "use the controlled Brev Launchable activation",
-        );
-        expect(resolveSandboxBaseImageMock).not.toHaveBeenCalled();
-        expect(dockerBuildMock).not.toHaveBeenCalled();
+    withMockedDocker(({ ensureAgentBaseImage, dockerBuildMock, resolveSandboxBaseImageMock }) => {
+      expect(ensureAgentBaseImage(agent)).toEqual({
+        imageTag: "nemocua-scenario:staged",
+        built: false,
       });
-    } finally {
-      runtime.cleanup();
-    }
+      expect(resolveSandboxBaseImageMock).not.toHaveBeenCalled();
+      expect(dockerBuildMock).not.toHaveBeenCalled();
+    });
   });
 
-  it("uses the exact manifest-bound NemoCUA sandbox image without a nested base build (#7755)", () => {
-    const runtime = createCuaRuntimeTestFixture();
+  it("stages only the NemoCUA Dockerfile in the caller-image build context (#9649)", () => {
+    vi.stubEnv("NEMOCLAW_CUA_ENABLED", "1");
+    vi.stubEnv("NEMOCLAW_CUA_SANDBOX_IMAGE_REF", "nemocua-scenario:staged");
+    const agent = loadAgent("nemocua");
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, "unrelated-sentinel.txt"), "must not enter build context");
+    let buildContext = root;
+
     try {
-      Object.entries(runtime.env).filter(
-        (entry): entry is [string, string] => entry[1] !== undefined,
-      ).forEach(([name, value]) => {
-        vi.stubEnv(name, value);
-      });
-      const agent = loadAgent("nemocua");
-
-      withMockedDocker(({ ensureAgentBaseImage, dockerBuildMock, resolveSandboxBaseImageMock }) => {
-        expect(ensureAgentBaseImage(agent)).toEqual({
-          imageTag: process.env.NEMOCLAW_CUA_SANDBOX_IMAGE_REF,
-          built: false,
-        });
-        expect(resolveSandboxBaseImageMock).not.toHaveBeenCalled();
-        expect(dockerBuildMock).not.toHaveBeenCalled();
-      });
-    } finally {
-      runtime.cleanup();
-    }
-  });
-
-  it("stages only the exact manifest-bound NemoCUA Docker context (#7755)", () => {
-    const runtime = createCuaRuntimeTestFixture();
-    let buildContext: string | undefined;
-    try {
-      Object.entries(runtime.env).filter(
-        (entry): entry is [string, string] => entry[1] !== undefined,
-      ).forEach(([name, value]) => {
-        vi.stubEnv(name, value);
-      });
-      const agent = loadAgent("nemocua");
-
       withMockedDocker(({ createAgentSandbox }) => {
-        const result = createAgentSandbox(agent);
+        const result = createAgentSandbox(agent, { rootDir: root });
         buildContext = result.buildCtx;
-        expect(fs.readdirSync(result.buildCtx).sort()).toEqual(["Dockerfile", "agents"]);
-        expect(fs.readdirSync(path.join(result.buildCtx, "agents"))).toEqual(["nemocua"]);
-        expect(fs.readdirSync(path.join(result.buildCtx, "agents", "nemocua")).sort()).toEqual([
-          "Dockerfile",
-          "Dockerfile.base",
-          "manifest.yaml",
-          "nemocua-cli.tar.gz",
-          "policy-additions.yaml",
-          "security-adapter.sh",
-          "target-adapter.sh",
-          "target-services.tar.gz",
-          "task-adapter.sh",
-        ]);
-        expect(fs.existsSync(path.join(result.buildCtx, "package.json"))).toBe(false);
-        expect(fs.existsSync(path.join(result.buildCtx, "private-source-coordinate.txt"))).toBe(
-          false,
-        );
+        expect(fs.readdirSync(result.buildCtx)).toEqual(["Dockerfile"]);
+        expect(fs.existsSync(path.join(result.buildCtx, "unrelated-sentinel.txt"))).toBe(false);
         expect(fs.readFileSync(result.stagedDockerfile, "utf8")).toContain(
-          `ARG BASE_IMAGE=${runtime.env.NEMOCLAW_CUA_SANDBOX_IMAGE_REF}`,
+          "ARG BASE_IMAGE=nemocua-scenario:staged",
         );
       });
     } finally {
-      buildContext ? fs.rmSync(buildContext, { recursive: true, force: true }) : undefined;
-      runtime.cleanup();
+      fs.rmSync(buildContext, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("accepts a Pi base only when its immutable security inventory is current", () => {
+    const pi = makeAgent({
+      name: "pi",
+      displayName: "Pi",
+      dockerfileBasePath: "/test/root/agents/pi/Dockerfile.base",
+    });
+    withMockedDocker(({ ensureAgentBaseImage, dockerCaptureMock, resolveSandboxBaseImageMock }) => {
+      ensureAgentBaseImage(pi);
+      const options = resolveSandboxBaseImageMock.mock.calls[0]?.[0] as {
+        validateImage?: (imageRef: string) => boolean;
+        validationDescription?: string;
+      };
+
+      dockerCaptureMock.mockReturnValueOnce("");
+      expect(options.validateImage?.("pi-base:stale")).toBe(false);
+
+      dockerCaptureMock.mockReturnValueOnce("nemoclaw-security-inventory-ok");
+      expect(options.validateImage?.("pi-base:current")).toBe(true);
+      expect(options.validationDescription).toBe("the immutable security package inventory");
+      expect(dockerCaptureMock.mock.calls[1]?.[0]).toEqual(
+        expect.arrayContaining([
+          "--network",
+          "none",
+          "--cap-drop",
+          "ALL",
+          "--read-only",
+          "pi-base:current",
+          expect.stringContaining("nemoclaw-security-inventory-ok"),
+        ]),
+      );
+    });
+  });
+
+  it("initializes the lazy Hermes MCP runtime before accepting a published base", () => {
+    const imageRef = "hermes-base:current";
+
+    withMockedDocker(({ ensureAgentBaseImage, dockerCaptureMock, resolveSandboxBaseImageMock }) => {
+      ensureAgentBaseImage(makeAgent());
+      const options = resolveSandboxBaseImageMock.mock.calls[0]?.[0] as {
+        validateImage?: (candidate: string) => boolean;
+      };
+
+      expect(options.validateImage?.(imageRef)).toBe(true);
+      expect(dockerCaptureMock.mock.calls[0]?.[0]).toEqual(
+        expect.arrayContaining([
+          "/opt/hermes/.venv/bin/python",
+          imageRef,
+          expect.stringContaining("mcp_tool._ensure_mcp_sdk() or sys.exit(1)"),
+        ]),
+      );
+    });
   });
 
   it(
@@ -234,7 +225,8 @@ describe("agent base image provisioning", () => {
               forceRefresh: true,
               rootDir: root,
               validateImage: expect.any(Function),
-              validationDescription: "the required MCP Streamable HTTP runtime",
+              validationDescription:
+                "Hermes 0.21.3 with the required MCP Streamable HTTP and ACP runtimes and the immutable security package inventory",
             }),
           );
           expect(dockerImageInspectMock).not.toHaveBeenCalled();
@@ -279,9 +271,11 @@ describe("agent base image provisioning", () => {
         dockerCaptureMock.mockImplementation((args: string[]) =>
           args.includes("/usr/bin/ldd")
             ? "ldd (Debian GLIBC 2.41-12) 2.41"
-            : "nemoclaw-hermes-mcp-runtime-ok",
+            : args.includes("/opt/hermes/.venv/bin/python")
+              ? "nemoclaw-hermes-mcp-runtime-ok"
+              : "nemoclaw-security-inventory-ok",
         );
-        dockerImageInspectFormatMock.mockImplementation((format: string, imageRef: string) =>
+        dockerImageInspectFormatMock.mockImplementation((format: string, _imageRef: string) =>
           format === "{{json .}}"
             ? JSON.stringify({
                 Id: imageId,
@@ -347,7 +341,9 @@ describe("agent base image provisioning", () => {
         dockerCaptureMock.mockImplementation((args: string[]) =>
           args.includes("/usr/bin/ldd")
             ? "ldd (Debian GLIBC 2.41-12) 2.41"
-            : "nemoclaw-hermes-mcp-runtime-ok",
+            : args.includes("/opt/hermes/.venv/bin/python")
+              ? "nemoclaw-hermes-mcp-runtime-ok"
+              : "nemoclaw-security-inventory-ok",
         );
         dockerImageInspectFormatMock.mockImplementation((format: string) =>
           format === "{{json .}}"
@@ -455,29 +451,32 @@ describe("agent base image provisioning", () => {
   it.each([
     ["operating system", "linux", "windows", "amd64", "amd64"],
     ["architecture", "linux", "linux", "amd64", "arm64"],
-  ])("refuses provenance when a local Hermes alias has a different %s (#7144)", (_difference, localOs, pinnedOs, localArchitecture, pinnedArchitecture) => {
-    withMockedDocker(
-      ({ bindLocalAgentBaseImageToPinnedProvenance, dockerImageInspectFormatMock }) => {
-        const agent = makeAgent();
-        const localRef = "nemoclaw-hermes-sandbox-base-local:e2e-current";
-        const dockerfile = fs.readFileSync(agent.dockerfilePath as string, "utf8");
-        const pinnedRef = dockerfile.match(/^ARG BASE_IMAGE=(\S+)$/m)?.[1] as string;
-        const imageId = `sha256:${"a".repeat(64)}`;
-        dockerImageInspectFormatMock.mockImplementation((format: string, imageRef: string) =>
-          format === "{{json .}}"
-            ? JSON.stringify({
-                Id: imageId,
-                Os: imageRef === localRef ? localOs : pinnedOs,
-                Architecture: imageRef === localRef ? localArchitecture : pinnedArchitecture,
-                RepoDigests: [pinnedRef],
-              })
-            : imageId,
-        );
+  ])(
+    "refuses provenance when a local Hermes alias has a different %s (#7144)",
+    (_difference, localOs, pinnedOs, localArchitecture, pinnedArchitecture) => {
+      withMockedDocker(
+        ({ bindLocalAgentBaseImageToPinnedProvenance, dockerImageInspectFormatMock }) => {
+          const agent = makeAgent();
+          const localRef = "nemoclaw-hermes-sandbox-base-local:e2e-current";
+          const dockerfile = fs.readFileSync(agent.dockerfilePath as string, "utf8");
+          const pinnedRef = dockerfile.match(/^ARG BASE_IMAGE=(\S+)$/m)?.[1] as string;
+          const imageId = `sha256:${"a".repeat(64)}`;
+          dockerImageInspectFormatMock.mockImplementation((format: string, imageRef: string) =>
+            format === "{{json .}}"
+              ? JSON.stringify({
+                  Id: imageId,
+                  Os: imageRef === localRef ? localOs : pinnedOs,
+                  Architecture: imageRef === localRef ? localArchitecture : pinnedArchitecture,
+                  RepoDigests: [pinnedRef],
+                })
+              : imageId,
+          );
 
-        expect(bindLocalAgentBaseImageToPinnedProvenance(agent, localRef)).toBeNull();
-      },
-    );
-  });
+          expect(bindLocalAgentBaseImageToPinnedProvenance(agent, localRef)).toBeNull();
+        },
+      );
+    },
+  );
 
   it("configures Deep Agents Code base-image validation from the manifest (#6456)", () => {
     withMockedDocker(({ ensureAgentBaseImage, resolveSandboxBaseImageMock }) => {
@@ -485,7 +484,7 @@ describe("agent base image provisioning", () => {
         makeAgent({
           name: "langchain-deepagents-code",
           displayName: "LangChain Deep Agents Code",
-          expectedVersion: "0.1.34",
+          expectedVersion: "0.1.55",
           dockerfileBasePath: "/test/root/agents/langchain-deepagents-code/Dockerfile.base",
           dockerfilePath: "/test/root/agents/langchain-deepagents-code/Dockerfile",
         }),
@@ -495,10 +494,13 @@ describe("agent base image provisioning", () => {
           inputPaths: [
             "/test/root/agents/langchain-deepagents-code/manifest.yaml",
             "/test/root/agents/langchain-deepagents-code/requirements.lock",
+            "/test/root/agents/langchain-deepagents-code/dependency-overrides.in",
+            "/test/root/agents/langchain-deepagents-code/patch-dependency-compatibility.py",
+            "src/lib/agent/deep-agents-code-runtime-identity.json",
           ],
           validateImage: expect.any(Function),
           validationDescription:
-            "deepagents-code==0.1.34, dos2unix, and the immutable security package inventory",
+            "deepagents-code==0.1.55, sandbox identity, dos2unix, and the immutable security package inventory",
         }),
       );
     });
@@ -507,7 +509,9 @@ describe("agent base image provisioning", () => {
   it.each(CORPORATE_CA_BASE_IMAGE_AGENTS)(
     "passes the resolved corporate CA into local %s base image builds (#8119)",
     (agentName) => {
-      vi.stubEnv("NEMOCLAW_CORPORATE_CA_BUNDLE", writeCa(tmpDir()));
+      const corporateCaPath = writeCa(tmpDir());
+      const corporateCaContents = fs.readFileSync(corporateCaPath, "utf8");
+      vi.stubEnv("NEMOCLAW_CORPORATE_CA_BUNDLE", corporateCaPath);
       withMockedDocker(({ ensureAgentBaseImage, dockerBuildMock, resolveSandboxBaseImageMock }) => {
         resolveSandboxBaseImageMock.mockReturnValue({
           ref: `nemoclaw-${agentName}-sandbox-base-local:compatible`,
@@ -520,7 +524,7 @@ describe("agent base image provisioning", () => {
           makeAgent({
             name: agentName,
             displayName: agentName,
-            expectedVersion: "0.1.34",
+            expectedVersion: readManifestExpectedVersion(agentName),
             dockerfileBasePath: `/test/root/agents/${agentName}/Dockerfile.base`,
             dockerfilePath: `/test/root/agents/${agentName}/Dockerfile`,
           }),
@@ -532,12 +536,21 @@ describe("agent base image provisioning", () => {
         };
         const encoded = options.buildArgs?.NEMOCLAW_CORPORATE_CA_B64;
         expect(encoded).toBeTypeOf("string");
-        expect(Buffer.from(encoded ?? "", "base64").toString("utf8")).toContain(
-          "BEGIN CERTIFICATE",
-        );
+        expect(Buffer.from(encoded ?? "", "base64").toString("utf8")).toBe(corporateCaContents);
       });
     },
   );
+
+  it("omits corporate CA build inputs from Hermes base image builds (#8119)", () => {
+    vi.stubEnv("NEMOCLAW_CORPORATE_CA_BUNDLE", writeCa(tmpDir()));
+    withMockedDocker(({ ensureAgentBaseImage, dockerBuildMock }) => {
+      ensureAgentBaseImage(makeAgent(), { forceBaseImageRebuild: true });
+
+      expect(dockerBuildMock.mock.calls[0]?.[3]).toEqual(
+        expect.objectContaining({ buildArgs: undefined }),
+      );
+    });
+  });
 
   it("omits corporate CA build inputs when corporate CA import is disabled (#8119)", () => {
     vi.stubEnv("NEMOCLAW_CORPORATE_CA_BUNDLE", writeCa(tmpDir()));
@@ -554,7 +567,7 @@ describe("agent base image provisioning", () => {
         makeAgent({
           name: "langchain-deepagents-code",
           displayName: "LangChain Deep Agents Code",
-          expectedVersion: "0.1.34",
+          expectedVersion: "0.1.55",
           dockerfileBasePath: "/test/root/agents/langchain-deepagents-code/Dockerfile.base",
           dockerfilePath: "/test/root/agents/langchain-deepagents-code/Dockerfile",
         }),
@@ -645,7 +658,8 @@ describe("agent base image provisioning", () => {
               NEMOCLAW_SANDBOX_BASE_LOCAL_BUILD: "0",
             }),
             validateImage: expect.any(Function),
-            validationDescription: "the required MCP Streamable HTTP runtime",
+            validationDescription:
+              "Hermes 0.21.3 with the required MCP Streamable HTTP and ACP runtimes and the immutable security package inventory",
             trustedLocalOverride: { ref: result.imageTag, provenance },
           }),
         );

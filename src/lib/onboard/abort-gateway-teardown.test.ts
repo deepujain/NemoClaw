@@ -26,20 +26,20 @@ describe("gatewayHasRegisteredSandbox", () => {
     expect(gatewayHasRegisteredSandbox("nemoclaw-8814", listSandboxes)).toBe(false);
   });
 
-  it("fails closed when a registry binding cannot be resolved", () => {
+  it("reports unknown ownership when a registry binding cannot be resolved", () => {
     const listSandboxes = () => ({
       sandboxes: [{ name: "alpha", gatewayName: "not-a-nemoclaw-gateway" }],
       defaultSandbox: "alpha" as string | null,
     });
-    expect(gatewayHasRegisteredSandbox("nemoclaw-8814", listSandboxes)).toBe(true);
+    expect(gatewayHasRegisteredSandbox("nemoclaw-8814", listSandboxes)).toBeNull();
   });
 });
 
 describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
-  it("skips teardown when a sandbox still owns the gateway", () => {
+  it("skips teardown when a sandbox still owns the gateway", async () => {
     const release = vi.fn();
     const remove = vi.fn();
-    const attempted = teardownOrphanManagedGatewayOnAbort({
+    const cleanupComplete = await teardownOrphanManagedGatewayOnAbort({
       gatewayPort: 8814,
       gatewayName: "nemoclaw-8814",
       listSandboxes: () => ({
@@ -49,16 +49,16 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
       releaseManagedGatewayPort: release,
       removeGatewayRegistration: remove,
     });
-    expect(attempted).toBe(false);
+    expect(cleanupComplete).toBe(true);
     expect(release).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
   });
 
-  it("skips teardown for an externally supervised gateway", () => {
+  it("skips teardown for an externally supervised gateway", async () => {
     const release = vi.fn();
     const remove = vi.fn();
     const log = vi.fn();
-    const attempted = teardownOrphanManagedGatewayOnAbort({
+    const cleanupComplete = await teardownOrphanManagedGatewayOnAbort({
       gatewayPort: 8814,
       gatewayName: "nemoclaw-8814",
       listSandboxes: () => ({ sandboxes: [], defaultSandbox: null }),
@@ -76,7 +76,7 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
       removeGatewayRegistration: remove,
       log,
     });
-    expect(attempted).toBe(false);
+    expect(cleanupComplete).toBe(true);
     expect(release).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
     expect(log.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
@@ -84,11 +84,11 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
     );
   });
 
-  it("skips teardown when authority cannot be revalidated", () => {
+  it("skips teardown when authority cannot be revalidated", async () => {
     const release = vi.fn();
     const remove = vi.fn();
     const warn = vi.fn();
-    const attempted = teardownOrphanManagedGatewayOnAbort({
+    const cleanupComplete = await teardownOrphanManagedGatewayOnAbort({
       gatewayPort: 8814,
       gatewayName: "nemoclaw-8814",
       listSandboxes: () => ({ sandboxes: [], defaultSandbox: null }),
@@ -99,7 +99,7 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
       removeGatewayRegistration: remove,
       warn,
     });
-    expect(attempted).toBe(false);
+    expect(cleanupComplete).toBe(false);
     expect(release).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
     expect(warn.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
@@ -107,7 +107,31 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
     );
   });
 
-  it("stops the host listener and removes registration when no sandbox owns the gateway", () => {
+  it("fails cleanup without teardown when sandbox ownership is unknown", async () => {
+    const release = vi.fn();
+    const remove = vi.fn();
+    const warn = vi.fn();
+    const cleanupComplete = await teardownOrphanManagedGatewayOnAbort({
+      gatewayPort: 8814,
+      gatewayName: "nemoclaw-8814",
+      listSandboxes: () => ({
+        sandboxes: [{ name: "alpha", gatewayName: "not-a-nemoclaw-gateway" }],
+        defaultSandbox: "alpha",
+      }),
+      releaseManagedGatewayPort: release,
+      removeGatewayRegistration: remove,
+      warn,
+    });
+
+    expect(cleanupComplete).toBe(false);
+    expect(release).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+    expect(warn.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
+      "sandbox gateway binding is unreadable",
+    );
+  });
+
+  it("stops the host listener and removes registration when no sandbox owns the gateway", async () => {
     const release = vi.fn(() => ({
       port: 8814,
       released: true,
@@ -116,9 +140,9 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
       scanned: true,
       skipped: false,
     }));
-    const remove = vi.fn();
+    const remove = vi.fn(() => true);
     const log = vi.fn();
-    const attempted = teardownOrphanManagedGatewayOnAbort({
+    const cleanupComplete = await teardownOrphanManagedGatewayOnAbort({
       gatewayPort: 8814,
       gatewayName: "nemoclaw-8814",
       listSandboxes: () => ({ sandboxes: [], defaultSandbox: null }),
@@ -136,7 +160,7 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
       removeGatewayRegistration: remove,
       log,
     });
-    expect(attempted).toBe(true);
+    expect(cleanupComplete).toBe(true);
     expect(release).toHaveBeenCalledWith({ port: 8814 });
     expect(remove).toHaveBeenCalledWith("nemoclaw-8814");
     const output = log.mock.calls.map((call) => String(call[0])).join("\n");
@@ -144,11 +168,11 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
     expect(output).toContain("Released gateway port 8814");
   });
 
-  it("warns and returns false when the sandbox registry cannot be read", () => {
+  it("warns and returns false when the sandbox registry cannot be read", async () => {
     const release = vi.fn();
     const remove = vi.fn();
     const warn = vi.fn();
-    const attempted = teardownOrphanManagedGatewayOnAbort({
+    const cleanupComplete = await teardownOrphanManagedGatewayOnAbort({
       gatewayPort: 8814,
       gatewayName: "nemoclaw-8814",
       listSandboxes: () => {
@@ -158,7 +182,7 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
       removeGatewayRegistration: remove,
       warn,
     });
-    expect(attempted).toBe(false);
+    expect(cleanupComplete).toBe(false);
     expect(release).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
     expect(warn.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
@@ -166,7 +190,7 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
     );
   });
 
-  it("keeps registration when listener release is not confirmed", () => {
+  it("keeps registration when listener release is not confirmed", async () => {
     const release = vi.fn(() => ({
       port: 8814,
       released: false,
@@ -177,7 +201,7 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
     }));
     const remove = vi.fn();
     const warn = vi.fn();
-    const attempted = teardownOrphanManagedGatewayOnAbort({
+    const cleanupComplete = await teardownOrphanManagedGatewayOnAbort({
       gatewayPort: 8814,
       gatewayName: "nemoclaw-8814",
       listSandboxes: () => ({ sandboxes: [], defaultSandbox: null }),
@@ -195,7 +219,7 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
       removeGatewayRegistration: remove,
       warn,
     });
-    expect(attempted).toBe(true);
+    expect(cleanupComplete).toBe(false);
     expect(release).toHaveBeenCalledWith({ port: 8814 });
     expect(remove).not.toHaveBeenCalled();
     expect(warn.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
@@ -203,13 +227,13 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
     );
   });
 
-  it("keeps registration when listener release throws", () => {
+  it("keeps registration when listener release throws", async () => {
     const release = vi.fn(() => {
       throw new Error("stop boom");
     });
     const remove = vi.fn();
     const warn = vi.fn();
-    const attempted = teardownOrphanManagedGatewayOnAbort({
+    const cleanupComplete = await teardownOrphanManagedGatewayOnAbort({
       gatewayPort: 8814,
       gatewayName: "nemoclaw-8814",
       listSandboxes: () => ({ sandboxes: [], defaultSandbox: null }),
@@ -227,8 +251,76 @@ describe("teardownOrphanManagedGatewayOnAbort (#8952)", () => {
       removeGatewayRegistration: remove,
       warn,
     });
-    expect(attempted).toBe(true);
+    expect(cleanupComplete).toBe(false);
     expect(remove).not.toHaveBeenCalled();
     expect(warn.mock.calls.map((call) => String(call[0])).join("\n")).toContain("stop boom");
+  });
+
+  it("fails cleanup when gateway registration removal is not confirmed", async () => {
+    const warn = vi.fn();
+    const cleanupComplete = await teardownOrphanManagedGatewayOnAbort({
+      gatewayPort: 8814,
+      gatewayName: "nemoclaw-8814",
+      listSandboxes: () => ({ sandboxes: [], defaultSandbox: null }),
+      resolveAuthority: () => ({
+        gatewayName: "nemoclaw-8814",
+        gatewayPort: 8814,
+        mode: "nemoclaw-managed",
+        source: "standalone",
+        endpoint: null,
+        stateDir: null,
+        supervisor: null,
+        requiredCapabilities: [],
+      }),
+      releaseManagedGatewayPort: () => ({
+        port: 8814,
+        released: true,
+        stopped: [4242],
+        remaining: [],
+        scanned: true,
+        skipped: false,
+      }),
+      removeGatewayRegistration: () => false,
+      warn,
+    });
+
+    expect(cleanupComplete).toBe(false);
+    expect(warn.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
+      "was not confirmed removed",
+    );
+  });
+
+  it("fails cleanup when gateway registration removal throws", async () => {
+    const warn = vi.fn();
+    const cleanupComplete = await teardownOrphanManagedGatewayOnAbort({
+      gatewayPort: 8814,
+      gatewayName: "nemoclaw-8814",
+      listSandboxes: () => ({ sandboxes: [], defaultSandbox: null }),
+      resolveAuthority: () => ({
+        gatewayName: "nemoclaw-8814",
+        gatewayPort: 8814,
+        mode: "nemoclaw-managed",
+        source: "standalone",
+        endpoint: null,
+        stateDir: null,
+        supervisor: null,
+        requiredCapabilities: [],
+      }),
+      releaseManagedGatewayPort: () => ({
+        port: 8814,
+        released: true,
+        stopped: [4242],
+        remaining: [],
+        scanned: true,
+        skipped: false,
+      }),
+      removeGatewayRegistration: () => {
+        throw new Error("remove boom");
+      },
+      warn,
+    });
+
+    expect(cleanupComplete).toBe(false);
+    expect(warn.mock.calls.map((call) => String(call[0])).join("\n")).toContain("remove boom");
   });
 });

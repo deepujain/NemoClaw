@@ -9,10 +9,12 @@ import type {
 import { requireReadOnlyHostMountRuntimeSupport } from "../host-mount";
 import {
   assertLockedResumeIntentSnapshot,
+  assertPortableOnboardProviderIntent,
   createDefaultResumeProfileEnvironmentScope,
   createPortableOnboardEnvironmentScope,
   preparePortableExperimentalHost,
   type PortableOnboardEnvironmentScope,
+  type PortableOnboardRuntimeContext,
 } from "../session-bootstrap";
 import type { OnboardOptions } from "../types";
 import { ensureUsageNoticeConsent } from "../usage-notice";
@@ -20,9 +22,10 @@ import { ensureUsageNoticeConsent } from "../usage-notice";
 export interface LockedOnboardRuntimePreparation {
   readonly checkpointProfile: CheckpointOnboardProfile;
   readonly environmentScope: PortableOnboardEnvironmentScope | null;
-  readonly preparedPortableAuthority: CheckpointPortableRuntimeAuthority | null;
+  readonly portableRuntimeContext: PortableOnboardRuntimeContext | null;
 }
 
+/** Stop onboarding on denied consent; the caller owns its ordering relative to runtime preparation. */
 async function ensureNoticeAccepted(
   options: OnboardOptions,
   nonInteractive: boolean,
@@ -80,6 +83,7 @@ function resolveCheckpointProfile(
   return { checkpointProfile, expectedPortableAuthority };
 }
 
+/** Restore scoped environment values if Portable host preparation fails. */
 function prepareEnvironment(
   options: OnboardOptions,
   resume: boolean,
@@ -87,12 +91,12 @@ function prepareEnvironment(
   expectedPortableAuthority: CheckpointPortableRuntimeAuthority | null,
 ): {
   environmentScope: PortableOnboardEnvironmentScope | null;
-  preparedPortableAuthority: CheckpointPortableRuntimeAuthority | null;
+  portableRuntimeContext: PortableOnboardRuntimeContext | null;
 } {
   if (checkpointProfile !== "portable") {
     return {
       environmentScope: resume ? createDefaultResumeProfileEnvironmentScope(process.env) : null,
-      preparedPortableAuthority: null,
+      portableRuntimeContext: null,
     };
   }
   const environmentScope = createPortableOnboardEnvironmentScope(
@@ -111,13 +115,17 @@ function prepareEnvironment(
       containersConf: prepared.containersConf,
       socketPath: prepared.authority.socketPath,
     });
-    return { environmentScope, preparedPortableAuthority: prepared.authority };
+    return {
+      environmentScope,
+      portableRuntimeContext: { authority: prepared.authority, environmentScope },
+    };
   } catch (error) {
     environmentScope.restore();
     throw error;
   }
 }
 
+/** Prepare runtime authority with the consent ordering required by fresh and resumed runs. */
 export async function prepare(
   options: OnboardOptions,
   resume: boolean,
@@ -137,6 +145,11 @@ export async function prepare(
     options.hostMounts?.length ? options.hostMounts : storedSession?.metadata?.hostMounts,
     { experimentalProfile: checkpointProfile === "portable" ? "portable" : null },
   );
+  if (checkpointProfile === "portable") {
+    assertPortableOnboardProviderIntent(process.env, options.portableInferenceActivation ?? null, {
+      resume,
+    });
+  }
   let environmentScope: PortableOnboardEnvironmentScope | null = null;
   try {
     // Fresh runs obtain consent before bounded host preparation writes. Resumes

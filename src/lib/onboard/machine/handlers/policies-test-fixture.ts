@@ -4,6 +4,7 @@
 import { vi } from "vitest";
 
 import { makeMessagingPlan } from "../../../../../test/helpers/messaging-plan-fixtures";
+import { mergePolicyMessagingChannels } from "../../messaging-policy-presets";
 import { createSession, type Session, type SessionUpdates } from "../../../state/onboard-session";
 import type { PoliciesStateOptions } from "./policies";
 
@@ -19,30 +20,24 @@ export function createPolicyHandlerDeps(
     activeSandbox: vi.fn(() => ({
       messaging: { plan: makeMessagingPlan({ channels: ["telegram"] }) },
     })),
-    mergeChannels: vi.fn(
-      (selected: string[], recorded: string[], active: string[] | null | undefined) =>
-        selected.length > 0 ? selected : (active ?? recorded),
-    ),
+    mergeChannels: vi.fn(mergePolicyMessagingChannels),
     unconfiguredChannels: vi.fn(
       (_planChannels: readonly string[], _selectedChannels: readonly string[]) => [] as string[],
     ),
+    inspectGatewayCredential: vi.fn(() => ({ kind: "missing" as const })),
     smoke: vi.fn(),
     prepareResume: vi.fn(
       (
         _sandboxName: string,
-        options: Parameters<
+        _options: Parameters<
           PoliciesStateOptions<
             PolicyTestAgent,
             PolicyTestWebSearchConfig
           >["deps"]["preparePolicyPresetResumeSelection"]
         >[1],
       ) => ({
-        policyPresets: (options.recordedPolicyPresets ?? []).filter(
-          (name) => name !== "unsupported",
-        ),
-        recordedPolicyPresetsNeedReconcile: (options.recordedPolicyPresets ?? []).includes(
-          "unsupported",
-        ),
+        policyPresets: [],
+        livePolicyPresetsNeedUpdate: false,
         disabledMessagingPolicyPresetApplied: false,
         suppressedAgentRequiredPresetsLive: false,
       }),
@@ -57,7 +52,6 @@ export function createPolicyHandlerDeps(
       return session;
     }),
     complete: vi.fn(async () => session),
-    persistPolicies: vi.fn((_sandboxName: string, _appliedPolicyPresets: string[]) => undefined),
   };
   return {
     calls,
@@ -66,6 +60,7 @@ export function createPolicyHandlerDeps(
       getActiveSandbox: calls.activeSandbox,
       mergePolicyMessagingChannels: calls.mergeChannels,
       detectUnconfiguredMessagingChannels: calls.unconfiguredChannels,
+      inspectGatewayCredential: calls.inspectGatewayCredential,
       verifyCompatibleEndpointSandboxSmoke: calls.smoke,
       preparePolicyPresetResumeSelection: calls.prepareResume,
       arePolicyPresetsApplied: calls.appliedCheck,
@@ -76,7 +71,6 @@ export function createPolicyHandlerDeps(
       updateSession: calls.updateSession,
       recordStepComplete: calls.complete,
       toSessionUpdates: (updates: Record<string, unknown>) => updates as SessionUpdates,
-      persistAppliedPolicyPresets: calls.persistPolicies,
       ...overrides,
     },
     setSession(next: Session) {

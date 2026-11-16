@@ -6,10 +6,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { testTimeout } from "../../../test/helpers/timeouts";
-import { checkOptimizedBuildContextCopySources } from "../../../scripts/checks/optimized-build-context-copy-sources.mts";
 import {
   directDockerfileCopySources,
+  directDockerfileContextSources,
   formatMissingDockerfileCopySources,
   missingDockerfileCopySources,
 } from "../../../scripts/lib/dockerfile-copy-sources.mts";
@@ -35,21 +34,13 @@ describe("optimized build-context Dockerfile sources", () => {
     }
   });
 
-  it(
-    "accepts every direct COPY source from the root Dockerfile in the optimized context",
-    () => {
-      checkOptimizedBuildContextCopySources(path.resolve(import.meta.dirname, "../../.."));
-    },
-    testTimeout(30_000),
-  );
-
   it("parses flags, continuations, and multiple sources while ignoring build stages", () => {
     const directory = makeTemporaryDirectory();
     const dockerfilePath = writeDockerfile(
       directory,
       [
         "FROM base AS build",
-        "COPY --chmod=0444 \\",
+        "copy --chmod=0444 \\",
         "  scripts/lib/corporate-ca-runtime.sh \\",
         "  scripts/lib/sandbox-init.sh \\",
         "  /usr/local/lib/nemoclaw/",
@@ -85,6 +76,43 @@ describe("optimized build-context Dockerfile sources", () => {
     expect(formatMissingDockerfileCopySources(missing)).toContain(
       "Dockerfile:2 missing scripts/lib/corporate-ca-runtime.sh",
     );
+  });
+
+  it("tracks context bind mounts while ignoring cache and stage mounts", () => {
+    const directory = makeTemporaryDirectory();
+    const dockerfilePath = writeDockerfile(
+      directory,
+      [
+        "FROM base",
+        "RUN --mount=type=cache,target=/cache \\",
+        "    --mount=type=bind,from=build,source=/out,target=/out \\",
+        "    --mount=type=bind,source=scripts/probe.mts,target=/probe.mts \\",
+        "    --mount=src=src/specs.ts,target=/specs.ts node /probe.mts",
+      ].join("\n"),
+    );
+    expect(directDockerfileContextSources(dockerfilePath)).toEqual([
+      { lineNumber: 2, source: "scripts/probe.mts" },
+      { lineNumber: 2, source: "src/specs.ts" },
+    ]);
+    expect(missingDockerfileCopySources(dockerfilePath, directory)).toHaveLength(2);
+    fs.mkdirSync(path.join(directory, "scripts"));
+    fs.mkdirSync(path.join(directory, "src"));
+    fs.writeFileSync(path.join(directory, "scripts/probe.mts"), "fixture\n");
+    fs.writeFileSync(path.join(directory, "src/specs.ts"), "fixture\n");
+    expect(missingDockerfileCopySources(dockerfilePath, directory)).toEqual([]);
+  });
+
+  it.each([
+    "--mount=type=bind,target=/workspace",
+    "--mount=type=bind,source=../outside,target=/workspace",
+    "--mount=type=bind,source=$INPUT,target=/workspace",
+    "--mount=type=bind,source=first,source=second,target=/workspace",
+    "--mount=type=bind,source=first,src=second,target=/workspace",
+    "--mount type=bind,source=first,target=/workspace",
+  ])("rejects an untracked context bind form: %s", (mount) => {
+    const directory = makeTemporaryDirectory();
+    const dockerfilePath = writeDockerfile(directory, `FROM base\nRUN ${mount} true\n`);
+    expect(() => directDockerfileContextSources(dockerfilePath)).toThrow(/Unsupported|Missing/u);
   });
 
   it("requires a wildcard source to match at least one staged path", () => {

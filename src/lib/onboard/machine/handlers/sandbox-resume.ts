@@ -1,16 +1,70 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import {
-  type WebSearchConfig,
-  webSearchEnvFor,
-  webSearchLabelFor,
-  webSearchProviderForConfig,
-} from "../../../inference/web-search";
 import type { Session } from "../../../state/onboard-session";
 import type { SandboxEntry } from "../../../state/registry";
+import { isN1xManagedVllmProviderModel } from "../../../domain/sandbox/n1x-managed-vllm-rebuild";
+import {
+  isPendingReservationForSession,
+  isRouteOnlySandboxReservation,
+} from "../../../state/registry/route-reservation";
 import { persistedSandboxHostMountsEqual } from "../../../state/registry/host-mount";
-import { normalizeToolDisclosure, toolDisclosureOrDefault } from "../../../tool-disclosure";
+import { reserveRecoveredSandboxInferenceRoute } from "../../sandbox-lifecycle";
+import {
+  normalizeToolDisclosure,
+  resolveToolDisclosureRequest,
+  toolDisclosureOrDefault,
+  type ToolDisclosure,
+} from "../../../tool-disclosure";
+import { validateResourceValue } from "../../../resources-cmd";
+
+export {
+  assertHermesSwitchyardRoutingReusable,
+  hermesSwitchyardRoutingCreateIntentFields,
+} from "../../sandbox-reuse";
+
+/** Return true when a saved resource profile is null or has valid CPU and memory values. */
+export function isValidSavedResourceProfile(
+  profile: { readonly cpu: string; readonly memory: string } | null | undefined,
+): boolean {
+  if (profile === null) return true;
+  if (!profile) return false;
+  try {
+    validateResourceValue(profile.cpu);
+    validateResourceValue(profile.memory);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Choose the initial local OpenClaw default only for this session's new reservation. */
+export function initialOpenClawToolDisclosure(input: {
+  fresh: boolean;
+  agentName: string;
+  provider: string;
+  model: string;
+  deferredN1xManagedVllmPreviewIntent?: boolean;
+  entry: SandboxEntry | null;
+  sessionId: string | undefined;
+  env: NodeJS.ProcessEnv;
+}): ToolDisclosure | null {
+  const localDefault =
+    input.fresh &&
+    input.agentName === "openclaw" &&
+    (input.provider === "ollama-local" || input.provider === "vllm-local") &&
+    input.entry !== null &&
+    isRouteOnlySandboxReservation(input.entry) &&
+    isPendingReservationForSession(input.entry, input.sessionId) &&
+    input.entry.toolDisclosure === undefined;
+  if (!localDefault) return null;
+  // Reserve context for replies on the 32K N1x Qwen recipe (#13088).
+  const n1xDefault =
+    input.deferredN1xManagedVllmPreviewIntent === true &&
+    isN1xManagedVllmProviderModel(input.provider, input.model) &&
+    input.entry?.model === input.model;
+  return resolveToolDisclosureRequest(null, input.env) ?? (n1xDefault ? "progressive" : "direct");
+}
 
 export interface SandboxResumeSignals {
   readonly resume: boolean;
@@ -24,6 +78,7 @@ export interface SandboxResumeSignals {
   readonly hostMountConfigChanged: boolean;
   readonly recreateSandboxRequested: boolean;
   readonly recreateJournalHandoff?: boolean;
+  readonly activeRecreateJournal?: boolean;
   readonly messagingChannelConfigChanged: boolean;
   readonly messagingCredentialChanged: boolean;
   readonly hermesToolGatewayConfigChanged: boolean;
@@ -32,10 +87,24 @@ export interface SandboxResumeSignals {
   readonly toolDisclosureMigrationNeeded: boolean;
   readonly toolDisclosureChanged: boolean;
   readonly inferenceSelectionChanged: boolean;
+  readonly hermesPortableLifecyclePending?: boolean;
 }
 
 export function hasHostMountConfigDrift(left: unknown, right: unknown): boolean {
   return !persistedSandboxHostMountsEqual(left, right);
+}
+
+/**
+ * A sandbox with no recorded channel configuration consumed none, so
+ * process-environment channel values are not drift.
+ */
+export function hasMessagingChannelConfigDrift<Config>(
+  effective: Config | null,
+  stored: Config | null,
+  configsEqual: (left: Config | null, right: Config | null) => boolean,
+): boolean {
+  if (stored === null) return false;
+  return !configsEqual(effective, stored);
 }
 
 interface InferenceRouteResumeInput {
@@ -101,8 +170,8 @@ export function resolveToolDisclosureResumeSignals(
     toolDisclosureMigrationNeeded: migrationNeeded,
     toolDisclosureChanged: Boolean(
       registryEntry &&
-        !migrationNeeded &&
-        recorded !== toolDisclosureOrDefault(session?.toolDisclosure),
+      !migrationNeeded &&
+      recorded !== toolDisclosureOrDefault(session?.toolDisclosure),
     ),
   };
 }
@@ -111,8 +180,9 @@ export type SandboxResumeDecision =
   | {
       readonly kind: "create";
       readonly validateMessagingCredentialsBeforeMutation?: boolean;
+      readonly continueHermesPortableLifecycle?: true;
     }
-  | { readonly kind: "reuse" }
+  | { readonly kind: "reuse"; readonly note?: string }
   | {
       readonly kind: "recreate";
       readonly note: string;
@@ -136,35 +206,14 @@ export function requiresSandboxRecreation(
   return explicitlyRequested || decision.kind !== "create";
 }
 
-export function mcpRegistryRemovalBlockReason(
-  decision: SandboxResumeDecision,
-  sandboxName: string | null,
-  webSearchConfig: WebSearchConfig | null,
-  getSandboxRegistryEntry: (sandboxName: string) => SandboxEntry | null,
-): string | null {
-  if (decision.kind !== "recreate" || !decision.removeRegistryEntry || !sandboxName) return null;
-  const mcpState = getSandboxRegistryEntry(sandboxName)?.mcp;
-  if (!mcpState) return null;
-
-  const selectedProvider = webSearchConfig ? webSearchProviderForConfig(webSearchConfig) : null;
-  if (selectedProvider) {
-    const credentialEnv = webSearchEnvFor(selectedProvider);
-    const collidingBridge = Object.values(mcpState.bridges).find((entry) =>
-      entry.env.includes(credentialEnv),
-    );
-    if (collidingBridge) {
-      return `  Cannot enable ${webSearchLabelFor(selectedProvider)}: MCP server '${collidingBridge.server}' already owns ${credentialEnv}. Use a distinct credential name.`;
-    }
-  }
-
-  return `  Sandbox '${sandboxName}' has managed MCP state. Use the transactional rebuild command before changing settings that recreate the sandbox.`;
-}
-
 function canReuseSandbox(signals: SandboxResumeSignals): boolean {
   return (
     !signals.resumeAgentChanged &&
     !signals.inferenceRouteConfigChanged &&
-    !signals.compatibleEndpointReasoningChanged &&
+    // `compatibleEndpointReasoningChanged` is intentionally absent: baking the
+    // reasoning capability is a build-time value that a plain resume must not
+    // change, so a Ready sandbox is reused with its recorded value instead of
+    // being deleted. Only an explicit --recreate-sandbox changes it (#13732).
     !signals.inferenceSelectionChanged &&
     !signals.webSearchConfigChanged &&
     !signals.sandboxGpuConfigChanged &&
@@ -203,13 +252,12 @@ function toolDisclosureResumeDecision(signals: SandboxResumeSignals): SandboxRes
 }
 
 function compatibilityResumeDecision(signals: SandboxResumeSignals): SandboxResumeDecision | null {
-  if (signals.compatibleEndpointReasoningChanged && signals.sandboxReuseState === "ready") {
-    return {
-      kind: "recreate",
-      note: "  [resume] Compatible endpoint reasoning capability changed; recreating sandbox.",
-      removeRegistryEntry: false,
-    };
-  }
+  // A Ready sandbox's baked reasoning capability is deliberately NOT recreated
+  // here: the recorded value wins on a plain resume, and any drifted input is
+  // reported instead of applied. Recreating requires an explicit
+  // --recreate-sandbox, which runtimeConfigurationResumeDecision handles
+  // lower in the decision order (#13732). Not-ready sandboxes still fall
+  // through to repair.
   if (signals.inferenceSelectionChanged) {
     return {
       kind: "recreate",
@@ -308,11 +356,14 @@ function runtimeConfigurationResumeDecision(
 }
 
 function continuesJournaledRecreate(signals: SandboxResumeSignals): boolean {
+  const sourceStateKnown = ["ready", "missing", "not_ready"].includes(signals.sandboxReuseState);
   return (
     signals.resume &&
-    (signals.sandboxReuseState === "missing" || signals.sandboxReuseState === "not_ready") &&
-    signals.recreateSandboxRequested &&
-    Boolean(signals.recreateJournalHandoff)
+    sourceStateKnown &&
+    (signals.activeRecreateJournal === true ||
+      ((signals.sandboxReuseState === "missing" || signals.sandboxReuseState === "not_ready") &&
+        signals.recreateSandboxRequested &&
+        Boolean(signals.recreateJournalHandoff)))
   );
 }
 
@@ -324,6 +375,15 @@ function requiresUnownedNotReadyRepair(signals: SandboxResumeSignals): boolean {
   );
 }
 
+function reuseSandboxDecision(signals: SandboxResumeSignals): SandboxResumeDecision {
+  return signals.compatibleEndpointReasoningChanged
+    ? {
+        kind: "reuse",
+        note: "  [resume] Reasoning capability differs from the Ready sandbox; keeping its baked value. Pass --recreate-sandbox to apply the saved onboarding value.",
+      }
+    : { kind: "reuse" };
+}
+
 export function decideSandboxResume(signals: SandboxResumeSignals): SandboxResumeDecision {
   if (continuesJournaledRecreate(signals)) {
     return {
@@ -332,11 +392,14 @@ export function decideSandboxResume(signals: SandboxResumeSignals): SandboxResum
       removeRegistryEntry: false,
     };
   }
+  if (signals.hermesPortableLifecyclePending === true) {
+    return { kind: "create", continueHermesPortableLifecycle: true };
+  }
   if (!signals.resume || !signals.sandboxStepComplete) return { kind: "create" };
   if (requiresUnownedNotReadyRepair(signals)) return { kind: "repair-and-recreate" };
   const compatibilityDecision = compatibilityResumeDecision(signals);
   if (compatibilityDecision) return compatibilityDecision;
-  if (canReuseSandbox(signals)) return { kind: "reuse" };
+  if (canReuseSandbox(signals)) return reuseSandboxDecision(signals);
   const configurationDecision = runtimeConfigurationResumeDecision(signals);
   if (configurationDecision) return configurationDecision;
   const toolDisclosureDecision = toolDisclosureResumeDecision(signals);
@@ -348,3 +411,46 @@ export function decideSandboxResume(signals: SandboxResumeSignals): SandboxResum
     removeRegistryEntry: true,
   };
 }
+
+/** Preserve explicit runtime authority while reclaiming a published resume reservation. */
+export function reserveSandboxResumeRoute(
+  sandboxName: string,
+  entry: SandboxEntry | null,
+  route: Parameters<typeof import("../../../state/registry").reserveSandboxInferenceRoute>[1],
+  reserve: typeof import("../../../state/registry").reserveSandboxInferenceRoute,
+  cliName: string,
+): void {
+  if (!route.reservationSessionId || !entry) return;
+  const explicitHostLocal = entry.hostLocalInferenceProvenance !== undefined;
+  // Route-only create reservations stay with the verified create boundary.
+  if (
+    !explicitHostLocal &&
+    entry.pendingRouteReservation === true &&
+    (entry.reservationSessionId === route.reservationSessionId || entry.createdAt === undefined)
+  )
+    return;
+  const desired = explicitHostLocal
+    ? {
+        ...route,
+        gatewayPort: entry.gatewayPort ?? undefined,
+        openshellDriver: entry.openshellDriver ?? undefined,
+        hostLocalInferenceReceipt: entry.hostLocalInferenceReceipt,
+        hostLocalInferenceProvenance: entry.hostLocalInferenceProvenance,
+      }
+    : route;
+  try {
+    if (!reserveRecoveredSandboxInferenceRoute(reserve, sandboxName, desired)) {
+      throw new Error(`Failed to reserve the inference route for sandbox '${sandboxName}'.`);
+    }
+  } catch (error) {
+    if (!explicitHostLocal) throw error;
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Cannot reserve host-local inference for sandbox '${sandboxName}': ${detail}\n` +
+        `Run '${cliName} ${sandboxName} doctor' to inspect runtime and gateway authority before retrying.`,
+      { cause: error },
+    );
+  }
+}
+
+export { rejectRetiredModelRouter } from "../../../inference/provider-key/contract";

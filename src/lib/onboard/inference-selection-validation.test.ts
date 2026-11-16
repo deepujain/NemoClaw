@@ -2,14 +2,192 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
+import { useOpenAiValidationTestServers } from "../inference/openai-validation-session.test-helpers";
 import { OnboardInferenceCapabilityCache } from "./inference-capability-cache";
 import { createInferenceSelectionValidationHelpers } from "./inference-selection-validation";
 
+const EXPECTED_WSL_SLOW_VERIFICATION_ADVISORY =
+  "WSL2 detected — network verification may be slower than expected. " +
+  "Check proxy and VPN health, then run onboarding again with a longer budget: " +
+  "`NEMOCLAW_ONBOARD_VALIDATION_TIMEOUT_SECONDS=360 nemoclaw onboard`.";
+
+const listen = useOpenAiValidationTestServers();
+const resumableValidationExit = {
+  code: 1,
+  name: "OnboardDeferredExitError",
+  preserveIncompleteSession: true,
+};
+const terminalValidationExit = {
+  code: 1,
+  name: "OnboardDeferredExitError",
+  preserveIncompleteSession: false,
+};
+
 describe("inference selection validation", () => {
+  it.each([
+    {
+      route: "native optimized transport",
+      handleRequest: (request: http.IncomingMessage, response: http.ServerResponse) => {
+        request.resume();
+        response.end('{"choices":[{"message":{"content":"OK"}}]}');
+      },
+      expectedLegacyCalls: 0,
+    },
+    {
+      route: "legacy fallback after a native failure",
+      handleRequest: (request: http.IncomingMessage) => request.socket.destroy(),
+      expectedLegacyCalls: 1,
+    },
+  ])("uses the default optimized probe through the public helper: $route", async (testCase) => {
+    const server = http.createServer(testCase.handleRequest);
+    const port = await listen(server);
+    const spawnSyncImpl = vi.fn((_command: string, args: readonly string[]) => {
+      const outputPath = args[args.indexOf("-o") + 1];
+      fs.writeFileSync(outputPath, '{"choices":[{"message":{"content":"OK"}}]}');
+      return {
+        pid: 1,
+        output: [],
+        stdout: "200",
+        stderr: "",
+        status: 0,
+        signal: null,
+      };
+    });
+    const helpers = createInferenceSelectionValidationHelpers({
+      isNonInteractive: () => false,
+      agentProductName: () => "OpenClaw",
+      promptValidationRecovery: vi.fn(async () => "selection" as const),
+    });
+    const probeOptions = {
+      apiKey: "test-key",
+      skipResponsesProbe: true,
+      spawnSyncImpl,
+      validationTiming: {
+        connectTimeoutSeconds: 1,
+        maxTimeSeconds: 1,
+        source: "standard",
+      },
+      validationSessionOptions: {
+        env: {},
+        lookup: async () => [{ address: "127.0.0.1", family: 4 }],
+        allowPrivateAddressesForTesting: true,
+      },
+    };
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await expect(
+        helpers.validateOpenAiLikeSelection(
+          "Compatible endpoint",
+          `http://provider.example.com:${port}/v1`,
+          "model-a",
+          null,
+          undefined,
+          undefined,
+          probeOptions,
+        ),
+      ).resolves.toEqual({ ok: true, api: "openai-completions" });
+      expect(spawnSyncImpl).toHaveBeenCalledTimes(testCase.expectedLegacyCalls);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it.each([
+    {
+      variant: "NVIDIA",
+      provider: "nvidia-nim",
+      useNvidiaEndpointProbePayload: true,
+      expectedBody: {
+        model: "nvidia/nemotron-3-super-120b-a12b",
+        messages: [{ role: "user", content: "Reply with exactly: OK" }],
+        max_tokens: 16,
+        temperature: 1,
+        top_p: 0.95,
+        reasoning_effort: "none",
+      },
+    },
+    {
+      variant: "generic",
+      provider: "compatible-endpoint",
+      useNvidiaEndpointProbePayload: false,
+      expectedBody: {
+        model: "nvidia/nemotron-3-super-120b-a12b",
+        messages: [{ role: "user", content: "Reply with exactly: OK" }],
+        max_tokens: 16,
+      },
+    },
+    {
+      variant: "Gemini",
+      provider: "gemini-api",
+      useNvidiaEndpointProbePayload: false,
+      expectedBody: {
+        model: "gemini-2.5-flash",
+        messages: [{ role: "user", content: "Reply with exactly: OK" }],
+        max_tokens: 256,
+      },
+    },
+  ])(
+    "emits the $variant request through selection validation (#10880, #11965)",
+    async ({ provider, useNvidiaEndpointProbePayload, expectedBody }) => {
+      let observedBody = "";
+      const server = http.createServer((request, response) => {
+        let body = "";
+        request.setEncoding("utf8");
+        request.on("data", (chunk) => {
+          body += chunk;
+        });
+        request.on("end", () => {
+          observedBody = body;
+          response.end('{"choices":[{"message":{"content":"OK"}}]}');
+        });
+      });
+      const port = await listen(server);
+      const helpers = createInferenceSelectionValidationHelpers({
+        isNonInteractive: () => false,
+        agentProductName: () => "OpenClaw",
+        promptValidationRecovery: vi.fn(async () => "selection" as const),
+      });
+      const probeOptions = {
+        apiKey: "test-key",
+        skipResponsesProbe: true,
+        validationTiming: {
+          connectTimeoutSeconds: 1,
+          maxTimeSeconds: 1,
+          source: "standard" as const,
+        },
+        validationSessionOptions: {
+          env: {},
+          lookup: async () => [{ address: "127.0.0.1", family: 4 as const }],
+          allowPrivateAddressesForTesting: true,
+        },
+      };
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      try {
+        await expect(
+          helpers.validateOpenAiLikeSelection(
+            provider,
+            `http://provider.example.com:${port}/v1`,
+            expectedBody.model,
+            null,
+            undefined,
+            undefined,
+            { ...probeOptions, provider, useNvidiaEndpointProbePayload },
+          ),
+        ).resolves.toEqual({ ok: true, api: "openai-completions" });
+        expect(JSON.parse(observedBody)).toEqual(expectedBody);
+      } finally {
+        log.mockRestore();
+      }
+    },
+  );
+
   it("uses an explicit managed key without forwarding it as a probe option", async () => {
     const apiKey = "f".repeat(64);
     const getCredential = vi.fn(() => "ambient-key");
@@ -87,52 +265,81 @@ describe("inference selection validation", () => {
     }
   });
 
-  it("distinguishes a Gemini runtime 404 from native model catalog validation (#9298)", async () => {
-    const apiKey = "gemini-test-secret";
-    const probeOpenAiLikeEndpoint = vi.fn(() => ({
-      ok: false,
-      failures: [{ name: "Chat Completions API", httpStatus: 404, curlStatus: 0 }],
-    }));
-    const promptValidationRecovery = vi.fn(async () => "selection" as const);
+  it("withholds OpenAI-like availability and capability caching when sandbox identity changes during the probe (#9833)", async () => {
+    const capabilityCache = new OnboardInferenceCapabilityCache();
     const helpers = createInferenceSelectionValidationHelpers({
       isNonInteractive: () => false,
       agentProductName: () => "OpenClaw",
-      getCredential: () => apiKey,
-      probeOpenAiLikeEndpoint,
-      promptValidationRecovery,
+      getCredential: () => "test-key",
+      probeOpenAiLikeEndpoint: vi.fn(async () => ({
+        ok: true,
+        api: "openai-completions",
+        label: "Chat Completions API",
+      })),
+      promptValidationRecovery: vi.fn(async () => "selection" as const),
     });
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
 
     try {
       await expect(
         helpers.validateOpenAiLikeSelection(
-          "Google Gemini",
-          "https://generativelanguage.googleapis.com/v1beta/openai",
-          "gemini-2.5-flash",
-          "GEMINI_API_KEY",
+          "OpenAI",
+          "https://api.example.test/v1",
+          "model-a",
+          "OPENAI_API_KEY",
           undefined,
           undefined,
-          { provider: "gemini-api", skipResponsesProbe: true },
+          {
+            capabilityCache,
+            revalidateSandboxIdentity: () => {
+              throw new Error("sandbox identity changed");
+            },
+          },
         ),
-      ).resolves.toEqual({ ok: false, retry: "selection" });
-      expect(probeOpenAiLikeEndpoint).toHaveBeenCalledWith(
-        "https://generativelanguage.googleapis.com/v1beta/openai",
-        "gemini-2.5-flash",
-        apiKey,
-        { skipResponsesProbe: true, calibrateTimeouts: true },
-      );
-      const errorOutput = error.mock.calls.map((args) => args.join(" ")).join("\n");
-      expect(errorOutput).toContain(
-        "This 404 came from Google's OpenAI-compatible Chat Completions runtime route, not the native /v1beta/models catalog.",
-      );
-      expect(errorOutput).toContain(
-        "the sandbox uses that Chat Completions route at runtime",
-      );
-      expect(errorOutput).not.toContain(apiKey);
+      ).rejects.toThrow("sandbox identity changed");
+      expect(log.mock.calls.flat().join("\n")).not.toContain("available");
+      expect(
+        capabilityCache.takeCompletedOpenAiChat({
+          endpointUrl: "https://api.example.test/v1",
+          model: "model-a",
+        }),
+      ).toBe(false);
     } finally {
       log.mockRestore();
-      error.mockRestore();
+    }
+  });
+
+  it("withholds Anthropic availability when sandbox identity changes during the probe (#9833)", async () => {
+    const helpers = createInferenceSelectionValidationHelpers({
+      isNonInteractive: () => false,
+      agentProductName: () => "OpenClaw",
+      getCredential: () => "test-key",
+      probeAnthropicEndpoint: vi.fn(() => ({
+        ok: true,
+        api: "anthropic-messages",
+        label: "Anthropic Messages API",
+      })),
+      promptValidationRecovery: vi.fn(async () => "selection" as const),
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await expect(
+        helpers.validateAnthropicSelectionWithRetryMessage(
+          "Anthropic",
+          "https://api.anthropic.example.test",
+          "model-a",
+          "ANTHROPIC_API_KEY",
+          undefined,
+          undefined,
+          () => {
+            throw new Error("sandbox identity changed");
+          },
+        ),
+      ).rejects.toThrow("sandbox identity changed");
+      expect(log.mock.calls.flat().join("\n")).not.toContain("available");
+    } finally {
+      log.mockRestore();
     }
   });
 
@@ -141,7 +348,7 @@ describe("inference selection validation", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
     const promptValidationRecovery = vi.fn(async () => "selection" as const);
-    const teardownOrphanManagedGatewayOnAbort = vi.fn();
+    const teardownOrphanManagedGatewayOnAbort = vi.fn(() => true);
     const helpers = createInferenceSelectionValidationHelpers({
       isNonInteractive: () => true,
       agentProductName: () => "OpenClaw",
@@ -162,8 +369,8 @@ describe("inference selection validation", () => {
           "meta/llama-3.3-70b-instruct",
           "NVIDIA_INFERENCE_API_KEY",
         ),
-      ).rejects.toThrow("Non-interactive endpoint validation failed.");
-      expect(exit).toHaveBeenCalledWith(1);
+      ).rejects.toMatchObject(resumableValidationExit);
+      expect(exit).not.toHaveBeenCalled();
       expect(process.exitCode).toBe(1);
       expect(promptValidationRecovery).not.toHaveBeenCalled();
       expect(teardownOrphanManagedGatewayOnAbort).toHaveBeenCalledOnce();
@@ -176,6 +383,157 @@ describe("inference selection validation", () => {
       process.exitCode = originalExitCode;
       error.mockRestore();
       exit.mockRestore();
+    }
+  });
+
+  it("prints transport guidance and the WSL advisory before the non-interactive abort (#10413)", async () => {
+    // A non-interactive run exits before the recovery prompt, which is where
+    // this guidance normally reaches an operator. Without it the terminal ends
+    // at a bare "curl exit 28" and names no next step.
+    const originalExitCode = process.exitCode;
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const promptValidationRecovery = vi.fn(async () => "selection" as const);
+    const helpers = createInferenceSelectionValidationHelpers({
+      isNonInteractive: () => true,
+      agentProductName: () => "OpenClaw",
+      getCredential: () => "nvapi-test-key-12345",
+      probeOpenAiLikeEndpoint: () => ({
+        ok: false,
+        advisory: EXPECTED_WSL_SLOW_VERIFICATION_ADVISORY,
+        failures: [
+          {
+            name: "Chat Completions API",
+            curlStatus: 28,
+            message: "curl failed (exit 28)",
+          },
+        ],
+      }),
+      teardownOrphanManagedGatewayOnAbort: () => true,
+      promptValidationRecovery,
+    });
+
+    try {
+      await expect(
+        helpers.validateOpenAiLikeSelection(
+          "NVIDIA Endpoints",
+          "https://integrate.api.nvidia.com/v1",
+          "meta/llama-3.3-70b-instruct",
+          "NVIDIA_INFERENCE_API_KEY",
+        ),
+      ).rejects.toMatchObject(resumableValidationExit);
+      expect(promptValidationRecovery).not.toHaveBeenCalled();
+      expect(error.mock.calls.map((args) => args.join(" "))).toEqual([
+        "  NVIDIA Endpoints endpoint validation failed.",
+        "  Validation probe summary: Chat Completions API: curl exit 28.",
+        "  Validation details were omitted to avoid exposing credentials.",
+        "  Validation timed out before the provider replied. Retry, or check network/proxy health.",
+        `  ${EXPECTED_WSL_SLOW_VERIFICATION_ADVISORY}`,
+      ]);
+    } finally {
+      process.exitCode = originalExitCode;
+      error.mockRestore();
+    }
+  });
+
+  it("carries a default-probe WSL timeout through non-interactive teardown (#10413)", async () => {
+    let _requestIndex = 0;
+    const reasoningResponse =
+      '{"choices":[{"finish_reason":"length","message":{"content":"","reasoning_content":"Planning the tool call."}}]}';
+    const replies = [(response: http.ServerResponse) => response.end(reasoningResponse), () => {}];
+    const server = http.createServer((request, response) => {
+      request.resume();
+      (replies[_requestIndex++] ?? replies[1])(response);
+    });
+    const port = await listen(server);
+    const originalExitCode = process.exitCode;
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const promptValidationRecovery = vi.fn(async () => "selection" as const);
+    const teardownOrphanManagedGatewayOnAbort = vi.fn(() => true);
+    const helpers = createInferenceSelectionValidationHelpers({
+      isNonInteractive: () => true,
+      agentProductName: () => "OpenClaw",
+      getCredential: () => "test-key",
+      teardownOrphanManagedGatewayOnAbort,
+      promptValidationRecovery,
+    });
+    const probeOptions = {
+      skipResponsesProbe: true,
+      requireChatCompletionsToolCalling: true,
+      isWsl: true,
+      spawnSyncImpl: () => {
+        throw new Error("unexpected legacy probe");
+      },
+      validationTiming: { connectTimeoutSeconds: 0.01, maxTimeSeconds: 0.01, source: "standard" },
+      validationSessionOptions: {
+        env: {},
+        lookup: async () => [{ address: "127.0.0.1", family: 4 }],
+        allowPrivateAddressesForTesting: true,
+      },
+    };
+    try {
+      const failure = await helpers
+        .validateOpenAiLikeSelection(
+          "Compatible endpoint",
+          `http://provider.example.com:${port}/v1`,
+          "qwen3-vl:4b",
+          null,
+          undefined,
+          undefined,
+          probeOptions,
+        )
+        .catch((caught) => caught);
+      expect({
+        failure,
+        output: error.mock.calls.map((args) => args.join(" ")),
+        promptCalls: promptValidationRecovery.mock.calls.length,
+        teardownCalls: teardownOrphanManagedGatewayOnAbort.mock.calls.length,
+      }).toEqual({
+        failure: expect.objectContaining(resumableValidationExit),
+        output: expect.arrayContaining([
+          "  Validation timed out before the provider replied. Retry, or check network/proxy health.",
+          `  ${EXPECTED_WSL_SLOW_VERIFICATION_ADVISORY}`,
+        ]),
+        promptCalls: 0,
+        teardownCalls: 1,
+      });
+    } finally {
+      process.exitCode = originalExitCode;
+      error.mockRestore();
+    }
+  });
+
+  it("shows the WSL advisory on the interactive recovery path too (#10413)", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const promptValidationRecovery = vi.fn(async () => "selection" as const);
+    const helpers = createInferenceSelectionValidationHelpers({
+      isNonInteractive: () => false,
+      agentProductName: () => "OpenClaw",
+      getCredential: () => "nvapi-test-key-12345",
+      probeOpenAiLikeEndpoint: () => ({
+        ok: false,
+        advisory: EXPECTED_WSL_SLOW_VERIFICATION_ADVISORY,
+        failures: [{ name: "Chat Completions API", curlStatus: 28 }],
+      }),
+      promptValidationRecovery,
+    });
+
+    try {
+      await helpers.validateOpenAiLikeSelection(
+        "NVIDIA Endpoints",
+        "https://integrate.api.nvidia.com/v1",
+        "meta/llama-3.3-70b-instruct",
+        "NVIDIA_INFERENCE_API_KEY",
+      );
+      // The prompt owns transport guidance here, so only the advisory is added.
+      expect(error.mock.calls.map((args) => args.join(" "))).toEqual([
+        "  NVIDIA Endpoints endpoint validation failed.",
+        "  Validation probe summary: Chat Completions API: curl exit 28.",
+        "  Validation details were omitted to avoid exposing credentials.",
+        `  ${EXPECTED_WSL_SLOW_VERIFICATION_ADVISORY}`,
+      ]);
+      expect(promptValidationRecovery).toHaveBeenCalledOnce();
+    } finally {
+      error.mockRestore();
     }
   });
 
@@ -439,12 +797,14 @@ describe("inference selection validation", () => {
           "COMPATIBLE_API_KEY",
         ),
       ).resolves.toEqual({ ok: false, retry: "retry" });
+      expect(error).toHaveBeenCalledWith('  Endpoint: "https://example.invalid/v1"');
       expect(probeOpenAiLikeEndpoint).not.toHaveBeenCalled();
       expect(promptValidationRecovery).toHaveBeenCalledWith(
         "Custom endpoint",
         expect.objectContaining({ kind: "transport", retry: "retry" }),
         "COMPATIBLE_API_KEY",
         null,
+        undefined,
       );
     } finally {
       error.mockRestore();
@@ -504,7 +864,7 @@ describe("inference selection validation", () => {
       probeAnthropicEndpoint,
       promptValidationRecovery: vi.fn(async () => "selection" as const),
       resolveEndpointHost: async () => [{ address: "169.254.169.254", family: 4 }],
-      teardownOrphanManagedGatewayOnAbort: vi.fn(),
+      teardownOrphanManagedGatewayOnAbort: vi.fn(() => true),
     });
 
     try {
@@ -515,9 +875,9 @@ describe("inference selection validation", () => {
           "model-a",
           "COMPATIBLE_ANTHROPIC_API_KEY",
         ),
-      ).rejects.toThrow("Non-interactive endpoint validation failed.");
+      ).rejects.toMatchObject(resumableValidationExit);
       expect(probeAnthropicEndpoint).not.toHaveBeenCalled();
-      expect(exit).toHaveBeenCalledWith(1);
+      expect(exit).not.toHaveBeenCalled();
     } finally {
       process.exitCode = originalExitCode;
       exit.mockRestore();
@@ -527,7 +887,7 @@ describe("inference selection validation", () => {
 
   it("tears down an orphan managed gateway before non-interactive validation exit (#8952)", async () => {
     const originalExitCode = process.exitCode;
-    const teardownOrphanManagedGatewayOnAbort = vi.fn();
+    const teardownOrphanManagedGatewayOnAbort = vi.fn(() => true);
     const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const helpers = createInferenceSelectionValidationHelpers({
@@ -548,12 +908,9 @@ describe("inference selection validation", () => {
           "model-a",
           "COMPATIBLE_ANTHROPIC_API_KEY",
         ),
-      ).rejects.toThrow("Non-interactive endpoint validation failed.");
+      ).rejects.toMatchObject(resumableValidationExit);
       expect(teardownOrphanManagedGatewayOnAbort).toHaveBeenCalledTimes(1);
-      expect(exit).toHaveBeenCalledWith(1);
-      expect(teardownOrphanManagedGatewayOnAbort.mock.invocationCallOrder[0]).toBeLessThan(
-        exit.mock.invocationCallOrder[0] ?? 0,
-      );
+      expect(exit).not.toHaveBeenCalled();
     } finally {
       process.exitCode = originalExitCode;
       exit.mockRestore();
@@ -561,7 +918,40 @@ describe("inference selection validation", () => {
     }
   });
 
-  it("still exits when abort teardown throws during non-interactive validation (#8952)", async () => {
+  it("keeps validation exit terminal when abort teardown is incomplete (#9732)", async () => {
+    const originalExitCode = process.exitCode;
+    const teardownOrphanManagedGatewayOnAbort = vi.fn(() => false);
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const helpers = createInferenceSelectionValidationHelpers({
+      isNonInteractive: () => true,
+      agentProductName: () => "OpenClaw",
+      getCredential: () => "test-key",
+      probeAnthropicEndpoint: vi.fn(),
+      teardownOrphanManagedGatewayOnAbort,
+      promptValidationRecovery: vi.fn(async () => "selection" as const),
+      resolveEndpointHost: async () => [{ address: "169.254.169.254", family: 4 }],
+    });
+
+    try {
+      await expect(
+        helpers.validateCustomAnthropicSelection(
+          "Custom Anthropic",
+          "https://metadata-name.example/v1",
+          "model-a",
+          "COMPATIBLE_ANTHROPIC_API_KEY",
+        ),
+      ).rejects.toMatchObject(terminalValidationExit);
+      expect(teardownOrphanManagedGatewayOnAbort).toHaveBeenCalledTimes(1);
+      expect(exit).not.toHaveBeenCalled();
+    } finally {
+      process.exitCode = originalExitCode;
+      exit.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  it("keeps validation exit terminal when abort teardown throws (#8952)", async () => {
     const originalExitCode = process.exitCode;
     const teardownOrphanManagedGatewayOnAbort = vi.fn(() => {
       throw new Error("teardown boom");
@@ -586,13 +976,10 @@ describe("inference selection validation", () => {
           "model-a",
           "COMPATIBLE_ANTHROPIC_API_KEY",
         ),
-      ).rejects.toThrow("Non-interactive endpoint validation failed.");
+      ).rejects.toMatchObject(terminalValidationExit);
       expect(teardownOrphanManagedGatewayOnAbort).toHaveBeenCalledTimes(1);
       expect(error.mock.calls.map((call) => String(call[0])).join("\n")).toContain("teardown boom");
-      expect(exit).toHaveBeenCalledWith(1);
-      expect(teardownOrphanManagedGatewayOnAbort.mock.invocationCallOrder[0]).toBeLessThan(
-        exit.mock.invocationCallOrder[0] ?? 0,
-      );
+      expect(exit).not.toHaveBeenCalled();
     } finally {
       process.exitCode = originalExitCode;
       exit.mockRestore();
@@ -832,8 +1219,9 @@ exit 0
       isNonInteractive: () => false,
       agentProductName: () => "OpenClaw",
       getCredential: () => "test-key",
-      // Use the real probeOpenAiLikeEndpoint (no injection) so the full
-      // preflight → pinnedAddresses → curl --resolve chain is exercised.
+      // Use the public helper's production optimized default. A preflight pin
+      // must take the bounded #6661 legacy path until native sessions enforce
+      // the exact address set; --resolve proves that fallback cannot rebind.
       promptValidationRecovery: vi.fn(async () => "selection" as const),
       resolveEndpointHost,
     });
@@ -930,7 +1318,7 @@ exit 0
       probeOpenAiLikeEndpoint,
       promptValidationRecovery,
       resolveEndpointHost: async () => [{ address: "93.184.216.34", family: 4 }],
-      teardownOrphanManagedGatewayOnAbort: vi.fn(),
+      teardownOrphanManagedGatewayOnAbort: vi.fn(() => true),
     });
 
     try {
@@ -943,8 +1331,8 @@ exit 0
           null,
           { intendedApi: "openai-completions" },
         ),
-      ).rejects.toThrow("Non-interactive endpoint validation failed.");
-      expect(exit).toHaveBeenCalledWith(1);
+      ).rejects.toMatchObject(resumableValidationExit);
+      expect(exit).not.toHaveBeenCalled();
       expect(promptValidationRecovery).not.toHaveBeenCalled();
       const errorOutput = error.mock.calls.map((args) => args.join(" ")).join("\n");
       expect(errorOutput).toContain(

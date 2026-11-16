@@ -8,4 +8,8 @@
 export {
   checkAndRecoverSandboxProcesses,
   isSandboxGatewayRunningForStatus,
+  OPENCLAW_GATEWAY_STARTUP_WAIT_SECONDS,
+  resolveGatewayRecoveryWaitSeconds,
+  waitForStartedHermesGatewayProcess,
+  waitForStartedNativeGatewayProcess,
 } from "../process-recovery";

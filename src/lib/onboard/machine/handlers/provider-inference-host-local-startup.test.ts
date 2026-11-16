@@ -7,19 +7,28 @@ import { llamaCppHostLocalInferenceReceipt } from "../../../../../test/helpers/h
 import { createSession } from "../../../state/onboard-session";
 import type { HostLocalInferenceReceipt } from "../../runtime-provider/host-local-inference";
 import type {
-  HostLocalInferenceApplication,
   HostLocalInferenceStartupSelection,
   HostLocalInferenceStartupSelectionInput,
 } from "../../runtime-provider/host-local-inference-routing";
 import {
   createCachedHostLocalInferenceSetupResolver,
   handleProviderInferenceState,
+  type ProviderInferenceStateOptions,
 } from "./provider-inference";
-import { baseOptions, baseSelection, createDeps } from "./provider-inference.test-support";
+import {
+  baseOptions,
+  baseSelection,
+  createDeps,
+  type Agent,
+  type Gpu,
+  type Host,
+} from "./provider-inference.test-support";
 
+type TestProviderInferenceOptions = ProviderInferenceStateOptions<Gpu, Agent, Host>;
 const PROBE_IMAGE = `quay.io/curl/curl@sha256:${"b".repeat(64)}`;
 const NIM_IMAGE = `nvcr.io/nim/meta/llama@sha256:${"d".repeat(64)}`;
 const MANAGED_IMAGE = `nvcr.io/nvidia/vllm@sha256:${"c".repeat(64)}`;
+const OLLAMA_IMAGE = `docker.io/ollama/ollama@sha256:${"e".repeat(64)}`;
 const NETWORK_ID = "2".repeat(64);
 const NETWORK_GATEWAY_IP = "10.89.0.1";
 const NETWORK_AUTHORITY = "3".repeat(64);
@@ -28,7 +37,6 @@ const receiptWriter = {
   targetSha256: "1".repeat(64),
   writeExact: (value: string) => value,
 };
-
 function publishedManagedReceipt(
   service: "nim" | "vllm",
   model: string,
@@ -162,13 +170,44 @@ function hostLocalPublishedResumeSelection(
   };
 }
 
+function managedOllamaSelection(
+  input: HostLocalInferenceStartupSelectionInput,
+  recover: boolean,
+): HostLocalInferenceStartupSelection {
+  const selected = hostLocalStartupSelection(
+    input,
+    "vllm",
+    false,
+    recover ? "interrupted" : "fresh",
+  );
+  const request = selected.request as Extract<
+    HostLocalInferenceStartupSelection["request"],
+    { managed: unknown }
+  >;
+  return {
+    ...selected,
+    request: {
+      ...request,
+      service: "ollama",
+      managed: {
+        ...request.managed,
+        service: "ollama",
+        containerName: "nemoclaw-ollama",
+        containerPort: 11434,
+        hostPort: 11434,
+        imageRef: OLLAMA_IMAGE,
+      },
+    },
+  };
+}
+
 function expectedOllamaSelection(
   selected: HostLocalInferenceStartupSelection,
-): Extract<HostLocalInferenceStartupSelection["request"], { service: "ollama" }> {
+): Extract<HostLocalInferenceStartupSelection["request"], { endpoint: unknown }> {
   expect(selected.request.service).toBe("ollama");
   return selected.request as Extract<
     HostLocalInferenceStartupSelection["request"],
-    { service: "ollama" }
+    { endpoint: unknown }
   >;
 }
 
@@ -203,6 +242,25 @@ function llamaCppLifecycleSelection(
 }
 
 describe("provider inference host-local startup selection", () => {
+  it("does not require host-local application support for a hosted candidate provider", () => {
+    const resolver = vi.fn();
+    const resolve = createCachedHostLocalInferenceSetupResolver({
+      resolver,
+      application: "pi",
+      provider: "nvidia-prod",
+      model: "nvidia/nemotron-3-super-120b-a12b",
+      acceleration: "cpu",
+      requireToolCalling: null,
+      freshRequireToolCalling: true,
+      allowPublishedResume: false,
+      recover: false,
+      recordToolCallingRequirement: vi.fn(),
+    });
+
+    expect(resolve("pi-sandbox")).toEqual({});
+    expect(resolver).not.toHaveBeenCalled();
+  });
+
   it.each(["openclaw", "hermes", "langchain-deepagents-code"] as const)(
     "dispatches a published %s llama.cpp route through the common lifecycle exactly once",
     async (application) => {
@@ -377,15 +435,32 @@ describe("provider inference host-local startup selection", () => {
     async ({ application, service }) => {
       const model = "qwen3.5-9b";
       const provider = service === "ollama" ? "ollama-local" : "vllm-local";
-      const setupNim = vi.fn(async () => ({
-        ...baseSelection,
-        provider,
-        model,
-        acceleration: "nvidia-gpu",
-        endpointUrl: null,
-        credentialEnv: null,
-        preferredInferenceApi: "openai-completions",
-      }));
+      const setupNim = vi.fn<TestProviderInferenceOptions["deps"]["setupNim"]>(
+        async (
+          _gpu,
+          _sandboxName,
+          _agent,
+          _allowRecordedProviderRecovery,
+          _gatewayName,
+          _assertRouteCompatible,
+          _canProbeRoute,
+          _recoverySessionId,
+          revalidateSandboxIdentity,
+        ) => {
+          const selection = {
+            ...baseSelection,
+            provider,
+            model,
+            acceleration: "nvidia-gpu" as const,
+            endpointUrl: null,
+            credentialEnv: null,
+            preferredInferenceApi: "openai-completions",
+          };
+          expect(revalidateSandboxIdentity).toBeTypeOf("function");
+          revalidateSandboxIdentity!(selection, "install managed local runtime");
+          return selection;
+        },
+      );
       const resolver = vi.fn((input: HostLocalInferenceStartupSelectionInput) =>
         hostLocalStartupSelection(input, service),
       );
@@ -479,6 +554,64 @@ describe("provider inference host-local startup selection", () => {
 
     expect(calls.setupInference).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["hermes", "mxc", "true" as unknown as boolean],
+    ["hermes", "mxc", true],
+    ["hermes", "podman", "true" as unknown as boolean],
+    ["openclaw", "podman", true],
+    ["langchain-deepagents-code", "podman", true],
+  ] as const)(
+    "rejects fresh managed Ollama for %s on %s with recovery %s",
+    async (application, runtimeProviderId, recover) => {
+      const model = "qwen3-vl:4b";
+      const session = createSession({
+        provider: "ollama-local",
+        model,
+        endpointUrl: null,
+        credentialEnv: null,
+        preferredInferenceApi: "openai-completions",
+      });
+      const { deps, calls } = createDeps({
+        setupNim: vi.fn(async () => ({
+          ...baseSelection,
+          provider: "ollama-local",
+          model,
+          endpointUrl: null,
+          credentialEnv: null,
+          preferredInferenceApi: "openai-completions",
+        })),
+        resolveHostLocalInferenceStartupSelection: (input) => {
+          const selected = hostLocalStartupSelection(input, "vllm", true, "fresh");
+          const request = selected.request as Extract<
+            HostLocalInferenceStartupSelection["request"],
+            { managed: unknown }
+          >;
+          return {
+            ...selected,
+            runtimeProviderId,
+            request: {
+              ...request,
+              service: "ollama" as const,
+              recover,
+              managed: { ...request.managed, service: "ollama" as const },
+            },
+          };
+        },
+      });
+
+      await expect(
+        handleProviderInferenceState({
+          ...baseOptions(deps, session),
+          agent: { name: application },
+          forceInferenceSetup: true,
+          sandboxName: "portable-hermes",
+        }),
+      ).rejects.toThrow(/recovery authority/u);
+
+      expect(calls.setupInference).not.toHaveBeenCalled();
+    },
+  );
 
   it("keeps fresh Ollama CPU-scoped when GPU passthrough was disabled on NVIDIA", async () => {
     const model = "nemotron:latest";
@@ -1095,6 +1228,136 @@ describe("provider inference host-local startup selection", () => {
     expect(result.hostLocalInferenceSandboxProofAuthority).toEqual(
       expect.objectContaining({ service: "ollama", toolCallingRequired: false }),
     );
+  });
+
+  it("resumes the exact managed Ollama route-publication gap through provider setup", async () => {
+    const model = "qwen3-vl:4b";
+    const session = createSession({
+      provider: "ollama-local",
+      model,
+      endpointUrl: "https://inference.local/v1",
+      credentialEnv: null,
+      preferredInferenceApi: "openai-completions",
+    });
+    session.steps.provider_selection.status = "complete";
+    const resolver = vi.fn((input: HostLocalInferenceStartupSelectionInput) =>
+      managedOllamaSelection(input, true),
+    );
+    const { deps, calls } = createDeps({
+      isInferenceRouteReady: vi.fn(() => true),
+      resolveHostLocalInferenceStartupSelection: resolver,
+    });
+    const options = baseOptions(deps, session);
+
+    const result = await handleProviderInferenceState({
+      ...options,
+      agent: { name: "hermes" },
+      initial: { ...options.initial, endpointSource: "inference-set" },
+      resume: true,
+      sandboxName: "portable-hermes",
+    });
+
+    expect(resolver).toHaveBeenCalledWith({
+      application: "hermes",
+      sandboxName: "portable-hermes",
+      provider: "ollama-local",
+      model,
+      acceleration: "nvidia-gpu",
+      requireToolCalling: null,
+      allowPublishedResume: true,
+      recover: true,
+    });
+    expect(calls.repair).not.toHaveBeenCalled();
+    const setupCall = calls.setupInference.mock.calls[0] as unknown as readonly unknown[];
+    expect(setupCall[7]).toEqual(
+      expect.objectContaining({
+        hostLocalInference: expect.objectContaining({
+          request: expect.objectContaining({
+            service: "ollama",
+            recover: true,
+            managed: expect.objectContaining({
+              service: "ollama",
+              containerName: "nemoclaw-ollama",
+            }),
+          }),
+        }),
+      }),
+    );
+    expect(
+      (setupCall[7] as { hostLocalInference: HostLocalInferenceStartupSelection })
+        .hostLocalInference.request,
+    ).not.toHaveProperty("resumeReceipt");
+    expect(result.hostLocalInferenceRouteOnly).toBe(true);
+  });
+
+  it("resumes after provider selection commits before inference completion (#9596)", async () => {
+    const model = "qwen3-vl:4b";
+    const session = createSession();
+    const setupNim = vi.fn(async () => ({
+      ...baseSelection,
+      provider: "ollama-local",
+      model,
+      endpointUrl: null,
+      credentialEnv: null,
+      preferredInferenceApi: "openai-completions",
+    }));
+    const resolver = vi.fn((input: HostLocalInferenceStartupSelectionInput) =>
+      managedOllamaSelection(input, input.recover),
+    );
+    const completeStep = async (stepName: string, updates: Record<string, unknown>) => {
+      Object.assign(session, updates);
+      session.steps[stepName]!.status = "complete";
+      return session;
+    };
+    const recordStepComplete = vi
+      .fn(completeStep)
+      .mockImplementationOnce(completeStep)
+      .mockImplementationOnce(async () => {
+        throw new Error("simulated inference completion interruption");
+      });
+    const startRecordedStep = vi.fn(async (stepName: string) => {
+      session.steps[stepName]!.status = "in_progress";
+    });
+    const setupInference = vi.fn(async () => ({ ok: true as const }));
+    const { deps } = createDeps({
+      setupNim,
+      setupInference,
+      resolveHostLocalInferenceStartupSelection: resolver,
+      recordStepComplete,
+      startRecordedStep,
+      isInferenceRouteReady: vi.fn(() => true),
+    });
+
+    await expect(
+      handleProviderInferenceState({
+        ...baseOptions(deps, session),
+        agent: { name: "hermes" },
+        sandboxName: "portable-hermes",
+      }),
+    ).rejects.toThrow("simulated inference completion interruption");
+
+    expect(session.steps.provider_selection.status).toBe("complete");
+    expect(session.steps.inference.status).toBe("in_progress");
+    const resumed = await handleProviderInferenceState({
+      ...baseOptions(deps, session),
+      agent: { name: "hermes" },
+      initial: {
+        ...baseOptions(deps, session).initial,
+        endpointSource: "inference-set",
+      },
+      resume: true,
+      sandboxName: "portable-hermes",
+    });
+
+    expect(resumed.hostLocalInferenceRouteOnly).toBe(true);
+    expect(resolver).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        allowPublishedResume: true,
+        recover: true,
+      }),
+    );
+    expect(setupInference).toHaveBeenCalledTimes(2);
+    expect(session.steps.inference.status).toBe("complete");
   });
 
   it("fails closed when canonical resumed state loses its injected runtime resolver", async () => {

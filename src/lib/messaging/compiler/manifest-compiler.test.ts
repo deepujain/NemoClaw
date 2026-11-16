@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
-
 import {
   createBuiltInChannelManifestRegistry,
   createBuiltInRenderTemplateResolver,
@@ -16,74 +15,11 @@ import {
 import { ManifestCompiler } from "./manifest-compiler";
 
 const ALL_CHANNELS = ["telegram", "discord", "wechat", "slack", "whatsapp", "teams"] as const;
-const TEST_CREDENTIALS: Readonly<Record<string, string>> = {
-  TELEGRAM_BOT_TOKEN: "123456:test-telegram-token",
-  DISCORD_BOT_TOKEN: "test-discord-token",
-  WECHAT_BOT_TOKEN: "test-wechat-token",
-  SLACK_BOT_TOKEN: "xoxb-test-slack-token",
-  SLACK_APP_TOKEN: "xapp-test-slack-token",
-  MSTEAMS_APP_PASSWORD: "test-teams-client-secret",
-};
-const TEST_TEAMS_ENV = {
-  MSTEAMS_APP_ID: "test-teams-app-id",
-  MSTEAMS_TENANT_ID: "test-teams-tenant-id",
-  TEAMS_ALLOWED_USERS: "00000000-0000-0000-0000-000000000001",
-  MSTEAMS_PORT: "3978",
-} as const;
-const TEST_WECHAT_LOGIN = {
-  token: "test-wechat-token",
-  accountId: "test-wechat-account",
-  baseUrl: "https://ilinkai.wechat.com",
-  userId: "test-wechat-user",
-} as const;
-
-function compiler(): ManifestCompiler {
-  return new ManifestCompiler(
-    createBuiltInChannelManifestRegistry(),
-    createBuiltInMessagingHookRegistry({
-      common: {
-        env: {},
-        getCredential: (key) => TEST_CREDENTIALS[key] ?? null,
-        saveCredential: () => {},
-        prompt: async () => "",
-        log: () => {},
-      },
-      slack: {
-        validateCredentials: {
-          log: () => {},
-          validateCredentials: () => ({ ok: true }),
-        },
-      },
-      telegram: {
-        fetch: async () => ({
-          ok: true,
-          status: 200,
-          async json() {
-            return { ok: true };
-          },
-          async text() {
-            return "";
-          },
-        }),
-      },
-      wechat: {
-        ilinkLogin: {
-          env: {},
-          log: () => {},
-          saveCredential: () => {},
-          runLogin: async () => ({
-            kind: "ok",
-            credentials: TEST_WECHAT_LOGIN,
-          }),
-        },
-        seedOpenClawAccount: {
-          now: () => "2026-01-01T00:00:00.000Z",
-        },
-      },
-    }),
-    createBuiltInRenderTemplateResolver(),
-  );
-}
+import {
+  compiler,
+  TEST_CREDENTIALS,
+  TEST_TEAMS_ENV,
+} from "../../../../test/support/messaging-compiler-fixture";
 
 function jsonRoundTrip<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -210,6 +146,7 @@ describe("ManifestCompiler", () => {
       "discord:discord-openclaw-channel",
       "discord:discord-openclaw-plugin",
       "wechat:wechat-openclaw-plugin",
+      "wechat:wechat-openclaw-channel",
       "slack:slack-openclaw-channel",
       "slack:slack-openclaw-plugin",
       "whatsapp:whatsapp-openclaw-channel",
@@ -220,7 +157,12 @@ describe("ManifestCompiler", () => {
     expect(plan.agentRender.every((render) => render.handler === "common.staticOutputs")).toBe(
       true,
     );
-    expect(JSON.stringify(plan.agentRender)).toContain("openshell:resolve:env:TELEGRAM_BOT_TOKEN");
+    // The credential placeholder stays out of the agent render: OpenShell injects
+    // it into the sandbox environment, and writing the canonical form into config
+    // is what 0.0.106 refuses once the policy binds the credential.
+    expect(JSON.stringify(plan.agentRender)).not.toContain(
+      "openshell:resolve:env:TELEGRAM_BOT_TOKEN",
+    );
     expect(plan.buildSteps.map(({ value: _value, ...step }) => step)).toEqual([
       {
         channelId: "discord",
@@ -292,7 +234,7 @@ describe("ManifestCompiler", () => {
           kind: "package-install",
           value: {
             manager: "openclaw-plugin",
-            spec: "npm:@tencent-weixin/openclaw-weixin@2.4.3",
+            spec: "npm:@tencent-weixin/openclaw-weixin@2.4.10",
             pin: true,
           },
         }),
@@ -402,43 +344,43 @@ describe("ManifestCompiler", () => {
       source: "manifest",
     });
     expect(plan.agentRender.map((render) => `${render.channelId}:${render.target}`)).toEqual([
-      "telegram:~/.hermes/.env",
+      // No telegram .env entry: this case configures no allowed IDs, so every
+      // remaining Telegram env line resolves to undefined once the bot-token
+      // line is gone.
       "telegram:~/.hermes/config.yaml",
       "telegram:~/.hermes/config.yaml",
-      "discord:~/.hermes/.env",
+      // No discord .env entry: this case configures no server ID, so every
+      // remaining Discord env line resolves to undefined once the bot-token
+      // line is gone, and agent-render-engine drops a render with no lines.
       "discord:~/.hermes/config.yaml",
       "discord:~/.hermes/config.yaml",
       "wechat:~/.hermes/.env",
       "wechat:~/.hermes/config.yaml",
-      "slack:~/.hermes/.env",
+      // Same as Discord above: this case configures no Slack allowlist, so with
+      // the bot/app token lines gone every remaining Slack env line resolves to
+      // undefined and the render is dropped for having no lines.
       "slack:~/.hermes/config.yaml",
       "whatsapp:~/.hermes/.env",
       "whatsapp:~/.hermes/config.yaml",
       "teams:~/.hermes/.env",
       "teams:~/.hermes/config.yaml",
     ]);
-    expect(JSON.stringify(plan.agentRender)).toContain(
-      "WEIXIN_TOKEN=openshell:resolve:env:WECHAT_BOT_TOKEN",
-    );
-    expect(JSON.stringify(plan.agentRender)).toContain(
-      "TEAMS_CLIENT_SECRET=openshell:resolve:env:MSTEAMS_APP_PASSWORD",
-    );
+    expect(JSON.stringify(plan.agentRender)).not.toContain("WEIXIN_TOKEN=");
+    expect(JSON.stringify(plan.agentRender)).not.toContain("TEAMS_CLIENT_SECRET=");
     expect(plan.runtimeSetup?.envAliases).toEqual([
       {
-        channelId: "slack",
-        envKey: "SLACK_BOT_TOKEN",
-        match: "^openshell:resolve:env:(v[0-9]+_)?SLACK_BOT_TOKEN$",
-        value: "xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN",
-        message:
-          "[channels] Normalized SLACK_BOT_TOKEN runtime placeholder to the Bolt-compatible alias",
+        channelId: "wechat",
+        envKey: "WECHAT_BOT_TOKEN",
+        targetEnvKey: "WEIXIN_TOKEN",
+        match: "^openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_WECHAT_BOT_TOKEN$",
+        value: "openshell:resolve:env:WECHAT_BOT_TOKEN",
       },
       {
-        channelId: "slack",
-        envKey: "SLACK_APP_TOKEN",
-        match: "^openshell:resolve:env:(v[0-9]+_)?SLACK_APP_TOKEN$",
-        value: "xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN",
-        message:
-          "[channels] Normalized SLACK_APP_TOKEN runtime placeholder to the Bolt-compatible alias",
+        channelId: "teams",
+        envKey: "MSTEAMS_APP_PASSWORD",
+        targetEnvKey: "TEAMS_CLIENT_SECRET",
+        match: "^openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_MSTEAMS_APP_PASSWORD$",
+        value: "openshell:resolve:env:MSTEAMS_APP_PASSWORD",
       },
     ]);
     expect(plan.buildSteps).toEqual([
@@ -450,16 +392,6 @@ describe("ManifestCompiler", () => {
         value: {
           manager: "hermes-uv-pip",
           spec: "microsoft-teams-apps==2.0.13.4",
-        },
-      },
-      {
-        channelId: "teams",
-        kind: "package-install",
-        outputId: "hermesAiohttpPackage",
-        required: true,
-        value: {
-          manager: "hermes-uv-pip",
-          spec: "aiohttp==3.14.3",
         },
       },
     ]);
@@ -503,6 +435,7 @@ describe("ManifestCompiler", () => {
   it.each([
     ["MSTEAMS_APP_ID", "teams-app\nEVIL=1"],
     ["MSTEAMS_TENANT_ID", "teams-tenant\nEVIL=1"],
+    ["MSTEAMS_APP_PASSWORD", "teams-password\r\nEVIL=1"],
     ["TEAMS_ALLOWED_USERS", "user-one\nEVIL=1"],
   ] as const)("rejects unsafe Microsoft Teams Hermes env value %s", async (envKey, value) => {
     await expect(
@@ -569,7 +502,15 @@ describe("ManifestCompiler", () => {
         value: "1",
       }),
     );
-    expect(JSON.stringify(plan.agentRender)).toContain('"port":3978');
+    expect(plan.agentRender).toContainEqual(
+      expect.objectContaining({
+        path: "channels.msteams",
+        value: expect.objectContaining({
+          webhook: { path: "/api/messages" },
+          legacyWebhook: { port: 3978 },
+        }),
+      }),
+    );
     expect(JSON.stringify(plan.agentRender)).toContain('"streaming":{"mode":"off"}');
     expect(JSON.stringify(plan.agentRender)).toContain('"groupPolicy":"open"');
     expect(JSON.stringify(plan.agentRender)).not.toContain("groupAllowFrom");
@@ -633,7 +574,15 @@ describe("ManifestCompiler", () => {
       port: 3977,
       label: "Microsoft Teams webhook",
     });
-    expect(JSON.stringify(plan.agentRender)).toContain('"port":3977');
+    expect(plan.agentRender).toContainEqual(
+      expect.objectContaining({
+        path: "channels.msteams",
+        value: expect.objectContaining({
+          webhook: { path: "/api/messages" },
+          legacyWebhook: { port: 3977 },
+        }),
+      }),
+    );
   });
 
   it("rejects invalid Microsoft Teams webhook ports", async () => {
@@ -1018,6 +967,45 @@ describe("ManifestCompiler", () => {
     );
   });
 
+  it.each([
+    ["openclaw", "onboard", true, true, "\n"],
+    ["openclaw", "add-channel", true, true, "\r\n"],
+    ["hermes", "onboard", false, true, "\r\n"],
+    ["hermes", "add-channel", false, true, "\n"],
+    ["openclaw", "onboard", false, false, "\n"],
+  ] as const)(
+    "accepts formatted Google Chat JSON for %s %s interactive=%s (#10383)",
+    async (agent, workflow, isInteractive, active, eol) => {
+      const secret = "synthetic-googlechat-private-key";
+      const account = { client_email: "bot@example.test", private_key: `${secret}\nkey-material` };
+      const serviceAccountJson = JSON.stringify(account, null, 2).replaceAll("\n", eol);
+      await withEnv(
+        {
+          GOOGLECHAT_SERVICE_ACCOUNT: serviceAccountJson,
+          GOOGLECHAT_AUDIENCE: "https://chat.test/googlechat",
+        },
+        async () => {
+          const plan = await compiler().compile({
+            sandboxName: "demo",
+            agent,
+            workflow,
+            isInteractive,
+            configuredChannels: ["googlechat"],
+          });
+          expect(plan.channels[0]?.active).toBe(active);
+          expect(plan.channels[0]?.inputs).toContainEqual(
+            expect.objectContaining({
+              inputId: "serviceAccount",
+              kind: "secret",
+              credentialAvailable: true,
+            }),
+          );
+          expect(JSON.stringify(plan)).not.toContain(secret);
+        },
+      );
+    },
+  );
+
   it("reads config default values when env keys are unset", async () => {
     const customManifest = {
       schemaVersion: 1,
@@ -1052,7 +1040,6 @@ describe("ManifestCompiler", () => {
         },
       ],
       credentials: [],
-      policyPresets: [],
       render: [],
       hooks: [],
     } as const satisfies ChannelManifest;
@@ -1120,7 +1107,6 @@ describe("ManifestCompiler", () => {
         },
       ],
       credentials: [],
-      policyPresets: [],
       render: [],
       hooks: [
         {
@@ -1203,7 +1189,6 @@ describe("ManifestCompiler", () => {
         },
       ],
       credentials: [],
-      policyPresets: [],
       render: [],
       hooks: [],
     } as const satisfies ChannelManifest;
@@ -1348,7 +1333,7 @@ describe("ManifestCompiler", () => {
           placeholder: "openshell:resolve:env:MATRIX_ACCESS_TOKEN",
         },
       ],
-      policyPresets: ["matrix"],
+      policyPresets: [{ name: "matrix", policyKeys: ["matrix"] }],
       render: [],
       hooks: [
         {

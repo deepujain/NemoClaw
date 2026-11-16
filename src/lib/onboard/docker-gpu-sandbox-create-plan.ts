@@ -32,17 +32,19 @@ export function resetIsDockerDesktopWslRuntimeCache(): void {
   cachedDockerDesktopWslRuntime = null;
 }
 
-export function resolveAgentPlan(
+export function resolveProfileGpuCreatePlan(
   config: DockerGpuSandboxConfig,
-  agent: { name?: string | null } | null,
   dockerDriverGateway: boolean,
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): DockerGpuSandboxCreatePlan {
   return resolveDockerGpuSandboxCreatePlan(config, {
     dockerDriverGateway,
-    portableLifecycle:
-      isPortableExperimentalProfile(env) && (agent?.name ?? "openclaw") === "openclaw",
+    // Rootless Podman owns every portable sandbox regardless of agent: the
+    // compatibility recreation discovers containers by docker-driver labels
+    // and can never match a podman-driver sandbox (#9462), so keep the whole
+    // profile on native GPU injection, not only OpenClaw (#9068).
+    portableLifecycle: isPortableExperimentalProfile(env),
     env,
     platform,
   });
@@ -71,10 +73,9 @@ export function resolveDockerGpuSandboxCreatePlan(
 ): DockerGpuSandboxCreatePlan {
   const env = options.env ?? process.env;
   const portableLifecycle = options.portableLifecycle === true;
-  const dockerDesktopWsl =
-    portableLifecycle
-      ? false
-      : (options.dockerDesktopWsl ?? (options.detectDockerDesktopWsl ?? isDockerDesktopWslRuntime)());
+  const dockerDesktopWsl = portableLifecycle
+    ? false
+    : (options.dockerDesktopWsl ?? (options.detectDockerDesktopWsl ?? isDockerDesktopWslRuntime)());
   const gpuRoutePlan = resolveDockerGpuRoutePlan(config, {
     // The hidden portable profile reaches OpenShell through its Docker-compatible
     // endpoint, but rootless Podman owns sandbox lifecycle. Keep Docker-only

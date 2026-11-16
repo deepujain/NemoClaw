@@ -5,6 +5,8 @@ import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TierDefinition } from "../policy/tiers";
 import { createPolicySelectionPromptHelpers } from "./policy-selection-prompts";
+
+type PromptHelpers = ReturnType<typeof createPolicySelectionPromptHelpers>;
 import { selectFromNumberedMenuOrExit } from "./prompt-helpers";
 
 class FakeInput extends EventEmitter {
@@ -67,11 +69,13 @@ function createHarness({
   stdinTTY = true,
   stdoutTTY = true,
   promptReplies = [],
+  takePendingStdinEof,
 }: {
   tiers?: TierDefinition[];
   stdinTTY?: boolean;
   stdoutTTY?: boolean;
   promptReplies?: string[];
+  takePendingStdinEof?: () => Promise<boolean> | false;
 } = {}) {
   const stdin = new FakeInput(stdinTTY);
   const stdout = new FakeOutput(stdoutTTY);
@@ -101,6 +105,7 @@ function createHarness({
     stdin,
     stdout,
     processEvents,
+    takePendingStdinEof,
   });
 
   return { helpers, markCancelled, processEvents, prompt, stdin, stdout };
@@ -154,6 +159,58 @@ describe("createPolicySelectionPromptHelpers", () => {
       { name: "github", access: "read-write" },
     ]);
     expect(errorSpy).toHaveBeenCalledWith("  Unknown preset name ignored: missing");
+  });
+
+  it.each([
+    [
+      "policy tier",
+      (helpers: ReturnType<typeof createPolicySelectionPromptHelpers>) =>
+        helpers.selectPolicyTier(),
+    ],
+    [
+      "tier presets",
+      (helpers: ReturnType<typeof createPolicySelectionPromptHelpers>) =>
+        helpers.selectTierPresetsAndAccess("balanced", [{ name: "npm" }]),
+    ],
+    [
+      "preset checkbox",
+      (helpers: ReturnType<typeof createPolicySelectionPromptHelpers>) =>
+        helpers.presetsCheckboxSelector([{ name: "npm", description: "npm registry" }], []),
+    ],
+  ])(
+    "marks cancellation when SIGTERM interrupts the non-TTY %s selector",
+    async (_label, select) => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const { helpers, markCancelled, processEvents, prompt } = createHarness({
+        stdinTTY: false,
+        stdoutTTY: false,
+      });
+      prompt.mockImplementation(() => new Promise<string>(() => undefined));
+
+      const selection = select(helpers);
+      expect(prompt).toHaveBeenCalledOnce();
+      processEvents.emit("SIGTERM");
+
+      await expect(selection).rejects.toMatchObject({ code: 1 });
+      expect(markCancelled).toHaveBeenCalledOnce();
+      expect(processEvents.listenerCount("SIGINT")).toBe(0);
+      expect(processEvents.listenerCount("SIGTERM")).toBe(0);
+    },
+  );
+
+  it("marks cancellation when a non-TTY prompt reports Ctrl-C", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const { helpers, markCancelled, processEvents, prompt } = createHarness({
+      stdinTTY: false,
+      stdoutTTY: false,
+    });
+    prompt.mockRejectedValue(Object.assign(new Error("Prompt interrupted"), { code: "SIGINT" }));
+
+    await expect(helpers.selectPolicyTier()).rejects.toMatchObject({ code: 1 });
+
+    expect(markCancelled).toHaveBeenCalledOnce();
+    expect(processEvents.listenerCount("SIGINT")).toBe(0);
+    expect(processEvents.listenerCount("SIGTERM")).toBe(0);
   });
 
   it("selectTierPresetsAndAccess returns raw-mode access toggles on Enter", async () => {
@@ -235,6 +292,63 @@ describe("createPolicySelectionPromptHelpers", () => {
     expect(markCancelled).toHaveBeenCalledOnce();
     expect(stdin.setRawMode).toHaveBeenLastCalledWith(false);
     expect(stdin.listenerCount("data")).toBe(0);
+  });
+
+  const RAW_MENUS = [
+    ["selectPolicyTier", (helpers: PromptHelpers) => helpers.selectPolicyTier()],
+    [
+      "selectTierPresetsAndAccess",
+      (helpers: PromptHelpers) =>
+        helpers.selectTierPresetsAndAccess("balanced", [{ name: "npm" }, { name: "pypi" }]),
+    ],
+    [
+      "presetsCheckboxSelector",
+      (helpers: PromptHelpers) =>
+        helpers.presetsCheckboxSelector([{ name: "npm", description: "npm registry" }], []),
+    ],
+  ] as const;
+
+  it.each(RAW_MENUS)(
+    "%s cancels through the prompt when Ctrl-D is pressed in the raw menu (#12169)",
+    async (_name, open) => {
+      const { helpers, markCancelled, stdin } = createHarness();
+
+      const selection = open(helpers);
+      stdin.emit("data", "\x04");
+
+      await expect(selection).rejects.toMatchObject({ code: 1 });
+      expect(markCancelled).toHaveBeenCalledOnce();
+      expect(stdin.setRawMode).toHaveBeenLastCalledWith(false);
+      expect(stdin.listenerCount("data")).toBe(0);
+    },
+  );
+
+  it.each(RAW_MENUS)(
+    "%s cancels before raw mode when stdin closed between questions (#12169)",
+    async (_name, open) => {
+      const { helpers, markCancelled, stdin } = createHarness({
+        takePendingStdinEof: () => Promise.resolve(true),
+      });
+
+      await expect(open(helpers)).rejects.toMatchObject({ code: 1 });
+      expect(markCancelled).toHaveBeenCalledOnce();
+      expect(stdin.setRawMode).not.toHaveBeenCalled();
+      expect(stdin.listenerCount("data")).toBe(0);
+    },
+  );
+
+  it("opens the raw menu when the pending-input window finds no closed stdin", async () => {
+    const { helpers, stdin } = createHarness({
+      takePendingStdinEof: () => Promise.resolve(false),
+    });
+
+    const selection = helpers.selectPolicyTier();
+    await vi.waitFor(() => expect(stdin.listenerCount("data")).toBe(1));
+    stdin.emit("data", "\r");
+
+    await expect(selection).resolves.toBe("balanced");
+    expect(stdin.setRawMode).toHaveBeenNthCalledWith(1, true);
+    expect(stdin.setRawMode).toHaveBeenLastCalledWith(false);
   });
 
   it("selectPolicyTier rejects when no policy tiers are configured", async () => {

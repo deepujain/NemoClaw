@@ -6,6 +6,8 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+import { resolveSourcedDockerBuildShell } from "./openclaw-build-shell";
+
 const DEFAULT_SHELL_TIMEOUT_MS = 5000;
 const CHOWN_LOGGER = 'chown() { printf "chown %s\\n" "$*" >> "$call_log"; }';
 
@@ -40,14 +42,29 @@ export function dockerRunCommandBetween(
   if (finalLineIndex === -1) {
     throw new Error(`Expected complete RUN instruction before ${endMarker}`);
   }
-  return blockLines
-    .slice(0, finalLineIndex + 1)
-    .filter((line) => !line.trimStart().startsWith("#"))
-    .join("\n")
-    .trim()
-    .replace(/\\\n\s*/g, " ")
-    .replace(/^RUN\s+/, "")
-    .replace(/^(?:--[a-z-]+=[^\s]+\s+)+/u, "");
+  return resolveSourcedDockerBuildShell(
+    blockLines
+      .slice(0, finalLineIndex + 1)
+      .filter((line) => !line.trimStart().startsWith("#"))
+      .join("\n")
+      .trim()
+      .replace(/\\\n\s*/g, " ")
+      .replace(/^RUN\s+/, "")
+      .replace(/^(?:--[a-z-]+=[^\s]+\s+)+/u, ""),
+  );
+}
+
+export function shellCommandSegmentBetween(
+  command: string,
+  startMarker: string,
+  endMarker: string,
+): string {
+  const start = command.indexOf(startMarker);
+  const end = command.indexOf(endMarker, start);
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error(`Expected shell command segment between ${startMarker} and ${endMarker}`);
+  }
+  return command.slice(start, end).trim();
 }
 
 function shellEnvironment(

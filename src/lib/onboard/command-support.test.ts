@@ -42,6 +42,29 @@ describe("buildOnboardFlags --observability help", () => {
   });
 });
 
+describe("buildOnboardFlags --switchyard-config help", () => {
+  it("exposes one high-level Hermes routing file (#13862)", () => {
+    const flags = buildOnboardFlags();
+
+    expect(flags["switchyard-config"].description).toContain("adaptive Hermes routing");
+    expect(onboardUsage.join(" ")).toContain("--switchyard-config <file>");
+  });
+});
+
+describe("buildOnboardFlags --apf-interceptor help", () => {
+  it("exposes one-way operator selection without a generated --no form (#9833)", () => {
+    const flags = buildOnboardFlags();
+
+    expect(flags["apf-interceptor"].hidden).not.toBe(true);
+    expect(flags["apf-interceptor"].allowNo).not.toBe(true);
+    expect(flags["apf-interceptor"].description).toContain("providerless sandbox");
+    expect(flags["apf-interceptor"].description).toContain("contained sandbox-scoped policy");
+    expect(flags["apf-interceptor"].description).toContain("without claiming its provenance");
+    expect(flags["apf-interceptor"].exclusive).toEqual(["resume", "recreate-sandbox"]);
+    expect(onboardUsage.join(" ")).toContain("--apf-interceptor");
+  });
+});
+
 describe("buildOnboardFlags --events help", () => {
   it("exposes the JSONL observer only on the canonical onboard command", () => {
     const onboardFlags = buildOnboardFlags({ includeEvents: true });
@@ -56,13 +79,13 @@ describe("buildOnboardFlags --events help", () => {
 });
 
 describe("buildOnboardFlags temporary managed runtime gate", () => {
-  it("accepts the activation flag without advertising it in CLI help", () => {
+  it("keeps candidate activation hidden while allowing exact stock qualification catalogs", () => {
     const flags = buildOnboardFlags({ includeEvents: true });
 
     expect(flags["temp-managed-runtime"].hidden).toBe(true);
     expect(flags["temp-managed-runtime"].description).toBeUndefined();
     expect(flags["temp-managed-runtime-catalog"].hidden).toBe(true);
-    expect(flags["temp-managed-runtime-catalog"].dependsOn).toEqual(["temp-managed-runtime"]);
+    expect(flags["temp-managed-runtime-catalog"].dependsOn).toBeUndefined();
     expect(flags.events.hidden).not.toBe(true);
   });
 });

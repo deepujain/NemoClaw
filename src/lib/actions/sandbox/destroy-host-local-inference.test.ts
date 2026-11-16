@@ -3,8 +3,27 @@
 
 import { describe, expect, it, vi } from "vitest";
 
+vi.mock("./mcp-bridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./mcp-bridge")>()),
+  prepareMcpBridgesForDestroy: async (
+    _sandboxName: string,
+    options: { runtimeSelection?: OpenShellRuntimeSelection } = {},
+  ) => ({
+    entries: [],
+    ...(options.runtimeSelection ? { runtimeSelection: options.runtimeSelection } : {}),
+  }),
+  prepareMcpBridgesForAbsentSandboxDestroy: async (
+    _sandboxName: string,
+    options: { runtimeSelection?: OpenShellRuntimeSelection } = {},
+  ) => ({
+    entries: [],
+    ...(options.runtimeSelection ? { runtimeSelection: options.runtimeSelection } : {}),
+  }),
+}));
+
 import { createInMemoryRuntimeProviderBundle } from "../../../../test/helpers/runtime-provider-bundle";
 import { llamaCppHostLocalInferenceReceipt } from "../../../../test/helpers/host-local-inference-receipt";
+import type { OpenShellRuntimeSelection } from "../../adapters/openshell/runtime-selection";
 import type { HostLocalInferenceOperation } from "../../onboard/runtime-provider/host-local-inference";
 import {
   type HostLocalInferenceDestroyResult,
@@ -19,6 +38,24 @@ import { executeSandboxDestroy } from "./destroy-execution";
 const AUTHORITY_ID = `mxc-endpoint:${"a".repeat(64)}`;
 const BINDING_SHA256 = "d".repeat(64);
 const MODEL = "qwen3.5-9b";
+const SANDBOX_FINGERPRINT = "a".repeat(64);
+type PendingCreateVerification = NonNullable<SandboxEntry["pendingCreateIdentity"]>;
+
+function pendingCreateIdentity(
+  overrides: Partial<PendingCreateVerification> = {},
+): PendingCreateVerification {
+  return {
+    schemaVersion: 1,
+    state: "verified-create",
+    gatewayName: "nemoclaw",
+    gatewayPort: 8080,
+    sandboxName: "alpha",
+    lifecycleGeneration: "alpha-generation-1",
+    sandboxIdentityFingerprint: SANDBOX_FINGERPRINT,
+    route: "none",
+    ...overrides,
+  };
+}
 
 function receipt(
   service: "ollama" | "nim" | "vllm" = "vllm",
@@ -164,9 +201,20 @@ async function runDestroy(
     peers?: SandboxEntry[];
     currentAfterDelete?: SandboxEntry | null;
     deleteResult?: { status: number; stdout: string; stderr: string };
+    listResult?: { status: number; stdout: string; stderr: string };
+    lookupResults?: { status: number; stdout: string; stderr: string }[];
+    expectedContainerIdentityFingerprint?: string;
     sandboxConfirmedAbsent?: boolean;
     force?: boolean;
     includeRegistryReaders?: boolean;
+    inspectSandboxIdentityFingerprint?: NonNullable<
+      NonNullable<
+        Parameters<typeof executeSandboxDestroy>[0]["deps"]
+      >["inspectOpenShellSandboxIdentityFingerprint"]
+    >;
+    mcpRuntimeSelection?: NonNullable<
+      Parameters<typeof executeSandboxDestroy>[0]["mcpRuntimeSelection"]
+    >;
     lifecycleOptions?: NonNullable<
       NonNullable<
         Parameters<typeof executeSandboxDestroy>[0]["deps"]
@@ -187,34 +235,61 @@ async function runDestroy(
   const stopInferenceResources = vi.fn(() => {
     runtimeProvider.events.push("legacy inference cleanup");
   });
+  const onMutationStarted = vi.fn();
+  let lookupAttempt = 0;
+  let convergenceClockMs = 0;
   const runOpenshell = vi.fn((args: string[]) => {
     const command = args.join(" ");
     runtimeProvider.events.push(command);
-    current = command === "sandbox delete alpha" ? afterDelete : current;
-    return (
-      options.deleteResult ?? {
-        status: 0,
-        stdout: "",
-        stderr: "",
+    switch (`${String(args[0])}:${String(args[1])}`) {
+      case "sandbox:list":
+        return options.listResult ?? { status: 0, stdout: "", stderr: "" };
+      case "sandbox:get": {
+        const sequenced =
+          options.lookupResults?.[Math.min(lookupAttempt, options.lookupResults.length - 1)];
+        lookupAttempt += 1;
+        const fallback = options.listResult?.stdout.trim()
+          ? { status: 0, stdout: "Name: alpha\nPhase: Ready", stderr: "" }
+          : { status: 1, stdout: "", stderr: "Error: sandbox alpha not found" };
+        return sequenced ?? fallback;
       }
-    );
+      case "sandbox:delete":
+        current = args.at(-1) === "alpha" ? afterDelete : current;
+        return options.deleteResult ?? { status: 0, stdout: "", stderr: "" };
+      default:
+        return { status: 0, stdout: "", stderr: "" };
+    }
   });
   const result = await executeSandboxDestroy({
-    cleanupShieldsArtifacts: () => runtimeProvider.events.push("cleanup"),
     force: options.force ?? false,
+    deleteGatewayName: "nemoclaw",
     ...(options.includeRegistryReaders === false ? {} : { getSandbox, listSandboxes }),
     runOpenshell,
     sandbox: entry,
     sandboxConfirmedAbsent: options.sandboxConfirmedAbsent ?? false,
     sandboxName: "alpha",
     stopInferenceResources,
+    onMutationStarted,
+    ...(options.mcpRuntimeSelection ? { mcpRuntimeSelection: options.mcpRuntimeSelection } : {}),
+    ...(options.expectedContainerIdentityFingerprint
+      ? { expectedContainerIdentityFingerprint: options.expectedContainerIdentityFingerprint }
+      : {}),
     runtimeProviders: { mxc: runtimeProvider.bundle },
     deps: {
       ...(options.lifecycleOptions
         ? { hostLocalInferenceLifecycleOptions: options.lifecycleOptions }
         : {}),
-      readTimerMarker: () => null,
-      wipeSandboxState: () => undefined,
+      ...(options.inspectSandboxIdentityFingerprint
+        ? {
+            inspectOpenShellSandboxIdentityFingerprint: options.inspectSandboxIdentityFingerprint,
+          }
+        : {}),
+      deleteConvergence: {
+        now: () => convergenceClockMs,
+        sleep: (milliseconds) => {
+          convergenceClockMs += milliseconds;
+        },
+      },
     },
   });
   return {
@@ -223,6 +298,7 @@ async function runDestroy(
     result,
     runOpenshell,
     stopInferenceResources,
+    onMutationStarted,
   };
 }
 
@@ -237,6 +313,185 @@ describe("sandbox destroy host-local inference transaction", () => {
       },
     };
   }
+
+  it.each([
+    ["changes", () => "b".repeat(64)],
+    [
+      "cannot be inspected",
+      () => {
+        throw new Error("identity unavailable");
+      },
+    ],
+  ])("preserves a pending create when its sandbox identity %s", async (_case, inspect) => {
+    const runtimeProvider = provider();
+    const entry = sandbox("alpha", receipt(), {
+      pendingCreateIdentity: pendingCreateIdentity(),
+    });
+
+    const { result, runOpenshell, stopInferenceResources, onMutationStarted } = await runDestroy(
+      runtimeProvider,
+      {
+        entry,
+        inspectSandboxIdentityFingerprint: inspect,
+      },
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      deleteOutput: expect.stringContaining("Pending create sandbox identity"),
+    });
+    expect(runOpenshell).not.toHaveBeenCalled();
+    expect(stopInferenceResources).not.toHaveBeenCalled();
+    expect(onMutationStarted).not.toHaveBeenCalled();
+    expect(runtimeProvider.events).toEqual([]);
+  });
+
+  it("re-reads a matching pending checkpoint and gateway-scopes its delete", async () => {
+    const runtimeProvider = provider();
+    const entry = sandbox("alpha", receipt(), {
+      pendingCreateIdentity: pendingCreateIdentity(),
+    });
+    const runtimeSelection = {
+      gatewayName: "nemoclaw",
+      workspace: "default",
+      localTlsDir: "/authority/tls",
+    };
+    const inspect = vi.fn(
+      (_options: {
+        readonly sandboxName: string;
+        readonly gatewayName: string;
+        readonly runtimeSelection?: OpenShellRuntimeSelection;
+      }) => SANDBOX_FINGERPRINT,
+    );
+
+    const { getSandbox, result, runOpenshell, onMutationStarted } = await runDestroy(
+      runtimeProvider,
+      {
+        entry,
+        inspectSandboxIdentityFingerprint: inspect,
+        mcpRuntimeSelection: runtimeSelection,
+      },
+    );
+
+    expect(result).toMatchObject({ ok: true });
+    expect(onMutationStarted).toHaveBeenCalledOnce();
+    expect(inspect.mock.calls.length).toBeGreaterThanOrEqual(5);
+    expect(inspect.mock.calls.map(([options]) => options)).toEqual(
+      new Array(inspect.mock.calls.length).fill(
+        expect.objectContaining({
+          sandboxName: "alpha",
+          gatewayName: "nemoclaw",
+          runtimeSelection,
+        }),
+      ),
+    );
+    expect(getSandbox.mock.calls.length).toBeGreaterThanOrEqual(10);
+    expect(runOpenshell).toHaveBeenCalledWith(
+      ["sandbox", "delete", "-g", "nemoclaw", "alpha"],
+      expect.objectContaining({ ignoreError: true }),
+    );
+  });
+
+  it("scopes pending-create cleanup and convergence to its recorded gateway", async () => {
+    const runtimeProvider = provider();
+    const entry = sandbox("alpha", receipt(), {
+      pendingCreateIdentity: pendingCreateIdentity({ gatewayName: "gateway-other" }),
+    });
+    const { result, runOpenshell } = await runDestroy(runtimeProvider, {
+      entry,
+      inspectSandboxIdentityFingerprint: () => SANDBOX_FINGERPRINT,
+    });
+
+    expect(result).toMatchObject({ ok: true, alreadyGone: true });
+    expect(runOpenshell).toHaveBeenCalledWith(
+      expect.arrayContaining(["sandbox", "exec", "-g", "gateway-other", "--name", "alpha"]),
+      expect.any(Object),
+    );
+    expect(runOpenshell).toHaveBeenCalledWith(
+      ["sandbox", "delete", "-g", "gateway-other", "alpha"],
+      expect.objectContaining({ ignoreError: true }),
+    );
+    expect(runOpenshell).toHaveBeenCalledWith(
+      ["sandbox", "get", "-g", "gateway-other", "alpha"],
+      expect.any(Object),
+    );
+  });
+
+  it("uses the runtime-selected gateway for identity continuity and cleanup", async () => {
+    const runtimeProvider = provider();
+    const entry = sandbox();
+    const runtimeSelection = {
+      gatewayName: "gateway-other",
+      workspace: "default",
+      localTlsDir: "/authority/tls",
+    };
+    const inspect = vi.fn(
+      (_options: {
+        readonly sandboxName: string;
+        readonly gatewayName: string;
+        readonly runtimeSelection?: OpenShellRuntimeSelection;
+      }) => SANDBOX_FINGERPRINT,
+    );
+
+    const { result, runOpenshell } = await runDestroy(runtimeProvider, {
+      entry,
+      expectedContainerIdentityFingerprint: SANDBOX_FINGERPRINT,
+      inspectSandboxIdentityFingerprint: inspect,
+      mcpRuntimeSelection: runtimeSelection,
+    });
+
+    expect(result).toMatchObject({ ok: true, alreadyGone: true });
+    expect(inspect.mock.calls.length).toBeGreaterThanOrEqual(5);
+    expect(inspect.mock.calls.map(([options]) => options)).toEqual(
+      new Array(inspect.mock.calls.length).fill(
+        expect.objectContaining({
+          sandboxName: "alpha",
+          gatewayName: "gateway-other",
+          runtimeSelection,
+        }),
+      ),
+    );
+    expect(runOpenshell).toHaveBeenCalledWith(
+      ["sandbox", "delete", "-g", "gateway-other", "alpha"],
+      expect.objectContaining({ ignoreError: true }),
+    );
+  });
+
+  it("preserves a pending create when its checkpoint changes during identity inspection", async () => {
+    const runtimeProvider = provider();
+    const entry = sandbox("alpha", receipt(), {
+      pendingCreateIdentity: pendingCreateIdentity(),
+    });
+    const getSandbox = vi
+      .fn()
+      .mockReturnValueOnce(entry)
+      .mockReturnValueOnce({
+        ...entry,
+        pendingCreateIdentity: pendingCreateIdentity({ route: "compatibility" }),
+      });
+    const runOpenshell = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+    const stopInferenceResources = vi.fn();
+
+    const result = await executeSandboxDestroy({
+      force: false,
+      deleteGatewayName: "nemoclaw",
+      getSandbox,
+      listSandboxes: () => ({ sandboxes: [entry] }),
+      runOpenshell,
+      sandbox: entry,
+      sandboxConfirmedAbsent: false,
+      sandboxName: "alpha",
+      stopInferenceResources,
+      runtimeProviders: { mxc: runtimeProvider.bundle },
+      deps: {
+        inspectOpenShellSandboxIdentityFingerprint: () => SANDBOX_FINGERPRINT,
+      },
+    });
+
+    expect(result).toMatchObject({ ok: false });
+    expect(runOpenshell).not.toHaveBeenCalled();
+    expect(stopInferenceResources).not.toHaveBeenCalled();
+  });
 
   function explicitLlamaSandbox(value = explicitLlamaReceipt()): SandboxEntry {
     const serialized = serializeHostLocalInferenceReceipt(value);
@@ -331,11 +586,15 @@ describe("sandbox destroy host-local inference transaction", () => {
     let current: SandboxEntry | null = entry;
     const stopInferenceResources = vi.fn();
     const result = await executeSandboxDestroy({
-      cleanupShieldsArtifacts: vi.fn(),
       force: false,
+      deleteGatewayName: "nemoclaw",
       getSandbox: () => current,
       listSandboxes: () => ({ sandboxes: current ? [current] : [] }),
-      runOpenshell: vi.fn(() => ({ status: 0, stdout: "", stderr: "" })),
+      runOpenshell: vi.fn((args: string[]) =>
+        args[1] === "get"
+          ? { status: 1, stdout: "", stderr: "Error: sandbox alpha not found" }
+          : { status: 0, stdout: "", stderr: "" },
+      ),
       sandbox: entry,
       sandboxConfirmedAbsent: false,
       sandboxName: "alpha",
@@ -345,8 +604,6 @@ describe("sandbox destroy host-local inference transaction", () => {
         hostLocalInferenceLifecycleOptions: {
           createLlamaCppAdapter: runtimeProvider.createLlamaCppAdapter,
         },
-        readTimerMarker: () => null,
-        wipeSandboxState: () => undefined,
       },
     });
 
@@ -364,11 +621,15 @@ describe("sandbox destroy host-local inference transaction", () => {
     const entry = explicitLlamaSandbox();
     const stopInferenceResources = vi.fn();
     const result = await executeSandboxDestroy({
-      cleanupShieldsArtifacts: vi.fn(),
       force: false,
+      deleteGatewayName: "nemoclaw",
       getSandbox: () => entry,
       listSandboxes: () => ({ sandboxes: [entry] }),
-      runOpenshell: vi.fn(() => ({ status: 0, stdout: "", stderr: "" })),
+      runOpenshell: vi.fn((args: string[]) =>
+        args[1] === "get"
+          ? { status: 1, stdout: "", stderr: "Error: sandbox alpha not found" }
+          : { status: 0, stdout: "", stderr: "" },
+      ),
       sandbox: entry,
       sandboxConfirmedAbsent: false,
       sandboxName: "alpha",
@@ -378,8 +639,6 @@ describe("sandbox destroy host-local inference transaction", () => {
         hostLocalInferenceLifecycleOptions: {
           createLlamaCppAdapter: runtimeProvider.createLlamaCppAdapter,
         },
-        readTimerMarker: () => null,
-        wipeSandboxState: () => undefined,
       },
     });
 
@@ -436,13 +695,15 @@ describe("sandbox destroy host-local inference transaction", () => {
         throw new Error("provider failed with OPENAI_API_KEY=super-secret");
       },
     });
-    const { result, runOpenshell, stopInferenceResources } = await runDestroy(runtimeProvider);
+    const { result, runOpenshell, stopInferenceResources, onMutationStarted } =
+      await runDestroy(runtimeProvider);
 
     expect(result).toMatchObject({ ok: false });
     expect(JSON.stringify(result)).not.toContain("super-secret");
     expect(JSON.stringify(result)).toContain("<REDACTED>");
     expect(runOpenshell).not.toHaveBeenCalled();
     expect(stopInferenceResources).not.toHaveBeenCalled();
+    expect(onMutationStarted).not.toHaveBeenCalled();
   });
 
   it("requires exact registry readers before deleting a sandbox with durable authority", async () => {
@@ -525,14 +786,17 @@ describe("sandbox destroy host-local inference transaction", () => {
 
   it("does not discard durable authority when --force cannot reach the gateway", async () => {
     const runtimeProvider = provider();
-    const { result, stopInferenceResources } = await runDestroy(runtimeProvider, {
-      deleteResult: {
-        status: 1,
-        stdout: "",
-        stderr: "tcp connect error: Connection refused (os error 61)",
+    const { result, stopInferenceResources, onMutationStarted } = await runDestroy(
+      runtimeProvider,
+      {
+        deleteResult: {
+          status: 1,
+          stdout: "",
+          stderr: "tcp connect error: Connection refused (os error 61)",
+        },
+        force: true,
       },
-      force: true,
-    });
+    );
 
     expect(result).toMatchObject({
       ok: false,
@@ -542,6 +806,83 @@ describe("sandbox destroy host-local inference transaction", () => {
     expect(runtimeProvider.events).not.toContain("cleanup");
     expect(runtimeProvider.destroy).not.toHaveBeenCalled();
     expect(stopInferenceResources).not.toHaveBeenCalled();
+    expect(onMutationStarted).toHaveBeenCalledOnce();
+  });
+
+  it("preserves recovery authority when an accepted delete remains present", async () => {
+    const runtimeProvider = provider();
+    const { result, runOpenshell, stopInferenceResources } = await runDestroy(runtimeProvider, {
+      listResult: { status: 0, stdout: "alpha Ready", stderr: "" },
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      deleteOutput: expect.stringContaining(
+        "final probe still observed it in phase 'Ready' on gateway 'nemoclaw'",
+      ),
+    });
+    expect(result.deleteOutput).toContain("Local recovery state was preserved");
+    expect(result.deleteOutput).toContain(
+      "Inspect the sandbox on that gateway, then retry destroy",
+    );
+    expect(runOpenshell.mock.calls.filter(([args]) => args[1] === "delete")).toHaveLength(1);
+    expect(runtimeProvider.destroy).not.toHaveBeenCalled();
+    expect(stopInferenceResources).not.toHaveBeenCalled();
+  });
+
+  it("reports the final gateway failure after an accepted delete", async () => {
+    const runtimeProvider = provider();
+    const { result, runOpenshell, stopInferenceResources } = await runDestroy(runtimeProvider, {
+      lookupResults: [
+        {
+          status: 1,
+          stdout: "",
+          stderr: "tcp connect error: Connection refused (os error 61)",
+        },
+      ],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      gatewayUnreachable: true,
+      deleteOutput: expect.stringContaining(
+        "final absence probe could not reach gateway 'nemoclaw'",
+      ),
+    });
+    expect(result.deleteOutput).toContain("Local recovery state was preserved");
+    expect(result.deleteOutput).toContain("Restore gateway access, then retry destroy");
+    expect(runOpenshell.mock.calls.filter(([args]) => args[1] === "delete")).toHaveLength(1);
+    expect(runtimeProvider.destroy).not.toHaveBeenCalled();
+    expect(stopInferenceResources).not.toHaveBeenCalled();
+  });
+
+  it("waits for accepted deletion to become explicitly absent without retrying it (#11941)", async () => {
+    const runtimeProvider = provider();
+    const { result, runOpenshell } = await runDestroy(runtimeProvider, {
+      lookupResults: [
+        { status: 0, stdout: "Name: alpha\nPhase: Deleting", stderr: "" },
+        { status: 1, stdout: "", stderr: "Error: sandbox alpha not found" },
+      ],
+    });
+
+    expect(result).toMatchObject({ ok: true, alreadyGone: true });
+    expect(runOpenshell.mock.calls.filter(([args]) => args[1] === "delete")).toHaveLength(1);
+    expect(runOpenshell.mock.calls.filter(([args]) => args[1] === "get")).toHaveLength(3);
+  });
+
+  it("reconciles ambiguous acknowledgement loss without retrying the mutation", async () => {
+    const runtimeProvider = provider();
+    const { result, runOpenshell } = await runDestroy(runtimeProvider, {
+      deleteResult: {
+        status: 1,
+        stdout: "",
+        stderr: "transport error: connection reset",
+      },
+      listResult: { status: 0, stdout: "", stderr: "" },
+    });
+
+    expect(result).toMatchObject({ ok: true, alreadyGone: true });
+    expect(runOpenshell.mock.calls.filter(([args]) => args[1] === "delete")).toHaveLength(1);
   });
 
   it("reconciles retained authority only after stable sandbox absence", async () => {

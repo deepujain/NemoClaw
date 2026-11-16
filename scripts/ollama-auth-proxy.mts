@@ -158,7 +158,7 @@ function decodeProcAddress(addr: string): number[] | null {
  *   - IPv4: first byte 0x7F (127.0.0.0/8)
  *   - IPv6 canonical loopback: 15 zero bytes then 0x01 (::1)
  *   - IPv4-mapped IPv6 loopback: 10 zero bytes, then 0xFF 0xFF, then any
- *     127.x.y.z (byte 12 == 0x7F). Covers ::ffff:127.0.0.0/8.
+ *     127.x.y.z (byte 12 == 0x7F). Covers ::ffff:127.0.0.0/104.
  * Returns false for any input the decoder produced that does not match one
  * of these shapes.
  */
@@ -202,10 +202,16 @@ function probeLinuxLoopbackBind(port: number): BackendProbeResult | null {
   try {
     v6Text = fs.readFileSync("/proc/net/tcp6", "utf8");
   } catch (err) {
-    // tcp6 may be absent on IPv6-disabled kernels; treat as empty. Any
-    // other failure (EACCES / EPERM) is treated the same: absence of IPv6
-    // data doesn't invalidate the IPv4 data we already read.
-    void err;
+    // tcp6 absent (ENOENT) means the kernel runs without IPv6, so there are
+    // no IPv6 listeners to classify; the IPv4 data alone is complete.
+    // Any other failure (EACCES / EPERM) means IPv6 listeners exist but are
+    // not visible here, and passing on IPv4 data alone would let a
+    // non-loopback IPv6-only listener through. Degrade to null so the
+    // caller falls back to `lsof`, which sees both address families.
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== "ENOENT") {
+      return null;
+    }
   }
   const listeners = [
     ...parseProcNetTcpListeners(v4Text, port),
@@ -226,7 +232,7 @@ function probeLinuxLoopbackBind(port: number): BackendProbeResult | null {
  * as loopback. Handles the same three semantic cases as
  * `isLoopbackProcAddress`, but on the cross-platform lsof-style form so the
  * IPv4 accept range matches on both probes: any 127.x.y.z (127.0.0.0/8),
- * ::1, and ::ffff:127.0.0.0/8. Advisor PRA-4 (Ultra) flagged the earlier
+ * ::1, and ::ffff:127.0.0.0/104. Advisor PRA-4 (Ultra) flagged the earlier
  * exact-match against "127.0.0.1" as an incomplete classifier that would
  * refuse legitimate loopback binds and, worse, mask a genuine non-loopback
  * mistake as "not-loopback" on the fallback path.
@@ -283,17 +289,14 @@ function probeLsofLoopbackBind(port: number): BackendProbeResult | null {
 
 function assertBackendBoundToLoopback(port: number): void {
   if (process.env.NEMOCLAW_OLLAMA_PROXY_SKIP_BIND_PROBE === "1") {
-    // PRA-5 audit trail: the operator override that disables the
-    // loopback probe MUST leave a durable record in the proxy's stderr so
-    // an incident investigator scanning proxy logs can see that
-    // enforcement was skipped, when, and via which knob. This is not a
-    // fail-closed decision (the operator explicitly asked for the
-    // override), but it must not be silent.
+    // The proxy warns when the operator override disables the loopback probe.
+    // Direct runs expose this stderr warning, and the managed launcher prints
+    // the same warning on the host. Issue #9846 owns a durable audit record.
     console.warn(
       `Ollama auth proxy: SECURITY PROBE SKIPPED. ` +
         `NEMOCLAW_OLLAMA_PROXY_SKIP_BIND_PROBE=1 disabled the loopback ` +
-        `bind check for port ${port}. Any Ollama daemon on this host ` +
-        `reachable on a non-loopback interface will bypass the proxy's ` +
+        `bind check for port ${port}. A selected backend reachable on a ` +
+        `non-loopback interface will bypass the proxy's ` +
         `token check. Unset the env to restore enforcement.`,
     );
     return;
@@ -318,6 +321,10 @@ function assertBackendBoundToLoopback(port: number): void {
   const labels = (result.nonLoopback || result.listeners || [])
     .map((l) => `${l.address}:${l.port}`)
     .join(", ");
+  // This stderr is not the user-facing message: the host spawns the proxy with
+  // stdio "ignore" and renders remediation from the status reason below, which
+  // knows whether the backend is Ollama or a compatible endpoint (#9730). Keep
+  // user-facing wording in that renderer, not here.
   console.error(
     `Ollama auth proxy: backend on port ${port} is NOT bound to loopback ` +
       `(found ${labels || "non-loopback listener"}). ` +
@@ -330,9 +337,45 @@ function assertBackendBoundToLoopback(port: number): void {
   process.exit(EXIT_BACKEND_NOT_LOOPBACK);
 }
 
+const RECEIPT_PATH = "/_nemoclaw/e2e-inference-receipt";
+const MAX_RECEIPT_REQUEST_BYTES = 8 * 1024 * 1024;
+const MAX_RECEIPT_MODEL_BYTES = 256;
+const MAX_RECEIPT_MODELS = 64;
+
+function captureChatModel(request: http.IncomingMessage): () => string | null {
+  let chunks: Buffer[] = [];
+  let bytes = 0;
+  let model: string | null = null;
+  request.on("data", (chunk: Buffer) => {
+    bytes += chunk.length;
+    if (bytes <= MAX_RECEIPT_REQUEST_BYTES) chunks.push(chunk);
+    else chunks = [];
+  });
+  request.once("end", () => {
+    if (bytes > MAX_RECEIPT_REQUEST_BYTES) return;
+    try {
+      const body: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      if (
+        body &&
+        typeof body === "object" &&
+        "model" in body &&
+        typeof body.model === "string" &&
+        Buffer.byteLength(body.model) <= MAX_RECEIPT_MODEL_BYTES
+      ) {
+        model = body.model;
+      }
+    } catch {
+      // An invalid request cannot establish model-scoped completion evidence.
+    }
+    chunks = [];
+  });
+  return () => model;
+}
+
 function buildProxyServer(token: string, backendUrl: URL): http.Server {
   const expectedBuf = Buffer.from(`Bearer ${token}`);
-  return http.createServer((clientReq, clientRes) => {
+  const completedChatRequestsByModel = new Map<string, number>();
+  const server = http.createServer((clientReq, clientRes) => {
     // Every request must present a valid Bearer token. The proxy binds 0.0.0.0
     // so the OpenShell sandbox container can reach it via the docker bridge —
     // which also means anything else with network reach to the host could,
@@ -356,10 +399,66 @@ function buildProxyServer(token: string, backendUrl: URL): http.Server {
       return;
     }
 
+    if (clientReq.url === "/_nemoclaw/proxy-config") {
+      if (clientReq.method !== "GET") {
+        clientRes.writeHead(405, { Allow: "GET" });
+        clientRes.end();
+        return;
+      }
+      const listener = server.address();
+      if (Buffer.byteLength(backendUrl.origin) > 512) {
+        clientRes.writeHead(503);
+        clientRes.end();
+        return;
+      }
+      clientRes.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      clientRes.end(
+        JSON.stringify({
+          schemaVersion: 1,
+          pid: process.pid,
+          listener:
+            typeof listener === "object" && listener !== null
+              ? { address: listener.address, port: listener.port }
+              : null,
+          backendOrigin: backendUrl.origin,
+        }),
+      );
+      return;
+    }
+
+    if (clientReq.url === RECEIPT_PATH || clientReq.url?.startsWith(`${RECEIPT_PATH}?`)) {
+      if (clientReq.method !== "GET") {
+        clientRes.writeHead(405, { Allow: "GET" });
+        clientRes.end();
+        return;
+      }
+      const models = new URLSearchParams(clientReq.url.slice(RECEIPT_PATH.length + 1)).getAll(
+        "model",
+      );
+      if (
+        models.length !== 1 ||
+        models[0].length === 0 ||
+        Buffer.byteLength(models[0]) > MAX_RECEIPT_MODEL_BYTES
+      ) {
+        clientRes.writeHead(400).end();
+        return;
+      }
+      clientRes.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      clientRes.end(
+        JSON.stringify({
+          model: models[0],
+          completedRequests: completedChatRequestsByModel.get(models[0]) ?? 0,
+        }),
+      );
+      return;
+    }
+
     // Strip the auth header before forwarding to Ollama
     const headers = { ...clientReq.headers };
     delete headers.authorization;
     delete headers.host;
+    const chatCompletion = clientReq.method === "POST" && clientReq.url === "/v1/chat/completions";
+    const requestModel = chatCompletion ? captureChatModel(clientReq) : () => null;
 
     const handleBackendError = (err: Error): void => {
       if (clientRes.destroyed || clientRes.writableEnded) return;
@@ -368,7 +467,7 @@ function buildProxyServer(token: string, backendUrl: URL): http.Server {
         return;
       }
       clientRes.writeHead(502, { "Content-Type": "text/plain" });
-      clientRes.end(`Ollama backend error: ${err.message}`);
+      clientRes.end(`Backend error: ${err.message}`);
     };
 
     const proxyReq = http.request(
@@ -381,6 +480,20 @@ function buildProxyServer(token: string, backendUrl: URL): http.Server {
       },
       (proxyRes: http.IncomingMessage) => {
         proxyRes.once("error", handleBackendError);
+        if (
+          chatCompletion &&
+          (proxyRes.statusCode ?? 500) >= 200 &&
+          (proxyRes.statusCode ?? 500) < 300
+        ) {
+          clientRes.once("finish", () => {
+            const model = requestModel();
+            if (!model) return;
+            const previous = completedChatRequestsByModel.get(model);
+            if (previous === undefined && completedChatRequestsByModel.size >= MAX_RECEIPT_MODELS)
+              return;
+            completedChatRequestsByModel.set(model, (previous ?? 0) + 1);
+          });
+        }
         clientRes.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
         proxyRes.pipe(clientRes);
       },
@@ -397,6 +510,7 @@ function buildProxyServer(token: string, backendUrl: URL): http.Server {
 
     clientReq.pipe(proxyReq);
   });
+  return server;
 }
 
 function shouldProbeBackendHostname(hostname: string): boolean {
@@ -453,6 +567,7 @@ if (import.meta.main) {
 }
 
 export {
+  buildProxyServer,
   clearExitStatus,
   decodeProcAddress,
   EXIT_BACKEND_NOT_LOOPBACK,

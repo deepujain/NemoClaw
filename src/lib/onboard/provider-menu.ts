@@ -36,7 +36,6 @@ export interface BuildInferenceProviderMenuInput {
   winOllamaLoopbackOnly: boolean;
   ollamaInstallEntry: ProviderMenuChoice | null;
   vllmEntries: readonly ProviderMenuChoice[];
-  routedEnabled: boolean;
   managedLlamaCppOptions?: readonly ProviderMenuChoice[];
 }
 
@@ -98,11 +97,15 @@ export function buildInferenceProviderMenu(
 
   options.push(...input.vllmEntries);
 
-  if (input.hasWindowsOllama && !input.isWindowsHostOllama) {
+  const needsWindowsOllamaRepair = input.hasWindowsOllama && !input.isWindowsHostOllama;
+  const needsWindowsOllamaRestart = input.isWindowsHostOllama && !input.windowsOllamaReachable;
+  if (needsWindowsOllamaRepair || needsWindowsOllamaRestart) {
     options.push({
       key: "start-windows-ollama",
       label: input.windowsHostStartLabel({
-        reachable: input.windowsOllamaReachable,
+        // Only an already-classified Windows route has passed the loopback,
+        // Docker reachability, and Host-header validation gates.
+        reachable: input.isWindowsHostOllama && input.windowsOllamaReachable,
         loopbackOnly: input.winOllamaLoopbackOnly,
       }),
     });
@@ -116,10 +119,6 @@ export function buildInferenceProviderMenu(
   }
 
   if (input.ollamaInstallEntry) options.push(input.ollamaInstallEntry);
-
-  if (input.routedEnabled) {
-    options.push({ key: "routed", label: "Model Router (experimental)" });
-  }
 
   options.push(...(input.managedLlamaCppOptions ?? []));
 

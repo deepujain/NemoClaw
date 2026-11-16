@@ -44,6 +44,16 @@ export const whatsappManifest = {
     },
   ],
   credentials: [],
+  // Channel removal owns these cleanup paths. Rebuild persistence captures the
+  // complete native home and intentionally has no per-agent path inventory.
+  state: {
+    openclaw: ["whatsapp"],
+    hermes: [
+      "platforms/whatsapp",
+      "profiles/dashboard-home/platforms/whatsapp/session",
+      "dashboard-home/platforms/whatsapp/session",
+    ],
+  },
   policyPresets: ["whatsapp"],
   render: [
     {
@@ -129,11 +139,20 @@ export const whatsappManifest = {
       spec: "npm:@openclaw/whatsapp@{{openclaw.version}}",
       pin: true,
       integrityByVersion: {
-        "2026.7.1":
-          "sha512-wLY/Omc5fleRpl2lKGN8sxt/8hYfHGwLRezmWsk8oCbea5pRKUPE6ZX+wJO1O52NOJkAGCuiXvS7x0qIeKxXbQ==",
+        "2026.10.5":
+          "sha512-3Dbv0p60yuz6tzuZNUMHzIYjhGL816BfOPBfz2YIpszQ7kx2j1uZfgpa0xTaxH4Spbg0AFakIp0kIcWOU1ODEQ==",
+        "2026.9.2":
+          "sha512-vOWQIk7FpLHrhMmO+FaLi+pnFB82hiWNJJFJONkBuofERh2SMEz7EMut/vECFFEjFnmOZSVlYfRlxhbNkd/R6g==",
+        "2026.9.5":
+          "sha512-V7o/ckrk0N0iN4fKk5jMBs4nqe4Ftc4/drJWY374fREY8gEMzmdvXMB2pfM2VrmptJfoPMMhI78C+1+mGUtwJw==",
+        "2026.9.1":
+          "sha512-llIcoMa6FM4SgYn7GG1FQIeTTA5JDdcHW5D7PT+3aGYT3/E2eLFutKwDvD/w7G0hvDwSftzZgLi3iA8dzK7a3A==",
       },
       tarballUrlByVersion: {
-        "2026.7.1": "https://registry.npmjs.org/@openclaw/whatsapp/-/whatsapp-2026.7.1.tgz",
+        "2026.10.5": "https://registry.npmjs.org/@openclaw/whatsapp/-/whatsapp-2026.10.5.tgz",
+        "2026.9.2": "https://registry.npmjs.org/@openclaw/whatsapp/-/whatsapp-2026.9.2.tgz",
+        "2026.9.5": "https://registry.npmjs.org/@openclaw/whatsapp/-/whatsapp-2026.9.5.tgz",
+        "2026.9.1": "https://registry.npmjs.org/@openclaw/whatsapp/-/whatsapp-2026.9.1.tgz",
       },
       required: true,
     },

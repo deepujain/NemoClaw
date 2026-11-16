@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import type { ModelSelectionProvenance } from "../domain/telemetry/provenance";
 import type { ServingProfileProvenance } from "../inference/serving/types";
 import type { WebSearchConfig } from "../inference/web-search";
 import type { SandboxMessagingPlan } from "../messaging/manifest";
@@ -12,6 +13,7 @@ export interface OnboardSessionUpdateInput {
   sandboxName?: string | null;
   provider?: string | null;
   model?: string | null;
+  modelSelectionProvenance?: ModelSelectionProvenance | null;
   servingProfileProvenance?: ServingProfileProvenance | null;
   endpointUrl?: string | null;
   credentialEnv?: string | null;
@@ -23,7 +25,6 @@ export interface OnboardSessionUpdateInput {
   webSearchConfig?: WebSearchConfig | null;
   toolDisclosure?: ToolDisclosure | string;
   observabilityEnabled?: boolean;
-  policyPresets?: string[] | null;
   messagingPlan?: SandboxMessagingPlan | null;
   hermesToolGateways?: string[] | null;
   /** Ephemeral vLLM checkpoint proof consumed by Station provider binding; never persisted. */
@@ -57,6 +58,9 @@ export function toSessionUpdates(updates: OnboardSessionUpdateInput = {}): Sessi
     normalized.sandboxName = toNullableString(updates.sandboxName);
   if (updates.provider !== undefined) normalized.provider = toNullableString(updates.provider);
   if (updates.model !== undefined) normalized.model = toNullableString(updates.model);
+  if (updates.modelSelectionProvenance !== undefined) {
+    normalized.modelSelectionProvenance = updates.modelSelectionProvenance;
+  }
   if (updates.servingProfileProvenance !== undefined) {
     normalized.servingProfileProvenance = updates.servingProfileProvenance;
   }
@@ -87,7 +91,6 @@ export function toSessionUpdates(updates: OnboardSessionUpdateInput = {}): Sessi
   if (typeof updates.observabilityEnabled === "boolean") {
     normalized.observabilityEnabled = updates.observabilityEnabled;
   }
-  if (updates.policyPresets !== undefined) normalized.policyPresets = updates.policyPresets;
   if (updates.messagingPlan !== undefined) normalized.messagingPlan = updates.messagingPlan;
   if (updates.hermesToolGateways !== undefined)
     normalized.hermesToolGateways = updates.hermesToolGateways;

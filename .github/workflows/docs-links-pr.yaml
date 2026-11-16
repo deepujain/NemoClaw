@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Docs / Link Check
+name: Docs / Check Changed Markdown Links
 
 on:
   pull_request:
@@ -17,6 +17,7 @@ permissions:
 
 jobs:
   markdown-links:
+    name: Docs / Check changed Markdown links
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -25,6 +26,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+          filter: blob:none
 
       - name: Determine changed documentation files
         id: changed

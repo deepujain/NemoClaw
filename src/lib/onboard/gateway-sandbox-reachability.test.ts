@@ -10,6 +10,12 @@ import {
   tryAutoApplyUfwRule,
   verifySandboxBridgeGatewayReachableOrExit,
 } from "./gateway-sandbox-reachability";
+import {
+  PORTABLE_DOCKER_NETWORK_NAME,
+  PORTABLE_DOCKER_NETWORK_SUBNET,
+  PORTABLE_HOST_GATEWAY_IP,
+} from "./experimental/portable-profile";
+import { prepareNativePodmanGatewayHostRuntime } from "./runtime-provider/podman-runtime-surfaces";
 
 describe("gateway sandbox reachability route modeling", () => {
   it("parses Docker network IPAM config for subnet and gateway", () => {
@@ -89,12 +95,40 @@ describe("isSandboxBridgeGatewayReachable", () => {
     expect(seen.args.join(" ")).toContain("nc -zw7 host.openshell.internal 9090");
   });
 
-  it("routes probes for the portable experimental profile through the OpenShell Podman host gateway", async () => {
+  it("uses the configured Docker network when networkName is omitted (#9461)", async () => {
+    vi.stubEnv("OPENSHELL_DOCKER_NETWORK_NAME", "portable-custom");
+    const inspectNetworkImpl = vi.fn(() => ({
+      subnet: "10.0.0.0/24",
+      gatewayIp: "10.0.0.1",
+    }));
+    let capturedArgs: readonly string[] = [];
+
+    const result = await isSandboxBridgeGatewayReachable({
+      inspectNetworkImpl,
+      usesHostGatewayRouteImpl: () => false,
+      runImpl: (args) => {
+        capturedArgs = args;
+        return { status: 0 };
+      },
+    });
+
+    expect(inspectNetworkImpl).toHaveBeenCalledWith("portable-custom");
+    const networkIndex = capturedArgs.indexOf("--network");
+    expect(networkIndex).toBeGreaterThanOrEqual(0);
+    expect(capturedArgs[networkIndex + 1]).toBe("portable-custom");
+    expect(result.ok).toBe(true);
+    expect(result.networkName).toBe("portable-custom");
+  });
+
+  it("reaches the Portable host gateway from openshell-docker (#9587)", async () => {
     vi.stubEnv("NEMOCLAW_EXPERIMENTAL_PROFILE", "portable");
     const seen: { args: readonly string[] } = { args: [] };
 
     const result = await isSandboxBridgeGatewayReachable({
-      inspectNetworkImpl: () => ({ subnet: "10.89.0.0/24", gatewayIp: "10.89.0.1" }),
+      inspectNetworkImpl: (networkName) => {
+        expect(networkName).toBe(PORTABLE_DOCKER_NETWORK_NAME);
+        return { subnet: PORTABLE_DOCKER_NETWORK_SUBNET, gatewayIp: "10.87.0.1" };
+      },
       usesHostGatewayRouteImpl: () => false,
       runImpl: (args) => {
         seen.args = args;
@@ -104,11 +138,56 @@ describe("isSandboxBridgeGatewayReachable", () => {
 
     expect(result).toMatchObject({
       ok: true,
-      gatewayIp: "169.254.1.2",
+      networkName: PORTABLE_DOCKER_NETWORK_NAME,
+      subnet: PORTABLE_DOCKER_NETWORK_SUBNET,
+      gatewayIp: PORTABLE_HOST_GATEWAY_IP,
       routeKind: "portable_host_gateway",
     });
 
-    expect(seen.args).toContain("host.openshell.internal:169.254.1.2");
+    const networkIndex = seen.args.indexOf("--network");
+    const addHostIndex = seen.args.indexOf("--add-host");
+    expect(seen.args[networkIndex + 1]).toBe(PORTABLE_DOCKER_NETWORK_NAME);
+    expect(seen.args[addHostIndex + 1]).toBe(`host.openshell.internal:${PORTABLE_HOST_GATEWAY_IP}`);
+    expect(seen.args).not.toContain("host.openshell.internal:10.87.0.1");
+  });
+
+  it("reaches the native Podman host gateway without selecting the portable profile", async () => {
+    const seen: { args: readonly string[] } = { args: [] };
+    const inspect = vi.fn(() => ({ subnet: "10.89.0.0/24", gatewayIp: "10.89.0.1" }));
+    const run = vi.fn((args: readonly string[]) => {
+      seen.args = args;
+      return { status: 0 };
+    });
+    const ensureProbeImageCached = vi.fn(() => ({ ok: true, alreadyCached: true }));
+    const gatewayRuntime = {
+      ...prepareNativePodmanGatewayHostRuntime({
+        environment: {},
+        platform: "linux",
+        socketPath: "/run/user/1000/podman/podman.sock",
+      }),
+      network: {
+        sandboxSourceCidrs: () => ["10.89.0.0/24"],
+        inspect,
+        usesHostGatewayRoute: vi.fn(() => false),
+        run,
+        ensureProbeImageCached,
+      },
+    };
+
+    const result = await isSandboxBridgeGatewayReachable({
+      gatewayRuntime,
+      platform: "linux",
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      gatewayIp: PORTABLE_HOST_GATEWAY_IP,
+      routeKind: "provider_host_gateway",
+    });
+    expect(inspect).toHaveBeenCalledWith("openshell-docker");
+    expect(ensureProbeImageCached).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledOnce();
+    expect(seen.args).toContain(`host.openshell.internal:${PORTABLE_HOST_GATEWAY_IP}`);
     expect(seen.args).not.toContain("host.openshell.internal:10.89.0.1");
   });
 
@@ -588,7 +667,7 @@ describe("formatSandboxBridgeUnreachableMessage", () => {
       routeKind: "portable_host_gateway",
       networkName: "openshell-docker",
       subnet: "10.89.0.0/24",
-      gatewayIp: "169.254.1.2",
+      gatewayIp: PORTABLE_HOST_GATEWAY_IP,
     });
     expect(msg).toContain("OpenShell Podman host gateway");
     expect(msg).toContain("systemctl --user try-restart podman.service");
@@ -793,7 +872,7 @@ describe("verifySandboxBridgeGatewayReachableOrExit host-gateway retry", () => {
     const portableFailure = {
       ...hostGatewayTcpFailure,
       routeKind: "portable_host_gateway" as const,
-      gatewayIp: "169.254.1.2",
+      gatewayIp: PORTABLE_HOST_GATEWAY_IP,
     };
     const reachabilityImpl = vi
       .fn()

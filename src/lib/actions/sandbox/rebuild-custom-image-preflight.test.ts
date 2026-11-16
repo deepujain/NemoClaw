@@ -6,17 +6,13 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import { fingerprintBuildContext } from "../../adapters/fs/build-context-fingerprint";
 import { ROOT } from "../../runner";
 import type { SandboxBaseImageResolutionMetadata } from "../../sandbox-base-image";
 import {
-  finalizePreparedRebuildImageMessagingPlan,
-  type PreparedRebuildImage,
   preflightRebuildImage,
   type RebuildImagePreflightResult,
 } from "./rebuild-custom-image-preflight";
 import {
-  createBuildContextVerifier,
   disposePreparedBuildContext,
   verifyPreparedBuildContext,
 } from "./rebuild-prepared-image-context";
@@ -50,35 +46,6 @@ function input(fromDockerfile: string | null) {
     },
     gatewayPort: 8080,
     chatUiUrl: "http://127.0.0.1:18789",
-  };
-}
-
-function hermesMessagingPlan() {
-  return {
-    schemaVersion: 1 as const,
-    sandboxName: "alpha",
-    agent: "hermes" as const,
-    workflow: "rebuild" as const,
-    channels: [
-      {
-        channelId: "slack",
-        displayName: "Slack",
-        authMode: "token-paste" as const,
-        active: true,
-        selected: true,
-        configured: true,
-        disabled: false,
-        inputs: [],
-        hooks: [],
-      },
-    ],
-    disabledChannels: [],
-    credentialBindings: [],
-    networkPolicy: { presets: [], entries: [] },
-    agentRender: [],
-    buildSteps: [],
-    stateUpdates: [],
-    healthChecks: [],
   };
 }
 
@@ -286,12 +253,164 @@ describe("preflightRebuildImage", () => {
     }
   });
 
-  it("builds and removes the exact staged custom context on success", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-custom-preflight-"));
-    const dockerfile = path.join(dir, "Dockerfile.custom");
+  it("isolates rebuild preflight from an unavailable WSL Docker Desktop helper (#7111)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-wsl-rebuild-preflight-"));
+    const dockerConfig = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-wsl-docker-config-"));
+    const dockerfile = path.join(dir, "Dockerfile");
+    const originalConfig = JSON.stringify({
+      auths: { "registry.example.com": { auth: "must-remain-private" } },
+      credsStore: "desktop.exe",
+    });
     fs.writeFileSync(dockerfile, "FROM scratch\n");
-    const buildImage = vi.fn(() => ({ status: 0 }) as never);
+    fs.writeFileSync(path.join(dockerConfig, "config.json"), originalConfig);
+    let isolatedConfig = "";
+    const credentialHelperResponds = vi.fn(() => false);
+    try {
+      const result = successful(
+        await preflightRebuildImage(input(null), {
+          stageBuildContext: vi.fn(() => ({
+            buildCtx: dir,
+            stagedDockerfile: dockerfile,
+            cleanupBuildCtx: () => true,
+            origin: "generated" as const,
+          })),
+          prepareDockerfilePatch: vi.fn(async () => ({
+            buildId: "wsl-safe-preflight",
+            dashboardRemoteBindPrepared: false,
+            resolvedBaseImage: null,
+          })),
+          buildImage: vi.fn((_dockerfile, _tag, _context, options) => {
+            isolatedConfig = String(options.env?.DOCKER_CONFIG);
+            expect(isolatedConfig).toContain("nemoclaw-wsl-buildkit-docker-config-");
+            expect(isolatedConfig).not.toBe(dockerConfig);
+            expect(options.env?.DOCKER_HOST).toBeUndefined();
+            expect(options.env?.DOCKER_CONTEXT).toBeUndefined();
+            expect(options.env?.DOCKER_BUILDKIT).toBe("1");
+            expect(
+              JSON.parse(fs.readFileSync(path.join(isolatedConfig, "config.json"), "utf8")),
+            ).toEqual({ auths: {} });
+            return { status: 0 } as never;
+          }),
+          removeImage: vi.fn(() => ({ status: 0 }) as never),
+          env: {
+            DOCKER_CONFIG: dockerConfig,
+            WSL_DISTRO_NAME: "Ubuntu",
+          },
+          credentialHelperResponds,
+          dockerContextIsDefault: () => true,
+          isWslHost: true,
+        }),
+      );
+
+      expect(credentialHelperResponds).toHaveBeenCalledOnce();
+      expect(fs.existsSync(isolatedConfig)).toBe(false);
+      expect(fs.readFileSync(path.join(dockerConfig, "config.json"), "utf8")).toBe(originalConfig);
+      expect(disposePreparedBuildContext(result.prepared)).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dockerConfig, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform === "linux")(
+    "uses the isolated config across the WSL helper and Docker subprocess boundary (#7111)",
+    async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-wsl-rebuild-process-"));
+      const executableRoot = path.join(root, "bin");
+      const dockerConfig = path.join(root, "docker-config");
+      const buildCtx = path.join(root, "context");
+      const dockerfile = path.join(buildCtx, "Dockerfile");
+      const helperMarker = path.join(root, "helper-invoked");
+      const dockerMarker = path.join(root, "docker-config-used");
+      fs.mkdirSync(executableRoot);
+      fs.mkdirSync(dockerConfig);
+      fs.mkdirSync(buildCtx);
+      fs.writeFileSync(dockerfile, "FROM scratch\n");
+      fs.writeFileSync(
+        path.join(dockerConfig, "config.json"),
+        JSON.stringify({
+          auths: { "registry.example.com": { auth: "must-remain-private" } },
+          credsStore: "desktop.exe",
+        }),
+      );
+      fs.writeFileSync(
+        path.join(executableRoot, "docker-credential-desktop.exe"),
+        ["#!/bin/sh", `printf 'invoked\\n' > "${helperMarker}"`, "exit 1", ""].join("\n"),
+        { mode: 0o700 },
+      );
+      fs.writeFileSync(
+        path.join(executableRoot, "docker"),
+        [
+          "#!/bin/sh",
+          "set -eu",
+          'if [ "$1" = "context" ] && [ "$2" = "show" ]; then',
+          "  printf 'default\\n'",
+          "  exit 0",
+          "fi",
+          'if [ "$1" = "build" ]; then',
+          '  [ -z "${DOCKER_HOST+x}" ]',
+          '  [ -z "${DOCKER_CONTEXT+x}" ]',
+          '  [ -n "${DOCKER_CONFIG:-}" ]',
+          `  [ "$DOCKER_CONFIG" != "${dockerConfig}" ]`,
+          '  grep -Fqx \'{"auths":{}}\' "$DOCKER_CONFIG/config.json"',
+          `  printf '%s\\n' "$DOCKER_CONFIG" > "${dockerMarker}"`,
+          "fi",
+          "",
+        ].join("\n"),
+        { mode: 0o700 },
+      );
+      vi.stubEnv("PATH", `${executableRoot}${path.delimiter}${String(process.env.PATH ?? "")}`);
+
+      try {
+        const result = successful(
+          await preflightRebuildImage(input(null), {
+            stageBuildContext: vi.fn(() => ({
+              buildCtx,
+              stagedDockerfile: dockerfile,
+              cleanupBuildCtx: () => true,
+              origin: "generated" as const,
+            })),
+            prepareDockerfilePatch: vi.fn(async () => ({
+              buildId: "wsl-process-boundary",
+              dashboardRemoteBindPrepared: false,
+              resolvedBaseImage: null,
+            })),
+            env: {
+              DOCKER_CONFIG: dockerConfig,
+              WSL_DISTRO_NAME: "Ubuntu",
+            },
+            isWslHost: true,
+          }),
+        );
+
+        expect(fs.readFileSync(helperMarker, "utf8")).toBe("invoked\n");
+        const isolatedConfig = fs.readFileSync(dockerMarker, "utf8").trim();
+        expect(isolatedConfig).toContain("nemoclaw-wsl-buildkit-docker-config-");
+        expect(fs.existsSync(isolatedConfig)).toBe(false);
+        expect(disposePreparedBuildContext(result.prepared)).toBe(true);
+      } finally {
+        vi.unstubAllEnvs();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("preserves Docker credentials while building the exact staged custom context", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-custom-preflight-"));
+    const dockerConfig = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-custom-docker-config-"));
+    const dockerfile = path.join(dir, "Dockerfile.custom");
+    const originalConfig = JSON.stringify({
+      auths: { "private.example.com": { auth: "required-by-custom-image" } },
+      credsStore: "desktop.exe",
+    });
+    fs.writeFileSync(dockerfile, "FROM scratch\n");
+    fs.writeFileSync(path.join(dockerConfig, "config.json"), originalConfig);
+    const buildImage = vi.fn((_dockerfile, _tag, _context, options) => {
+      expect(options.env?.DOCKER_CONFIG).toBe(dockerConfig);
+      return { status: 0 } as never;
+    });
     const removeImage = vi.fn(() => ({ status: 0 }) as never);
+    const credentialHelperResponds = vi.fn(() => false);
     try {
       const result = successful(
         await preflightRebuildImage(input(dockerfile), {
@@ -302,6 +421,9 @@ describe("preflightRebuildImage", () => {
           })),
           buildImage,
           removeImage,
+          env: { DOCKER_CONFIG: dockerConfig, WSL_DISTRO_NAME: "Ubuntu" },
+          credentialHelperResponds,
+          isWslHost: true,
         }),
       );
       expect(buildImage).toHaveBeenCalledWith(
@@ -311,10 +433,13 @@ describe("preflightRebuildImage", () => {
         expect.objectContaining({ ignoreError: true }),
       );
       expect(removeImage).toHaveBeenCalledOnce();
+      expect(credentialHelperResponds).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(dockerConfig, "config.json"), "utf8")).toBe(originalConfig);
       expect(fs.existsSync(result.prepared.buildCtx)).toBe(true);
       expect(disposePreparedBuildContext(result.prepared)).toBe(true);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dockerConfig, { recursive: true, force: true });
     }
   });
 
@@ -399,154 +524,6 @@ describe("preflightRebuildImage", () => {
     } finally {
       warn.mockRestore();
       fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("finalizePreparedRebuildImageMessagingPlan", () => {
-  it("rebuilds and re-fingerprints the retained context with backup-captured home channels (#7803)", () => {
-    const buildCtx = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-rebuild-finalize-"));
-    const stagedDockerfile = path.join(buildCtx, "Dockerfile");
-    fs.writeFileSync(stagedDockerfile, "FROM scratch\nARG NEMOCLAW_MESSAGING_PLAN_B64=old\n");
-    const cleanupBuildCtx = vi.fn(() => {
-      fs.rmSync(buildCtx, { recursive: true, force: true });
-      return true;
-    });
-    const originalFingerprint = fingerprintBuildContext(buildCtx);
-    const prepared: PreparedRebuildImage = {
-      buildCtx,
-      stagedDockerfile,
-      cleanupBuildCtx,
-      buildId: "finalize",
-      origin: "generated",
-      contextFingerprint: originalFingerprint,
-      verifyBuildCtx: createBuildContextVerifier(buildCtx, originalFingerprint),
-      rebuildTarget: { agentName: "hermes", fromDockerfile: null },
-    };
-    const builtDockerfiles: string[] = [];
-    const removeImage = vi.fn(() => ({ status: 0 }) as never);
-    try {
-      const result = successful(
-        finalizePreparedRebuildImageMessagingPlan(
-          prepared,
-          hermesMessagingPlan(),
-          [
-            {
-              path: ".env",
-              assignments: ["SLACK_HOME_CHANNEL=C0123", "SLACK_HOME_CHANNEL_THREAD_ID=123.456"],
-            },
-          ],
-          {
-            buildImage: vi.fn((dockerfile) => {
-              builtDockerfiles.push(fs.readFileSync(dockerfile, "utf8"));
-              return { status: 0 } as never;
-            }),
-            removeImage,
-          },
-        ),
-      );
-
-      const encodedPlan = builtDockerfiles[0]
-        ?.split("\n")
-        .find((line) => line.startsWith("ARG NEMOCLAW_MESSAGING_PLAN_B64="))
-        ?.split("=")[1];
-      const imagePlan = JSON.parse(Buffer.from(encodedPlan ?? "", "base64").toString("utf8")) as {
-        agentRender: Array<{ renderId?: string; lines?: string[] }>;
-      };
-      expect(imagePlan.agentRender[0]).toMatchObject({
-        renderId: "hermes-preserved-home-channels",
-        lines: ["SLACK_HOME_CHANNEL=C0123", "SLACK_HOME_CHANNEL_THREAD_ID=123.456"],
-      });
-      expect(result.prepared.contextFingerprint).not.toBe(originalFingerprint);
-      expect(verifyPreparedBuildContext(result.prepared)).toBe(true);
-      expect(removeImage).toHaveBeenCalledOnce();
-      expect(disposePreparedBuildContext(result.prepared)).toBe(true);
-    } finally {
-      fs.rmSync(buildCtx, { recursive: true, force: true });
-    }
-  });
-
-  it("refuses to bless a retained context that changed before backup finalization", () => {
-    const buildCtx = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-rebuild-finalize-drift-"));
-    const stagedDockerfile = path.join(buildCtx, "Dockerfile");
-    fs.writeFileSync(stagedDockerfile, "FROM scratch\nARG NEMOCLAW_MESSAGING_PLAN_B64=old\n");
-    const contextFingerprint = fingerprintBuildContext(buildCtx);
-    const prepared: PreparedRebuildImage = {
-      buildCtx,
-      stagedDockerfile,
-      cleanupBuildCtx: () => true,
-      buildId: "drift",
-      origin: "generated",
-      contextFingerprint,
-      verifyBuildCtx: createBuildContextVerifier(buildCtx, contextFingerprint),
-      rebuildTarget: { agentName: "hermes", fromDockerfile: null },
-    };
-    const buildImage = vi.fn();
-    try {
-      fs.writeFileSync(path.join(buildCtx, "changed"), "changed");
-
-      expect(
-        finalizePreparedRebuildImageMessagingPlan(
-          prepared,
-          hermesMessagingPlan(),
-          [{ path: ".env", assignments: ["SLACK_HOME_CHANNEL=C0123"] }],
-          { buildImage },
-        ),
-      ).toEqual({
-        ok: false,
-        detail: "replacement build context changed before backup finalization",
-      });
-      expect(buildImage).not.toHaveBeenCalled();
-    } finally {
-      fs.rmSync(buildCtx, { recursive: true, force: true });
-    }
-  });
-
-  it("retries finalization image cleanup at process exit", () => {
-    const buildCtx = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-finalize-cleanup-"));
-    const stagedDockerfile = path.join(buildCtx, "Dockerfile");
-    fs.writeFileSync(stagedDockerfile, "FROM scratch\nARG NEMOCLAW_MESSAGING_PLAN_B64=old\n");
-    const contextFingerprint = fingerprintBuildContext(buildCtx);
-    const prepared: PreparedRebuildImage = {
-      buildCtx,
-      stagedDockerfile,
-      cleanupBuildCtx: () => true,
-      buildId: "finalize-cleanup",
-      origin: "generated",
-      contextFingerprint,
-      verifyBuildCtx: createBuildContextVerifier(buildCtx, contextFingerprint),
-      rebuildTarget: { agentName: "hermes", fromDockerfile: null },
-    };
-    const removeImage = vi
-      .fn()
-      .mockReturnValueOnce({ status: 1 } as never)
-      .mockReturnValueOnce({ status: 0 } as never);
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const registerExitHandler = vi.fn((listener: () => void) => {
-      listener();
-    });
-    try {
-      expect(
-        finalizePreparedRebuildImageMessagingPlan(
-          prepared,
-          hermesMessagingPlan(),
-          [{ path: ".env", assignments: ["SLACK_HOME_CHANNEL=C0123"] }],
-          {
-            buildImage: vi.fn(() => ({ status: 0 }) as never),
-            removeImage,
-            registerExitHandler,
-          },
-        ).ok,
-      ).toBe(true);
-
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining("failed to remove temporary rebuild finalization image"),
-      );
-      expect(registerExitHandler).toHaveBeenCalledWith(expect.any(Function));
-      expect(removeImage).toHaveBeenCalledTimes(2);
-    } finally {
-      warn.mockRestore();
-      fs.rmSync(buildCtx, { recursive: true, force: true });
     }
   });
 });

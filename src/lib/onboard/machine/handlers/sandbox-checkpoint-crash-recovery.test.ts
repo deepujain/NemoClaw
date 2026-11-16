@@ -10,6 +10,7 @@ import {
   type OnboardCheckpoint,
 } from "../../../state/onboard-checkpoint-types";
 import { createSession, type Session, type SessionUpdates } from "../../../state/onboard-session";
+import * as registry from "../../../state/registry";
 import {
   type CredentialProviderRegistrationDeps,
   createCredentialProviderRegistration,
@@ -28,16 +29,15 @@ vi.mocked(detectMessagingChannelsFromEnv).mockReturnValue([]);
 
 function defaultCreateFingerprint(
   builtFingerprint = "my-assistant",
-  policyFingerprint = "default",
+  sandboxGpuSettings: object = { sandboxGpuEnabled: false, mode: "0" },
 ): string {
   return [
     builtFingerprint,
-    policyFingerprint,
     "provider",
     "model",
     "openai-completions",
     "",
-    JSON.stringify({ sandboxGpuEnabled: false, mode: "0" }),
+    JSON.stringify(sandboxGpuSettings),
     "",
   ].join("|");
 }
@@ -67,9 +67,68 @@ function crashedCheckpoint(overrides: Partial<OnboardCheckpoint> = {}): OnboardC
   };
 }
 
+function checkpointWithLegacyGpuProof(): OnboardCheckpoint {
+  return crashedCheckpoint({
+    effectGroups: {
+      sandbox_create: {
+        completedAt: "2026-01-01T00:00:00.000Z",
+        fingerprint: defaultCreateFingerprint("my-assistant", {
+          sandboxGpuEnabled: true,
+          mode: "auto",
+          sandboxGpuProof: {
+            status: "failed",
+            cudaVerified: false,
+            at: "2026-01-01T00:00:00.000Z",
+            detail: "probe output: {}|",
+          },
+        }),
+      },
+    },
+  });
+}
+
 type StubbedRunOpenshellResult = { status: number; stdout: string; stderr: string };
 
 const OK_RESULT: StubbedRunOpenshellResult = { status: 0, stdout: "", stderr: "" };
+const EXACT_MESSAGING_PROFILE: StubbedRunOpenshellResult = {
+  status: 0,
+  stdout: JSON.stringify({
+    id: "nemoclaw-mcp-v1",
+    credentials: [],
+    endpoints: [],
+    binaries: [],
+    inference_capable: false,
+  }),
+  stderr: "",
+};
+const EXACT_BRAVE_PROFILE: StubbedRunOpenshellResult = {
+  status: 0,
+  stdout: JSON.stringify({
+    id: "brave",
+    credentials: [
+      {
+        name: "api_key",
+        env_vars: ["BRAVE_API_KEY"],
+        required: true,
+        auth_style: "header",
+        header_name: "x-subscription-token",
+        query_param: "",
+      },
+    ],
+    endpoints: [
+      {
+        host: "api.search.brave.com",
+        port: 443,
+        protocol: "rest",
+        access: "read-write",
+        enforcement: "enforce",
+      },
+    ],
+    binaries: ["/usr/local/bin/node", "/usr/bin/node", "/usr/local/bin/curl", "/usr/bin/curl"],
+    inference_capable: false,
+  }),
+  stderr: "",
+};
 
 function fakeGatewayRunOpenshell() {
   const createdProviders = new Map<string, { type: string; credentialEnv: string }>();
@@ -88,7 +147,12 @@ function fakeGatewayRunOpenshell() {
           ].join("\n"),
           stderr: "",
         }
-      : { status: 1, stdout: "", stderr: "not found" };
+      : {
+          status: 1,
+          stdout: "",
+          stderr:
+            "Error: code: 'Some requested entity was not found', message: \"provider not found\"",
+        };
   };
 
   const handleCreate = (args: string[]): StubbedRunOpenshellResult => {
@@ -99,7 +163,17 @@ function fakeGatewayRunOpenshell() {
     return OK_RESULT;
   };
 
+  const exactProfileExports = new Map([
+    ["provider profile -g nemoclaw export brave --output json", EXACT_BRAVE_PROFILE],
+    ["provider profile -g nemoclaw export nemoclaw-mcp-v1 --output json", EXACT_MESSAGING_PROFILE],
+  ]);
+  const rejectUnexpectedProfileCommand = (args: string[]): never => {
+    throw new Error(`Unexpected provider profile command: ${args.join(" ")}`);
+  };
+
   const handlersByAction: Record<string, (args: string[]) => StubbedRunOpenshellResult> = {
+    profile: (args) =>
+      exactProfileExports.get(args.join(" ")) ?? rejectUnexpectedProfileCommand(args),
     get: handleGet,
     create: handleCreate,
     update: () => OK_RESULT,
@@ -119,16 +193,13 @@ function realStageSandboxCredentialProviders(
   const { runOpenshell } = fakeGatewayRunOpenshell();
   const registrationSession = { stagedCredentialProviders: [] as string[] } as Session;
   const registration = createCredentialProviderRegistration({
-    root: "/repo",
+    root: process.cwd(),
     runOpenshell: runOpenshell as unknown as CredentialProviderRegistrationDeps["runOpenshell"],
-    redact: (input) => input,
     getGatewayName: () => "nemoclaw",
     getCredential: () => null,
-    normalizeCredentialValue: (value) => (typeof value === "string" ? value.trim() : ""),
     updateSession: (mutator) => (mutator(registrationSession) ?? registrationSession) as Session,
     stagedLegacyValues: new Map(),
     migratedLegacyKeys: new Set(),
-    persistMigratedLegacyKeys: vi.fn(),
   });
   let crashPending = crashAfterFirstSuccess;
   const stageSandboxCredentialProviders = vi.fn(
@@ -223,9 +294,10 @@ describe("sandbox crash-recovery replay (#5961, #6228)", () => {
 
     expect(calls.createSandbox).not.toHaveBeenCalled();
     expect(calls.stopStale).not.toHaveBeenCalled();
-    expect(calls.updateSandbox).toHaveBeenCalledWith("my-assistant", {
-      pendingRouteReservation: undefined,
-    });
+    expect(calls.finalizeRouteReservation).toHaveBeenCalledExactlyOnceWith(
+      "my-assistant",
+      session.sessionId,
+    );
     expect(calls.recordSkip).toHaveBeenCalled();
   });
 
@@ -241,6 +313,38 @@ describe("sandbox crash-recovery replay (#5961, #6228)", () => {
 
     expect(calls.createSandbox).not.toHaveBeenCalled();
     expect(calls.recordSkip).toHaveBeenCalled();
+  });
+
+  it("reuses a surviving sandbox when the recorded create receipt contains a GPU proof with the field separator", async () => {
+    const { deps, calls } = createDeps({ getSandboxReuseState: () => "ready" });
+    const session = sessionWithCheckpoint(checkpointWithLegacyGpuProof());
+
+    await handleSandboxState({
+      ...baseOptions(deps, session),
+      resume: true,
+      sandboxName: "my-assistant",
+      sandboxGpuConfig: { sandboxGpuEnabled: true, mode: "auto" },
+    });
+
+    expect(calls.createSandbox).not.toHaveBeenCalled();
+    expect(calls.recordSkip).toHaveBeenCalled();
+  });
+
+  it("rejects reuse when the recorded create receipt contains the GPU proof and the sandbox GPU mode changed", async () => {
+    const { deps, calls } = createDeps({ getSandboxReuseState: () => "ready" });
+    const session = sessionWithCheckpoint(checkpointWithLegacyGpuProof());
+
+    await expect(
+      handleSandboxState({
+        ...baseOptions(deps, session),
+        resume: true,
+        sandboxName: "my-assistant",
+        sandboxGpuConfig: { sandboxGpuEnabled: true, mode: "1" },
+      }),
+    ).rejects.toThrow("exit 1");
+
+    expect(calls.createSandbox).not.toHaveBeenCalled();
+    expect(calls.error.mock.calls.flat().join("\n")).toContain("--recreate-sandbox");
   });
 
   it("recreates only under the recorded durable identity when the sandbox is gone", async () => {
@@ -278,14 +382,35 @@ describe("sandbox crash-recovery replay (#5961, #6228)", () => {
     expect(calls.error.mock.calls.flat().join("\n")).toContain("OPENAI_API_KEY");
   });
 
-  it("does not engage the crash-recovery path for a normal fresh create (no checkpoint receipt)", async () => {
-    const { deps, calls } = createDeps({ getSandboxReuseState: () => "missing" });
-    const session = createSession({ sessionId: "sess-1", agent: "openclaw" });
+  it.each([
+    { state: "missing", fresh: false, provider: "provider", model: "model" },
+    { state: "ready", fresh: true, provider: "provider", model: "changed-model" },
+    { state: "ready", fresh: false, provider: "provider", model: "changed-model" },
+    { state: "ready", fresh: true, provider: "changed-provider", model: "model" },
+    { state: "ready", fresh: false, provider: "provider", model: "model" },
+  ])(
+    "checks selection through create for $state sandbox with fresh=$fresh and $provider/$model (#12667)",
+    async ({ state, fresh, provider, model }) => {
+      vi.spyOn(registry, "getSandbox").mockReturnValue(null);
+      const session =
+        state === "missing"
+          ? createSession({ sessionId: "sess-1", agent: "openclaw" })
+          : sessionWithCheckpoint(crashedCheckpoint({ effectGroups: {} }));
+      const { deps, calls } = createDeps({ getSandboxReuseState: () => state }, session);
 
-    await handleSandboxState({ ...baseOptions(deps, session), resume: false });
+      await handleSandboxState({
+        ...baseOptions(deps, session),
+        resume: false,
+        fresh,
+        sandboxName: "my-assistant",
+        provider,
+        model,
+      });
 
-    expect(calls.createSandbox).toHaveBeenCalled();
-  });
+      expect(calls.createSandbox.mock.calls[0]?.slice(1, 3)).toEqual([model, provider]);
+      expect(calls.recordSkip).not.toHaveBeenCalled();
+    },
+  );
 
   it("reuses a live sandbox even when the create receipt was lost in the crash window (#7022)", async () => {
     const { deps, calls } = createDeps({ getSandboxReuseState: () => "ready" });
@@ -374,54 +499,57 @@ describe("sandbox crash-recovery replay (#5961, #6228)", () => {
       ["my-assistant-brave-search"],
       ["my-assistant-brave-search", "my-assistant-brave-search"],
     ],
-  ] as const)("does not grant provider replay authority to %s", async (_case, fingerprints, registeredProviderNames) => {
-    const [webFingerprint, messagingFingerprint] = fingerprints;
-    const { deps, calls } = createDeps({
-      getSandboxReuseState: () => "missing",
-      providerMatchesGatewayCredential: () => false,
-    });
-    const session = sessionWithCheckpoint(
-      crashedCheckpoint({
-        effectGroups: {
-          sandbox_create: {
-            completedAt: "2026-01-01T00:00:00.000Z",
-            fingerprint: defaultCreateFingerprint(),
+  ] as const)(
+    "does not grant provider replay authority to %s",
+    async (_case, fingerprints, registeredProviderNames) => {
+      const [webFingerprint, messagingFingerprint] = fingerprints;
+      const { deps, calls } = createDeps({
+        getSandboxReuseState: () => "missing",
+        providerMatchesGatewayCredential: () => false,
+      });
+      const session = sessionWithCheckpoint(
+        crashedCheckpoint({
+          effectGroups: {
+            sandbox_create: {
+              completedAt: "2026-01-01T00:00:00.000Z",
+              fingerprint: defaultCreateFingerprint(),
+            },
+            web_search_provider: {
+              completedAt: "2026-01-01T00:00:00.000Z",
+              fingerprint: webFingerprint,
+            },
+            ...(messagingFingerprint
+              ? {
+                  messaging_providers: {
+                    completedAt: "2026-01-01T00:00:00.000Z",
+                    fingerprint: messagingFingerprint,
+                  },
+                }
+              : {}),
           },
-          web_search_provider: {
-            completedAt: "2026-01-01T00:00:00.000Z",
-            fingerprint: webFingerprint,
+          bindings: {
+            credentialEnvs: ["BRAVE_API_KEY"],
+            registeredProviders: registeredProviderNames.map((name) => ({
+              name,
+              type: "brave",
+              credentialEnv: "BRAVE_API_KEY",
+            })),
           },
-          ...(messagingFingerprint
-            ? {
-                messaging_providers: {
-                  completedAt: "2026-01-01T00:00:00.000Z",
-                  fingerprint: messagingFingerprint,
-                },
-              }
-            : {}),
-        },
-        bindings: {
-          credentialEnvs: ["BRAVE_API_KEY"],
-          registeredProviders: registeredProviderNames.map((name) => ({
-            name,
-            type: "brave",
-            credentialEnv: "BRAVE_API_KEY",
-          })),
-        },
-      }),
-    );
+        }),
+      );
 
-    await expect(
-      handleSandboxState({
-        ...baseOptions(deps, session),
-        resume: true,
-        sandboxName: "my-assistant",
-        env: {},
-      }),
-    ).rejects.toThrow("exit 1");
+      await expect(
+        handleSandboxState({
+          ...baseOptions(deps, session),
+          resume: true,
+          sandboxName: "my-assistant",
+          env: {},
+        }),
+      ).rejects.toThrow("exit 1");
 
-    expect(calls.createSandbox).not.toHaveBeenCalled();
-  });
+      expect(calls.createSandbox).not.toHaveBeenCalled();
+    },
+  );
 
   it("rejects a malformed provider receipt before registering a changed selection (#7702)", async () => {
     const oldBinding = {
@@ -760,110 +888,115 @@ describe("sandbox crash-recovery replay (#5961, #6228)", () => {
     );
   });
 
-  it.each([
-    "interactive",
-    "non-interactive",
-  ] as const)("replays %s web-search provider registration without duplicating the external effect after receipt loss (#7022)", async (mode) => {
-    const { stageSandboxCredentialProviders, providerMatchesGatewayCredential, runOpenshell } =
-      realStageSandboxCredentialProviders(
-        [
-          {
-            name: "my-assistant-brave-search",
-            envKey: "BRAVE_API_KEY",
-            token: "brave-secret",
-            providerType: "brave",
-          },
-        ],
-        true,
+  it.each(["interactive", "non-interactive"] as const)(
+    "replays %s web-search provider registration without duplicating the external effect after receipt loss (#7022)",
+    async (mode) => {
+      const { stageSandboxCredentialProviders, providerMatchesGatewayCredential, runOpenshell } =
+        realStageSandboxCredentialProviders(
+          [
+            {
+              name: "my-assistant-brave-search",
+              envKey: "BRAVE_API_KEY",
+              token: "brave-secret",
+              providerType: "brave",
+            },
+          ],
+          true,
+        );
+      const session = createSession({ sessionId: "sess-1", agent: "openclaw", mode });
+      const { deps, getSession } = createDeps(
+        {
+          getSandboxReuseState: () => "missing",
+          configureWebSearch: vi.fn(async () => ({ fetchEnabled: true as const })),
+          stageSandboxCredentialProviders,
+          providerMatchesGatewayCredential,
+        },
+        session,
       );
-    const session = createSession({ sessionId: "sess-1", agent: "openclaw", mode });
-    const { deps, getSession } = createDeps(
-      {
-        getSandboxReuseState: () => "missing",
-        configureWebSearch: vi.fn(async () => ({ fetchEnabled: true as const })),
-        stageSandboxCredentialProviders,
-        providerMatchesGatewayCredential,
-      },
-      session,
-    );
 
-    await expect(
-      handleSandboxState({ ...baseOptions(deps, session), resume: false }),
-    ).rejects.toThrow("gateway connection dropped mid-registration");
+      await expect(
+        handleSandboxState({ ...baseOptions(deps, session), resume: false }),
+      ).rejects.toThrow("gateway connection dropped mid-registration");
 
-    const crashedSession = getSession();
-    expect(crashedSession.checkpoint?.effectGroups.web_search_provider).toBeUndefined();
-    expect(crashedSession.checkpoint?.bindings.registeredProviders).toEqual([]);
+      const crashedSession = getSession();
+      expect(crashedSession.checkpoint?.effectGroups.web_search_provider).toBeUndefined();
+      expect(crashedSession.checkpoint?.bindings.registeredProviders).toEqual([]);
 
-    await handleSandboxState({
-      ...baseOptions(deps, crashedSession),
-      resume: true,
-      sandboxName: "my-assistant",
-      webSearchConfig: { fetchEnabled: true },
-    });
+      await handleSandboxState({
+        ...baseOptions(deps, crashedSession),
+        resume: true,
+        sandboxName: "my-assistant",
+        webSearchConfig: { fetchEnabled: true },
+      });
 
-    expect(stageSandboxCredentialProviders).toHaveBeenCalledTimes(2);
-    expect(
-      runOpenshell.mock.calls.filter(([args]) => args[0] === "provider" && args[1] === "create"),
-    ).toHaveLength(1);
-    const resumedSession = getSession();
-    expect(resumedSession.checkpoint?.effectGroups.web_search_provider).toBeDefined();
-    expect(resumedSession.checkpoint?.bindings.registeredProviders).toEqual([
-      { name: "my-assistant-brave-search", type: "brave", credentialEnv: "BRAVE_API_KEY" },
-    ]);
-  });
+      expect(stageSandboxCredentialProviders).toHaveBeenCalledTimes(2);
+      expect(
+        runOpenshell.mock.calls.filter(([args]) => args[0] === "provider" && args[1] === "create"),
+      ).toHaveLength(1);
+      const resumedSession = getSession();
+      expect(resumedSession.checkpoint?.effectGroups.web_search_provider).toBeDefined();
+      expect(resumedSession.checkpoint?.bindings.registeredProviders).toEqual([
+        { name: "my-assistant-brave-search", type: "brave", credentialEnv: "BRAVE_API_KEY" },
+      ]);
+    },
+  );
 
-  it.each([
-    "interactive",
-    "non-interactive",
-  ] as const)("recovers the %s messaging provider receipt without duplicating the external effect after receipt loss (#7022)", async (mode) => {
-    const { stageSandboxCredentialProviders, providerMatchesGatewayCredential, runOpenshell } =
-      realStageSandboxCredentialProviders(
-        [
-          {
-            name: "my-assistant-discord-bridge",
-            envKey: "DISCORD_BOT_TOKEN",
-            token: "discord-secret",
-          },
-        ],
-        true,
+  it.each(["interactive", "non-interactive"] as const)(
+    "recovers the %s messaging provider receipt without duplicating the external effect after receipt loss (#7022)",
+    async (mode) => {
+      const { stageSandboxCredentialProviders, providerMatchesGatewayCredential, runOpenshell } =
+        realStageSandboxCredentialProviders(
+          [
+            {
+              name: "my-assistant-discord-bridge",
+              envKey: "DISCORD_BOT_TOKEN",
+              token: "discord-secret",
+              providerType: "nemoclaw-mcp-v1",
+            },
+          ],
+          true,
+        );
+      const session = createSession({ sessionId: "sess-1", agent: "openclaw", mode });
+      const messagingPlan = discordMessagingPlan();
+      const { deps, getSession } = createDeps(
+        {
+          getSandboxReuseState: () => "missing",
+          readMessagingPlanFromEnv: () => messagingPlan,
+          stageSandboxCredentialProviders,
+          providerMatchesGatewayCredential,
+        },
+        session,
       );
-    const session = createSession({ sessionId: "sess-1", agent: "openclaw", mode });
-    const messagingPlan = discordMessagingPlan();
-    const { deps, getSession } = createDeps(
-      {
-        getSandboxReuseState: () => "missing",
-        readMessagingPlanFromEnv: () => messagingPlan,
-        stageSandboxCredentialProviders,
-        providerMatchesGatewayCredential,
-      },
-      session,
-    );
 
-    await expect(
-      handleSandboxState({ ...baseOptions(deps, session), resume: false }),
-    ).rejects.toThrow("gateway connection dropped mid-registration");
+      await expect(
+        handleSandboxState({ ...baseOptions(deps, session), resume: false }),
+      ).rejects.toThrow("gateway connection dropped mid-registration");
 
-    const crashedSession = getSession();
-    expect(crashedSession.checkpoint?.effectGroups.messaging_providers).toBeUndefined();
-    expect(crashedSession.checkpoint?.bindings.registeredProviders).toEqual([]);
+      const crashedSession = getSession();
+      expect(crashedSession.checkpoint?.effectGroups.messaging_providers).toBeUndefined();
+      expect(crashedSession.checkpoint?.bindings.registeredProviders).toEqual([]);
 
-    await handleSandboxState({
-      ...baseOptions(deps, crashedSession),
-      resume: true,
-      sandboxName: "my-assistant",
-    });
+      await handleSandboxState({
+        ...baseOptions(deps, crashedSession),
+        resume: true,
+        sandboxName: "my-assistant",
+      });
 
-    expect(stageSandboxCredentialProviders).toHaveBeenCalledTimes(2);
-    expect(
-      runOpenshell.mock.calls.filter(([args]) => args[0] === "provider" && args[1] === "create"),
-    ).toHaveLength(1);
-    const resumedSession = getSession();
-    expect(resumedSession.checkpoint?.effectGroups.messaging_providers).toBeDefined();
-    expect(resumedSession.checkpoint?.bindings.registeredProviders).toEqual([
-      { name: "my-assistant-discord-bridge", type: "generic", credentialEnv: "DISCORD_BOT_TOKEN" },
-    ]);
-  });
+      expect(stageSandboxCredentialProviders).toHaveBeenCalledTimes(2);
+      expect(
+        runOpenshell.mock.calls.filter(([args]) => args[0] === "provider" && args[1] === "create"),
+      ).toHaveLength(1);
+      const resumedSession = getSession();
+      expect(resumedSession.checkpoint?.effectGroups.messaging_providers).toBeDefined();
+      expect(resumedSession.checkpoint?.bindings.registeredProviders).toEqual([
+        {
+          name: "my-assistant-discord-bridge",
+          type: "nemoclaw-mcp-v1",
+          credentialEnv: "DISCORD_BOT_TOKEN",
+        },
+      ]);
+    },
+  );
 
   it("rejects receipt recovery when a required messaging provider did not survive", async () => {
     const messagingPlan = discordMessagingPlan();
@@ -899,7 +1032,7 @@ describe("sandbox crash-recovery replay (#5961, #6228)", () => {
     expect(stageSandboxCredentialProviders).toHaveBeenCalledTimes(2);
     expect(providerMatchesGatewayCredential).toHaveBeenCalledWith(
       "my-assistant-discord-bridge",
-      "generic",
+      "nemoclaw-mcp-v1",
       "DISCORD_BOT_TOKEN",
     );
     expect(getSession().checkpoint?.effectGroups.messaging_providers).toBeUndefined();
@@ -928,33 +1061,49 @@ describe("sandbox crash-recovery replay (#5961, #6228)", () => {
     expect(calls.error.mock.calls.flat().join("\n")).toContain("--recreate-sandbox");
   });
 
-  it.each([
-    ["build", defaultCreateFingerprint("v0.0.108")],
-    ["policy", defaultCreateFingerprint("my-assistant", "previous-policy")],
-  ] as const)("recreates after %s drift when explicitly requested (#9297)", async (_drift, fingerprint) => {
-    const session = sessionWithCheckpoint(
-      crashedCheckpoint({
-        effectGroups: {
-          sandbox_create: { completedAt: "2026-01-01T00:00:00.000Z", fingerprint },
-        },
-      }),
-    );
-    session.machine.state = "openclaw";
-    const { deps, calls } = createDeps({ getSandboxReuseState: () => "ready" }, session);
+  it("does not let checkpoint replay override an explicit fresh recreation (#8847)", async () => {
+    const session = sessionWithCheckpoint(crashedCheckpoint());
+    const { deps, calls } = createDeps({ getSandboxReuseState: () => "ready" });
 
     await handleSandboxState({
       ...baseOptions(deps, session),
-      resume: true,
-      sandboxName: "my-assistant",
+      fresh: true,
       recreateSandbox: () => true,
+      sandboxName: "my-assistant",
     });
 
-    expect(calls.createSandbox).toHaveBeenCalledOnce();
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toEqual(
-      expect.objectContaining({ recreate: true }),
-    );
-    expect(calls.error).not.toHaveBeenCalled();
+    expect(calls.skipped).not.toHaveBeenCalledWith("sandbox", "my-assistant");
+    expect(calls.createSandbox).toHaveBeenCalledTimes(1);
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({ recreate: true });
   });
+
+  it.each([["build", defaultCreateFingerprint("v0.0.108")]] as const)(
+    "recreates after %s drift when explicitly requested (#9297)",
+    async (_drift, fingerprint) => {
+      const session = sessionWithCheckpoint(
+        crashedCheckpoint({
+          effectGroups: {
+            sandbox_create: { completedAt: "2026-01-01T00:00:00.000Z", fingerprint },
+          },
+        }),
+      );
+      session.machine.state = "openclaw";
+      const { deps, calls } = createDeps({ getSandboxReuseState: () => "ready" }, session);
+
+      await handleSandboxState({
+        ...baseOptions(deps, session),
+        resume: true,
+        sandboxName: "my-assistant",
+        recreateSandbox: () => true,
+      });
+
+      expect(calls.createSandbox).toHaveBeenCalledOnce();
+      expect(calls.createSandbox.mock.calls[0]?.at(-2)).toEqual(
+        expect.objectContaining({ recreate: true }),
+      );
+      expect(calls.error).not.toHaveBeenCalled();
+    },
+  );
 
   it("rejects reuse when a resolved policy or package input drifted despite an unchanged build version and policy tier (#7022)", async () => {
     const { deps, calls } = createDeps({ getSandboxReuseState: () => "ready" });
@@ -1013,82 +1162,6 @@ describe("sandbox crash-recovery replay (#5961, #6228)", () => {
 
     expect(calls.createSandbox).toHaveBeenCalledTimes(1);
     expect(calls.error).not.toHaveBeenCalled();
-  });
-
-  it("rejects stable resolved create-intent drift despite an unchanged light fingerprint (#7022)", async () => {
-    const session = createSession({ sessionId: "sess-1", agent: "openclaw" });
-    const updateSession = vi.fn((mutator: (value: typeof session) => void) => {
-      mutator(session);
-      return session;
-    });
-    const firstRun = createDeps({ getSandboxReuseState: () => "missing", updateSession });
-
-    await handleSandboxState({
-      ...baseOptions(firstRun.deps, session),
-      resume: false,
-      sandboxName: "my-assistant",
-    });
-
-    const resumedRun = createDeps({ getSandboxReuseState: () => "missing", updateSession });
-    const defaultResolve = resumedRun.calls.resolveCreateIntent.getMockImplementation();
-    expect(defaultResolve).toBeDefined();
-    resumedRun.calls.resolveCreateIntent.mockImplementation(async (input) => {
-      const resolved = await defaultResolve!(input);
-      return {
-        ...resolved,
-        policy: { ...resolved.policy, basePolicyPath: "/repo/changed-policy.yaml" },
-      };
-    });
-
-    await expect(
-      handleSandboxState({
-        ...baseOptions(resumedRun.deps, session),
-        resume: true,
-        sandboxName: "my-assistant",
-      }),
-    ).rejects.toThrow("exit 1");
-
-    expect(resumedRun.calls.createSandbox).not.toHaveBeenCalled();
-    expect(resumedRun.calls.error.mock.calls.flat().join("\n")).toContain("--recreate-sandbox");
-  });
-
-  it("recreates after stable resolved create-intent drift when explicitly requested (#9297)", async () => {
-    const session = createSession({ sessionId: "sess-1", agent: "openclaw" });
-    const updateSession = vi.fn((mutator: (value: typeof session) => void) => {
-      mutator(session);
-      return session;
-    });
-    const firstRun = createDeps({ getSandboxReuseState: () => "missing", updateSession });
-
-    await handleSandboxState({
-      ...baseOptions(firstRun.deps, session),
-      resume: false,
-      sandboxName: "my-assistant",
-    });
-
-    const resumedRun = createDeps({ getSandboxReuseState: () => "missing", updateSession });
-    const defaultResolve = resumedRun.calls.resolveCreateIntent.getMockImplementation();
-    expect(defaultResolve).toBeDefined();
-    resumedRun.calls.resolveCreateIntent.mockImplementation(async (input) => {
-      const resolved = await defaultResolve!(input);
-      return {
-        ...resolved,
-        policy: { ...resolved.policy, basePolicyPath: "/repo/changed-policy.yaml" },
-      };
-    });
-
-    await handleSandboxState({
-      ...baseOptions(resumedRun.deps, session),
-      resume: true,
-      recreateSandbox: () => true,
-      sandboxName: "my-assistant",
-    });
-
-    expect(resumedRun.calls.createSandbox).toHaveBeenCalledOnce();
-    expect(resumedRun.calls.createSandbox.mock.calls[0]?.at(-1)).toEqual(
-      expect.objectContaining({ recreate: true }),
-    );
-    expect(resumedRun.calls.error).not.toHaveBeenCalled();
   });
 
   it("rejects reasoning capability drift before replaying a recorded sandbox create (#7570)", async () => {
@@ -1203,122 +1276,135 @@ describe("sandbox crash-recovery replay (#5961, #6228)", () => {
     expect(calls.createSandbox).toHaveBeenCalledTimes(1);
   });
 
-  it.each([
-    "interactive",
-    "non-interactive",
-  ] as const)("resumes a %s onboarding attempt that crashed after create succeeded but before its completion receipt (#7022)", async (mode) => {
-    const recordStepComplete = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("process crashed after create"));
-    const { deps, calls, getSession } = createDeps({
-      getSandboxReuseState: () => "missing",
-      recordStepComplete,
-    });
-    const session = createSession({ sessionId: "sess-1", agent: "openclaw", mode });
-
-    await expect(
-      handleSandboxState({
-        ...baseOptions(deps, session),
-        resume: false,
-        sandboxName: "my-assistant",
-        authoritativeResumeConfig: true,
-      }),
-    ).rejects.toThrow("process crashed after create");
-
-    expect(calls.createSandbox).toHaveBeenCalledTimes(1);
-    expect(calls.promptName).not.toHaveBeenCalled();
-    expect(calls.configureWebSearch).not.toHaveBeenCalled();
-    const crashedSession = getSession();
-    expect(crashedSession.checkpoint?.effectGroups.sandbox_create).toBeUndefined();
-    expect(crashedSession.checkpoint?.sandboxIdentity).toEqual(
-      decisionSelected({ name: "my-assistant", agent: "openclaw" }),
-    );
-
-    const { deps: resumeDeps, calls: resumeCalls } = createDeps({
-      getSandboxReuseState: () => "ready",
-    });
-
-    await handleSandboxState({
-      ...baseOptions(resumeDeps, crashedSession),
-      resume: true,
-      sandboxName: "my-assistant",
-      authoritativeResumeConfig: true,
-    });
-
-    expect(resumeCalls.createSandbox).not.toHaveBeenCalled();
-    expect(resumeCalls.recordSkip).toHaveBeenCalled();
-  });
-
-  it.each([
-    "interactive",
-    "non-interactive",
-  ] as const)("backfills effect receipts after a %s crash following sandbox registration (#7022)", async (mode) => {
-    let persistedSession = createSession({ sessionId: "sess-1", agent: "openclaw", mode });
-    const updateSession = vi.fn((mutator: (value: Session) => Session | void) => {
-      persistedSession = mutator(persistedSession) ?? persistedSession;
-      return persistedSession;
-    });
-    const recordStepComplete = vi.fn(async (_stepName: string, updates: SessionUpdates) => {
-      Object.assign(persistedSession, updates);
-      updateSession.mockImplementationOnce(() => {
-        throw new Error("process crashed after sandbox registration");
+  it.each(["interactive", "non-interactive"] as const)(
+    "resumes a %s onboarding attempt that crashed after create succeeded but before its completion receipt (#7022)",
+    async (mode) => {
+      const recordStepComplete = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("process crashed after create"));
+      const { deps, calls, getSession } = createDeps({
+        getSandboxReuseState: () => "missing",
+        recordStepComplete,
       });
-      return persistedSession;
-    });
-    const firstRun = createDeps({
-      getSandboxReuseState: () => "missing",
-      recordStepComplete,
-      updateSession,
-    });
+      const session = createSession({ sessionId: "sess-1", agent: "openclaw", mode });
 
-    await expect(
-      handleSandboxState({
-        ...baseOptions(firstRun.deps, persistedSession),
-        resume: false,
+      await expect(
+        handleSandboxState({
+          ...baseOptions(deps, session),
+          resume: false,
+          sandboxName: "my-assistant",
+          authoritativeResumeConfig: true,
+        }),
+      ).rejects.toThrow("process crashed after create");
+
+      expect(calls.createSandbox).toHaveBeenCalledTimes(1);
+      expect(calls.promptName).not.toHaveBeenCalled();
+      expect(calls.configureWebSearch).not.toHaveBeenCalled();
+      const crashedSession = getSession();
+      expect(crashedSession.checkpoint?.effectGroups.sandbox_create).toBeUndefined();
+      expect(crashedSession.checkpoint?.sandboxIdentity).toEqual(
+        decisionSelected({ name: "my-assistant", agent: "openclaw" }),
+      );
+
+      const { deps: resumeDeps, calls: resumeCalls } = createDeps({
+        getSandboxReuseState: () => "ready",
+      });
+
+      await handleSandboxState({
+        ...baseOptions(resumeDeps, crashedSession),
+        resume: true,
         sandboxName: "my-assistant",
         authoritativeResumeConfig: true,
-      }),
-    ).rejects.toThrow("process crashed after sandbox registration");
+      });
 
-    expect(firstRun.calls.createSandbox).toHaveBeenCalledTimes(1);
-    expect(firstRun.calls.updateSandbox).toHaveBeenCalledTimes(1);
-    expect(recordStepComplete).toHaveBeenCalledTimes(1);
-    expect(persistedSession.checkpoint?.effectGroups.sandbox_create).toBeUndefined();
-    expect(persistedSession.checkpoint?.effectGroups.sandbox_register).toBeUndefined();
+      expect(resumeCalls.createSandbox).not.toHaveBeenCalled();
+      expect(resumeCalls.recordSkip).toHaveBeenCalled();
+    },
+  );
 
-    const resumeUpdateSession = vi.fn((mutator: (value: Session) => Session | void) => {
-      persistedSession = mutator(persistedSession) ?? persistedSession;
-      return persistedSession;
-    });
-    const recordStateSkipped = vi.fn(async () => persistedSession);
-    const resumedRun = createDeps({
-      getSandboxReuseState: () => "ready",
-      recordStateSkipped,
-      updateSession: resumeUpdateSession,
-    });
+  it.each(["interactive", "non-interactive"] as const)(
+    "backfills effect receipts after a %s crash following sandbox registration (#7022)",
+    async (mode) => {
+      let persistedSession = createSession({ sessionId: "sess-1", agent: "openclaw", mode });
+      const updateSession = vi.fn((mutator: (value: Session) => Session | void) => {
+        persistedSession = mutator(persistedSession) ?? persistedSession;
+        return persistedSession;
+      });
+      const recordStepComplete = vi.fn(async (_stepName: string, updates: SessionUpdates) => {
+        Object.assign(persistedSession, updates);
+        updateSession.mockImplementationOnce(() => {
+          throw new Error("process crashed after sandbox registration");
+        });
+        return persistedSession;
+      });
+      const firstRun = createDeps({
+        getSandboxReuseState: () => "missing",
+        recordStepComplete,
+        updateSession,
+      });
 
-    await handleSandboxState({
-      ...baseOptions(resumedRun.deps, persistedSession),
-      resume: true,
-      sandboxName: "my-assistant",
-      authoritativeResumeConfig: true,
-    });
+      await expect(
+        handleSandboxState({
+          ...baseOptions(firstRun.deps, persistedSession),
+          resume: false,
+          sandboxName: "my-assistant",
+          authoritativeResumeConfig: true,
+        }),
+      ).rejects.toThrow("process crashed after sandbox registration");
 
-    expect(resumedRun.calls.createSandbox).not.toHaveBeenCalled();
-    expect(recordStateSkipped).toHaveBeenCalledTimes(1);
-    expect(resumedRun.calls.updateSandbox).toHaveBeenCalledWith("my-assistant", {
-      pendingRouteReservation: undefined,
-    });
-    expect(
-      resumedRun.calls.updateSandbox.mock.calls.some(([, updates]) =>
-        Object.prototype.hasOwnProperty.call(updates, "provider"),
-      ),
-    ).toBe(false);
-    expect(persistedSession.checkpoint?.effectGroups.sandbox_create?.fingerprint).toBe(
-      defaultCreateFingerprint(),
-    );
-    expect(persistedSession.checkpoint?.effectGroups.sandbox_register?.fingerprint).toBe(
-      "my-assistant",
-    );
-  });
+      expect(firstRun.calls.createSandbox).toHaveBeenCalledTimes(1);
+      expect(firstRun.calls.updateSandbox).toHaveBeenCalledTimes(1);
+      expect(recordStepComplete).toHaveBeenCalledTimes(1);
+      expect(persistedSession.checkpoint?.effectGroups.sandbox_create).toBeUndefined();
+      expect(persistedSession.checkpoint?.effectGroups.sandbox_register).toBeUndefined();
+
+      const resumeUpdateSession = vi.fn((mutator: (value: Session) => Session | void) => {
+        persistedSession = mutator(persistedSession) ?? persistedSession;
+        return persistedSession;
+      });
+      const recordStateSkipped = vi.fn(async () => persistedSession);
+      const resumedRun = createDeps({
+        getSandboxReuseState: () => "ready",
+        recordStateSkipped,
+        updateSession: resumeUpdateSession,
+        getSandboxRegistryEntry: () => ({
+          name: "my-assistant",
+          agent: null,
+          provider: "provider",
+          model: "model",
+          endpointUrl: null,
+          preferredInferenceApi: "openai-completions",
+          gatewayName: "nemoclaw",
+          gatewayPort: 8080,
+          pendingRouteReservation: true,
+          reservationSessionId: persistedSession.sessionId,
+        }),
+      });
+
+      await handleSandboxState({
+        ...baseOptions(resumedRun.deps, persistedSession),
+        resume: true,
+        sandboxName: "my-assistant",
+        authoritativeResumeConfig: true,
+      });
+
+      expect(resumedRun.calls.createSandbox).not.toHaveBeenCalled();
+      expect(recordStateSkipped).toHaveBeenCalledTimes(1);
+      expect(resumedRun.calls.finalizeRouteReservation).toHaveBeenCalledExactlyOnceWith(
+        "my-assistant",
+        persistedSession.sessionId,
+      );
+      expect(
+        resumedRun.calls.updateSandbox.mock.calls.some(([, updates]) =>
+          Object.prototype.hasOwnProperty.call(updates, "provider"),
+        ),
+      ).toBe(false);
+      expect(persistedSession.checkpoint?.effectGroups.sandbox_create?.fingerprint).toBe(
+        defaultCreateFingerprint(),
+      );
+      expect(persistedSession.checkpoint?.effectGroups.sandbox_register?.fingerprint).toBe(
+        "my-assistant",
+      );
+    },
+  );
 });

@@ -10,7 +10,10 @@ import {
   type DcodeBaseImageContract,
   parseDcodeBaseImageContract,
 } from "../../../tools/e2e/dcode-base-image-contract.mts";
-import { requireDcodeBaseImageReference } from "../fixtures/dcode-base-image.ts";
+import {
+  DCODE_BASE_IMAGE_ENV,
+  requireDcodeBaseImageReference,
+} from "../fixtures/dcode-base-image.ts";
 import { readRegistrySandboxEntry } from "../fixtures/phases/index.ts";
 
 export const DCODE_BASE_IMAGE_TARGET_ID = "ubuntu-repo-cloud-langchain-deepagents-code";
@@ -91,12 +94,36 @@ export function dcodeBaseImageReferenceForContract(contract: DcodeBaseImageContr
   return contract.platformReferences[DCODE_BASE_IMAGE_TARGET_PLATFORM];
 }
 
+function requireDcodeSourceRevision(metadata: SandboxBaseImageResolutionMetadata): string {
+  if (!metadata.sourceRevision || !REVISION_PATTERN.test(metadata.sourceRevision)) {
+    throw new Error(
+      `Deep Agents Code sandbox image does not match the published ${DCODE_BASE_IMAGE_TARGET_PLATFORM} base-image contract (mismatched fields: source revision)`,
+    );
+  }
+  return metadata.sourceRevision;
+}
+
 export function loadDcodeBaseImagePublicationEvidence(
   targetId: string,
   evidencePath: string,
   environment: NodeJS.ProcessEnv = process.env,
 ): DcodeBaseImageContract | undefined {
   if (targetId !== DCODE_BASE_IMAGE_TARGET_ID) return undefined;
+  const workloadSource = environment.E2E_WORKLOAD_SOURCE?.trim() ?? "";
+  if (workloadSource === "local-dockerfile") {
+    if ((environment[DCODE_BASE_IMAGE_ENV]?.trim() ?? "") || fs.existsSync(evidencePath)) {
+      throw new Error(
+        "Deep Agents Code local-Dockerfile E2E cannot consume published base-image authority",
+      );
+    }
+    return undefined;
+  }
+  if (workloadSource !== "" && workloadSource !== "managed-image") {
+    throw new Error("Deep Agents Code E2E workload source is invalid");
+  }
+  // HostCliClient verifies managed-image digests against the selected cohort or candidate catalog.
+  // Base override metadata belongs to Dockerfile builds.
+  if (workloadSource === "managed-image") return undefined;
   if (!fs.existsSync(evidencePath)) {
     requireDcodeBaseImageReference(environment);
     if (environment.GITHUB_ACTIONS === "true") {
@@ -128,29 +155,32 @@ export function verifyDcodeBaseImageRuntimeEvidence(
   }
   const expectedDigest = contract.platformDigests[DCODE_BASE_IMAGE_TARGET_PLATFORM];
   const expectedReference = dcodeBaseImageReferenceForContract(contract);
-  if (
-    metadata.schema !== 1 ||
-    metadata.imageName !== contract.image ||
-    metadata.source !== "override" ||
-    metadata.pinnedRemoteRef !== undefined ||
-    metadata.digest !== expectedDigest ||
-    metadata.ref !== expectedReference ||
-    metadata.ref !== `${metadata.imageName}@${metadata.digest}`
-  ) {
+  const sourceRevision = requireDcodeSourceRevision(metadata);
+  const mismatchedFields = [
+    metadata.schema !== 1 ? "schema" : null,
+    metadata.imageName !== contract.image ? "image" : null,
+    metadata.source !== "override" ? "source" : null,
+    metadata.pinnedRemoteRef !== undefined ? "pinned reference" : null,
+    metadata.digest !== expectedDigest ? "digest" : null,
+    metadata.ref !== expectedReference ? "reference" : null,
+    metadata.ref !== `${metadata.imageName}@${metadata.digest}` ? "reference binding" : null,
+    sourceRevision !== contract.sourceRevision ? "source revision" : null,
+  ].filter((field): field is string => field !== null);
+  if (mismatchedFields.length > 0) {
     throw new Error(
-      `Deep Agents Code sandbox image did not use the published ${DCODE_BASE_IMAGE_TARGET_PLATFORM} base digest`,
+      `Deep Agents Code sandbox image does not match the published ${DCODE_BASE_IMAGE_TARGET_PLATFORM} base-image contract (mismatched fields: ${mismatchedFields.join(", ")})`,
     );
   }
   return {
     contractReference: contract.reference,
-    digest: metadata.digest,
-    image: metadata.imageName,
+    digest: expectedDigest,
+    image: contract.image,
     imageId: metadata.imageId,
     platform: DCODE_BASE_IMAGE_TARGET_PLATFORM,
-    reference: metadata.ref,
+    reference: expectedReference,
     sandboxImage,
-    source: metadata.source,
-    sourceRevision: contract.sourceRevision,
+    source: "override",
+    sourceRevision,
   };
 }
 

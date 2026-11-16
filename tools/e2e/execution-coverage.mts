@@ -5,6 +5,7 @@ export const E2E_AGENT_RUNTIMES = [
   "openclaw",
   "hermes",
   "langchain-deepagents-code",
+  "pi",
   "none",
   "openclaw + hermes",
   "openclaw + langchain-deepagents-code",
@@ -100,6 +101,7 @@ export function validateE2eExecutionRows(
         row.agentRuntime,
         row.observableOutcome,
         row.environmentOrInferenceEndpoint,
+        row.variant,
       ].join("\u0000");
       const previous = coverageEvidence.get(evidenceKey);
       if (previous) {
@@ -115,4 +117,8 @@ export function validateE2eExecutionRows(
 
 export function e2eExecutionLabel(row: E2eExecutionRow): string {
   return row.variant === "" ? row.id : `${row.id} / ${row.variant}`;
+}
+
+export function e2eExecutionTitle(metadata: E2eExecutionMetadata): string {
+  return `${metadata.observableOutcome} [${metadata.agentRuntime}; ${metadata.environmentOrInferenceEndpoint}]`;
 }

@@ -8,6 +8,7 @@ import {
   decideInstallOllamaLinuxMode,
   type InstallOllamaLinuxOptions,
   installOllamaOnLinux,
+  OFFICIAL_OLLAMA_INSTALLER_SHA256,
 } from "./install-ollama-linux";
 
 function makeOpts(overrides: Partial<InstallOllamaLinuxOptions>): InstallOllamaLinuxOptions {
@@ -21,6 +22,7 @@ function makeOpts(overrides: Partial<InstallOllamaLinuxOptions>): InstallOllamaL
     runCaptureImpl: vi.fn().mockReturnValue(""),
     runCaptureExImpl: vi.fn().mockReturnValue({ stdout: "", exitCode: 0, timedOut: false }),
     runShellImpl: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "", error: null }),
+    sha256FileImpl: vi.fn().mockReturnValue(OFFICIAL_OLLAMA_INSTALLER_SHA256),
     waitForHttpImpl: vi.fn().mockReturnValue(true),
     sleepSecondsImpl: vi.fn(),
     ensureManagedOllamaLoopbackSystemdOverrideImpl: vi.fn().mockReturnValue("ready"),
@@ -225,8 +227,10 @@ describe("installOllamaOnLinux (upgrade recovery)", () => {
       isUpgrade: true,
     });
     expect(installOllamaOnLinux(opts).ok).toBe(true);
-    const installer = findRunShellCall(runShellImpl, "ollama.com/install.sh");
+    const installer = findRunShellCall(runShellImpl, "OLLAMA_VERSION=");
     expect(installer).toContain(`OLLAMA_VERSION=${MIN_OLLAMA_VERSION} sh`);
+    expect(installer).not.toContain("curl");
+    expect(installer).not.toContain("|");
   });
 
   it("restarts the daemon for an already-current binary without running the pinned installer", () => {
@@ -259,8 +263,10 @@ describe("installOllamaOnLinux (upgrade recovery)", () => {
       runShellImpl,
     });
     expect(installOllamaOnLinux(opts).ok).toBe(true);
-    const installer = findRunShellCall(runShellImpl, "ollama.com/install.sh");
-    expect(installer).toContain("| sh");
+    const installer = findRunShellCall(runShellImpl, "sh '");
+    expect(installer).toBeDefined();
+    expect(installer).not.toContain("curl");
+    expect(installer).not.toContain("|");
     expect(installer).not.toContain("OLLAMA_VERSION=");
   });
 

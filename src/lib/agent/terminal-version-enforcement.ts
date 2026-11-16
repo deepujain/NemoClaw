@@ -2,28 +2,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { AgentDefinition } from "./defs";
+import type { OpenShellSandboxBufferedCommandExecutor } from "../adapters/openshell/sandbox-command";
 import {
   checkTerminalAgentVersion,
   formatTerminalAgentVersionFailure,
-  type RunCaptureOpenshell,
 } from "./terminal-version-drift";
 
 interface TerminalVersionEnforcementOptions {
+  gatewayName?: string;
   beforeFailure?: () => Promise<void>;
   onFailure: (message: string) => Promise<never>;
 }
 
 /**
- * Require the manifest-declared terminal-agent version before onboarding can
- * record agent setup as complete.
+ * Require the manifest-declared terminal-agent version before reporting
+ * completed onboarding or successful terminal readiness.
  */
 export async function enforceTerminalAgentVersion(
   sandboxName: string,
   agent: AgentDefinition,
-  runCaptureOpenshell: RunCaptureOpenshell,
+  executor: OpenShellSandboxBufferedCommandExecutor,
   options: TerminalVersionEnforcementOptions,
 ): Promise<void> {
-  const result = checkTerminalAgentVersion(sandboxName, agent, runCaptureOpenshell);
+  const result = await checkTerminalAgentVersion(sandboxName, agent, executor, options.gatewayName);
   if (result.status === "current" || result.status === "not-required") return;
 
   await options.beforeFailure?.();

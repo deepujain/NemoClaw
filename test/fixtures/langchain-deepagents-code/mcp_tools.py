@@ -57,16 +57,19 @@ async def resolve_and_load_mcp_tools(
     project_context=None,
 ):
     configs = []
+    session_cwd_servers = set()
     if explicit_config_path:
         config_path = (
             str(project_context.resolve_user_path(explicit_config_path))
             if project_context is not None
             else explicit_config_path
         )
-        configs.append(load_mcp_config(config_path))
+        explicit_config = load_mcp_config(config_path)
+        configs.append(explicit_config)
+        session_cwd_servers.update(explicit_config["mcpServers"])
     return configs
 
 
-def discover_mcp_configs(*, project_context=None):
+def discover_mcp_config_sources(*, project_context=None):
     del project_context
     return [Path.home() / ".deepagents" / ".mcp.json"]

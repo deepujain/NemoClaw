@@ -1,19 +1,39 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+import { describe, expect, it, vi } from "vitest";
 
 import { createSession } from "../state/onboard-session";
+import { nemoclawStateRoot } from "../state/state-root";
 import { bindGatewayAuthorityToCheckpoint } from "./gateway-authority-checkpoint";
 import type { GatewayManagementDeclaration } from "./gateway-management";
 import { type GatewayOwner, resolveGatewayOwner } from "./gateway-ownership";
 import {
+  GatewayAuthorityError,
+  removeGatewayRegistrationThroughAdapter,
   resolveGatewayCredentialMutationAuthority,
+  resolveGatewayForwardAuthority,
   resolveGatewayRebuildAuthority,
   resolveGatewayTeardownAuthority,
 } from "./gateway-teardown-authority";
 
 const target = { gatewayName: "nemoclaw", gatewayPort: 8080 };
+
+function targetSessionFile(homeDir: string): string {
+  const stateDir = nemoclawStateRoot(homeDir, target.gatewayPort);
+  return path.join(stateDir, "onboard-session.json");
+}
+
+function writeTargetSession(homeDir: string, content: string): void {
+  const sessionFile = targetSessionFile(homeDir);
+  const stateDir = path.dirname(sessionFile);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(sessionFile, content, { mode: 0o600 });
+}
 
 function declaration(
   kind: "systemd-system" | "systemd-user" = "systemd-system",
@@ -55,25 +75,25 @@ function checkpointSession(recordedOwner: GatewayOwner) {
 }
 
 describe("resolveGatewayTeardownAuthority", () => {
-  it.each([
-    "systemd-system",
-    "systemd-user",
-  ] as const)("returns the exact recorded %s authority when the declaration still matches (#6576)", (kind) => {
-    const currentDeclaration = declaration(kind);
-    const recordedOwner = owner(currentDeclaration);
+  it.each(["systemd-system", "systemd-user"] as const)(
+    "returns the exact recorded %s authority when the declaration still matches (#6576)",
+    (kind) => {
+      const currentDeclaration = declaration(kind);
+      const recordedOwner = owner(currentDeclaration);
 
-    expect(
-      resolveGatewayTeardownAuthority(target, {
-        hasPackagedService: () => false,
-        loadDeclaration: () => ({
-          ok: true,
-          declaration: currentDeclaration,
-          source: "profile",
+      expect(
+        resolveGatewayTeardownAuthority(target, {
+          hasPackagedService: () => false,
+          loadDeclaration: () => ({
+            ok: true,
+            declaration: currentDeclaration,
+            source: "profile",
+          }),
+          loadSession: () => checkpointSession(recordedOwner),
         }),
-        loadSession: () => checkpointSession(recordedOwner),
-      }),
-    ).toEqual(recordedOwner);
-  });
+      ).toEqual(recordedOwner);
+    },
+  );
 
   it("uses the current external declaration when no checkpoint exists (#6576)", () => {
     const currentDeclaration = declaration();
@@ -91,6 +111,85 @@ describe("resolveGatewayTeardownAuthority", () => {
         loadSession: () => null,
       }).mode,
     ).toBe("externally-supervised");
+  });
+
+  it("uses persisted gateway authority even when the unrelated sandbox identity is malformed (#9833)", () => {
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-teardown-authority-"));
+    const currentDeclaration = declaration();
+    const recordedOwner = owner(currentDeclaration);
+    const session = {
+      ...checkpointSession(recordedOwner),
+    };
+    writeTargetSession(homeDir, JSON.stringify(session));
+
+    try {
+      expect(
+        resolveGatewayTeardownAuthority(target, {
+          env: { HOME: homeDir },
+          hasPackagedService: () => false,
+          loadDeclaration: () => ({
+            ok: true,
+            declaration: currentDeclaration,
+            source: "profile",
+          }),
+        }),
+      ).toEqual(recordedOwner);
+    } finally {
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not adopt a different current owner when sandbox identity is malformed (#9833)", () => {
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-teardown-authority-"));
+    const recordedOwner = owner(declaration("systemd-system"));
+    const session = {
+      ...checkpointSession(recordedOwner),
+    };
+    writeTargetSession(homeDir, JSON.stringify(session));
+
+    try {
+      expect(() =>
+        resolveGatewayTeardownAuthority(target, {
+          env: { HOME: homeDir },
+          hasPackagedService: () => false,
+          loadDeclaration: () => ({
+            ok: true,
+            declaration: declaration("systemd-user"),
+            source: "profile",
+          }),
+        }),
+      ).toThrow(/authority changed since onboarding.*teardown will not perform gateway effects/);
+    } finally {
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed without disclosing the state path when persisted authority is malformed (#9833)", () => {
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-teardown-authority-"));
+    writeTargetSession(homeDir, "{");
+
+    try {
+      let refusal: unknown;
+      try {
+        resolveGatewayTeardownAuthority(target, {
+          env: { HOME: homeDir },
+          hasPackagedService: () => false,
+          loadDeclaration: () => ({
+            ok: true,
+            declaration: declaration("systemd-user"),
+            source: "profile",
+          }),
+        });
+      } catch (error) {
+        refusal = error;
+      }
+      expect(refusal).toBeInstanceOf(GatewayAuthorityError);
+      expect((refusal as Error).message).toMatch(/unreadable or is not valid JSON/);
+      expect((refusal as Error).message).toContain("fresh onboarding run");
+      expect((refusal as Error).message).not.toContain(homeDir);
+    } finally {
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    }
   });
 
   it("does not inspect the default packaged service for a custom gateway port (#6903)", () => {
@@ -205,6 +304,58 @@ describe("resolveGatewayTeardownAuthority", () => {
   });
 });
 
+describe("resolveGatewayForwardAuthority", () => {
+  it("returns the exact external endpoint while its recorded authority still matches", () => {
+    const currentDeclaration = declaration();
+    const recordedOwner = owner(currentDeclaration);
+
+    expect(
+      resolveGatewayForwardAuthority(target, {
+        hasPackagedService: () => false,
+        loadDeclaration: () => ({
+          ok: true,
+          declaration: currentDeclaration,
+          source: "profile",
+        }),
+        loadSession: () => checkpointSession(recordedOwner),
+      }),
+    ).toEqual(recordedOwner);
+  });
+
+  it("fails closed when forward recovery observes authority drift", () => {
+    const recordedOwner = owner(declaration("systemd-system"));
+
+    expect(() =>
+      resolveGatewayForwardAuthority(target, {
+        hasPackagedService: () => false,
+        loadDeclaration: () => ({
+          ok: true,
+          declaration: declaration("systemd-user"),
+          source: "profile",
+        }),
+        loadSession: () => checkpointSession(recordedOwner),
+      }),
+    ).toThrow(/authority changed since onboarding.*sandbox forward recovery/u);
+  });
+
+  it("rejects a noncanonical forward target before loading authority", () => {
+    let loaded = false;
+
+    expect(() =>
+      resolveGatewayForwardAuthority(
+        { gatewayName: "other", gatewayPort: 8080 },
+        {
+          loadDeclaration: () => {
+            loaded = true;
+            return { ok: true, declaration: null, source: null };
+          },
+        },
+      ),
+    ).toThrow(/noncanonical target/u);
+    expect(loaded).toBe(false);
+  });
+});
+
 describe("resolveGatewayRebuildAuthority", () => {
   const packagedOwner = resolveGatewayOwner({
     ...target,
@@ -269,5 +420,101 @@ describe("resolveGatewayRebuildAuthority", () => {
     ).toThrow(
       /authority changed since onboarding.*sandbox rebuild will not perform gateway effects/,
     );
+  });
+});
+
+describe("gateway registration cleanup authority", () => {
+  function lifecycleFailure(unsupported = true, ambiguous = false) {
+    return {
+      ok: false as const,
+      unsupported,
+      ambiguous,
+      error: { kind: "command" as const, reason: "failed" as const, message: "Removal failed." },
+    };
+  }
+  function cleanupFixture(result = lifecycleFailure()) {
+    const lifecycle = {
+      supportsLegacyLifecycle: vi.fn(async () => true),
+      selectGateway: vi.fn(async () => ({ ok: true as const, state: "completed" as const })),
+      registerGateway: vi.fn(async () => ({ ok: true as const, state: "completed" as const })),
+      removeGateway: vi.fn(async () => result),
+      destroyGateway: vi.fn(async () => ({ ok: true as const, state: "completed" as const })),
+      listGateways: vi.fn(async () => ({
+        ok: true as const,
+        names: [],
+        activeGateway: null,
+      })),
+    };
+    return {
+      gatewayName: target.gatewayName,
+      allowLegacyDestroy: true,
+      lifecycle,
+      revalidateAuthority: vi.fn(() => managedOwner(false)),
+    };
+  }
+
+  it("permits legacy destroy only after explicit unsupported removal and current ownership", async () => {
+    const options = cleanupFixture();
+    await expect(removeGatewayRegistrationThroughAdapter(options)).resolves.toEqual({
+      ok: true,
+      state: "completed",
+    });
+    expect(options.revalidateAuthority).toHaveBeenCalledOnce();
+    expect(options.lifecycle.destroyGateway).toHaveBeenCalledWith({
+      target: { kind: "named", gatewayName: "nemoclaw" },
+    });
+    expect(options.lifecycle.removeGateway).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { authority: "external", currentOwner: owner(declaration()), allowLegacyDestroy: true },
+    {
+      authority: "different",
+      currentOwner: { ...managedOwner(false), gatewayName: "nemoclaw-8090" },
+      allowLegacyDestroy: true,
+    },
+    { authority: "disabled", currentOwner: managedOwner(false), allowLegacyDestroy: false },
+  ])(
+    "preserves the gateway when fallback authority is $authority",
+    async ({ currentOwner, allowLegacyDestroy }) => {
+      const options = cleanupFixture();
+      options.revalidateAuthority.mockReturnValue(currentOwner);
+      options.allowLegacyDestroy = allowLegacyDestroy;
+      await expect(removeGatewayRegistrationThroughAdapter(options)).resolves.toMatchObject({
+        ok: false,
+      });
+      expect(options.lifecycle.destroyGateway).not.toHaveBeenCalled();
+    },
+  );
+
+  it("reconciles ambiguous removal without retry or legacy destruction", async () => {
+    const options = cleanupFixture(lifecycleFailure(false, true));
+    await expect(removeGatewayRegistrationThroughAdapter(options)).resolves.toMatchObject({
+      ok: false,
+      ambiguous: true,
+    });
+    expect(options.revalidateAuthority).toHaveBeenCalledOnce();
+    expect(options.lifecycle.listGateways).toHaveBeenCalledOnce();
+    expect(options.lifecycle.removeGateway).toHaveBeenCalledOnce();
+    expect(options.lifecycle.destroyGateway).not.toHaveBeenCalled();
+  });
+
+  it("does not destroy after an ordinary failed removal", async () => {
+    const options = cleanupFixture(lifecycleFailure(false));
+    await expect(removeGatewayRegistrationThroughAdapter(options)).resolves.toMatchObject({
+      ok: false,
+    });
+    expect(options.lifecycle.destroyGateway).not.toHaveBeenCalled();
+  });
+
+  it("stops when ownership changes before legacy destruction", async () => {
+    const options = cleanupFixture();
+    options.revalidateAuthority.mockImplementation(() => {
+      throw new GatewayAuthorityError("authority changed");
+    });
+    await expect(removeGatewayRegistrationThroughAdapter(options)).rejects.toThrow(
+      "authority changed",
+    );
+    expect(options.lifecycle.destroyGateway).not.toHaveBeenCalled();
   });
 });

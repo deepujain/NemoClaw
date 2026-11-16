@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
+import { VLLM_MODELS, type VllmRuntimeVariant } from "../inference/vllm-models";
 import { createSession, normalizeSession } from "../state/onboard-session";
 import {
   assertStationExpressInstallerResumeMatches,
@@ -110,6 +111,20 @@ describe("DGX Station Express resume (#7048)", () => {
     });
   });
 
+  it.each(["auto", "unknown-model", "qwen3.6-35b-a3b-nvfp4"])(
+    "rejects explicit model %s instead of selecting the Station default",
+    (model) => {
+      const env = expressEnv();
+      env.NEMOCLAW_VLLM_MODEL = model;
+      delete env.NEMOCLAW_MODEL;
+
+      expect(getStationExpressResumeIntent(env, "my-assistant")).toEqual({
+        ok: false,
+        message: "DGX Station Express requires a registered Station vLLM model and sandbox name.",
+      });
+    },
+  );
+
   it("captures the qualified dual-Station served alias in the sealed intent", () => {
     expect(getStationExpressResumeIntent(dualExpressEnv(), "my-assistant")).toEqual({
       ok: true,
@@ -119,6 +134,25 @@ describe("DGX Station Express resume (#7048)", () => {
         checkpointModel: "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
       },
     });
+  });
+
+  it("turns an ambiguous dual-Station runtime lookup into a structured conflict", () => {
+    const model = VLLM_MODELS.find(({ envValue }) => envValue === "nemotron-3-ultra-550b-a55b")!;
+    const originalVariants = model.runtimeVariants;
+    const stationVariant = (originalVariants ?? []).find(
+      ({ orchestrationRef }) => orchestrationRef === "vllm.station-pair-optional/v1",
+    )!;
+    const mutableModel = model as { runtimeVariants?: readonly VllmRuntimeVariant[] };
+    mutableModel.runtimeVariants = [...(originalVariants ?? []), stationVariant];
+
+    try {
+      expect(getStationExpressResumeIntent(dualExpressEnv(), "my-assistant")).toEqual({
+        ok: false,
+        message: "DGX Station Express has a conflicting NEMOCLAW_MODEL value.",
+      });
+    } finally {
+      mutableModel.runtimeVariants = originalVariants;
+    }
   });
 
   it.each(["NEMOCLAW_DGX_STATION_PEER", "NEMOCLAW_DGX_STATION_SSH_BINDING"])(
@@ -237,6 +271,40 @@ describe("DGX Station Express resume (#7048)", () => {
     });
 
     await withStationExpressResumeEnvironment(run, deps, env)({});
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(env).toEqual({});
+  });
+
+  it("replays an interrupted Station Express provider setup from its sealed intent (#9522)", async () => {
+    const env: NodeJS.ProcessEnv = {};
+    const interrupted = createSession({
+      mode: "non-interactive",
+      stationExpressIntent: ultraIntent,
+      provider: "vllm-local",
+      model: "nvidia/nemotron-3-ultra-550b-a55b",
+      steps: {
+        provider_selection: {
+          status: "in_progress",
+          startedAt: "2026-08-18T19:17:55.000Z",
+          completedAt: null,
+          error: null,
+        },
+      },
+    });
+    interrupted.status = "failed";
+    const deps = resumeDeps(interrupted);
+    const run = vi.fn(async () => {
+      expect(env).toMatchObject({
+        NEMOCLAW_STATION_EXPRESS: "1",
+        NEMOCLAW_NON_INTERACTIVE: "1",
+        NEMOCLAW_PROVIDER: "install-vllm",
+        NEMOCLAW_VLLM_MODEL: "nemotron-3-ultra-550b-a55b",
+        NEMOCLAW_MODEL: "nvidia/nemotron-3-ultra-550b-a55b",
+      });
+    });
+
+    await withStationExpressResumeEnvironment(run, deps, env)({ resume: true });
 
     expect(run).toHaveBeenCalledTimes(1);
     expect(env).toEqual({});
@@ -838,26 +906,27 @@ describe("DGX Station Express resume (#7048)", () => {
     }
   });
 
-  it("rejects an arbitrary served alias in an installer receipt", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-station-receipt-alias-"));
-    const stateDir = path.join(home, ".nemoclaw");
-    const receipt = path.join(stateDir, "station-express-resume");
-    fs.mkdirSync(stateDir, { mode: 0o700 });
-    fs.writeFileSync(receipt, receiptText(receiptGeneration, "nvidia/nemotron-3-ultra-550b-a55b"), {
-      mode: 0o600,
-    });
+  it.each(["nvidia/nemotron-3-ultra-550b-a55b", "AUTO", " auto"])(
+    "rejects noncanonical model %s in an installer receipt",
+    (model) => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-station-receipt-alias-"));
+      const stateDir = path.join(home, ".nemoclaw");
+      const receipt = path.join(stateDir, "station-express-resume");
+      fs.mkdirSync(stateDir, { mode: 0o700 });
+      fs.writeFileSync(receipt, receiptText(receiptGeneration, model), {
+        mode: 0o600,
+      });
 
-    try {
-      expect(() =>
-        retireStationExpressInstallerResume(receiptGeneration, { env: { HOME: home } }),
-      ).toThrow("installer resume state is malformed");
-      expect(fs.readFileSync(receipt, "utf8")).toBe(
-        receiptText(receiptGeneration, "nvidia/nemotron-3-ultra-550b-a55b"),
-      );
-    } finally {
-      fs.rmSync(home, { recursive: true, force: true });
-    }
-  });
+      try {
+        expect(() =>
+          retireStationExpressInstallerResume(receiptGeneration, { env: { HOME: home } }),
+        ).toThrow("installer resume state is malformed");
+        expect(fs.readFileSync(receipt, "utf8")).toBe(receiptText(receiptGeneration, model));
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("never unlinks a replacement receipt introduced before its atomic claim", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-station-receipt-race-"));

@@ -13,7 +13,7 @@ import { createDockerGpuDiagnosticRedactor } from "./docker-gpu-diagnostic-redac
 import { fullDockerContainerId } from "./docker-gpu-patch-clone";
 import { DOCKER_GPU_PATCH_TIMEOUT_MS } from "./docker-gpu-patch-constants";
 import { getDockerGpuPatchFailureContext } from "./docker-gpu-patch-recreate";
-import { formatDockerContainerState } from "./managed-bootstrap/docker-container-failure-evidence";
+import { formatDockerContainerState } from "./compute/docker-container-failure-evidence";
 import type {
   DockerContainerInspect,
   DockerGpuPatchDeps,
@@ -243,6 +243,8 @@ export function collectDockerGpuPatchDiagnostics(
     `old_container_id=${redactor.redactText(context?.oldContainerId ?? "unknown")}`,
     `new_container_id=${redactor.redactText(context?.newContainerId ?? "unknown")}`,
     `backup_container_name=${redactor.redactText(context?.backupContainerName ?? "none")}`,
+    `backup_removed=${confirmationValue(context?.backupRemoved)}`,
+    `last_openshell_phase=${redactor.redactText(context?.lastSandboxPhase ?? "unknown")}`,
     `rolled_back=${cleanupPendingRollback ? "pending" : context?.rolledBack === true ? "yes" : context?.rolledBack === false ? "failed" : "no"}`,
     ...(context?.replacementStopConfirmed !== undefined
       ? [`replacement_stop_confirmed=${confirmationValue(context.replacementStopConfirmed)}`]
@@ -345,22 +347,28 @@ export function collectDockerGpuPatchDiagnostics(
     if (containerLogs.trim()) writeDiagnosticText("docker-logs.txt", containerLogs);
   }
 
-  if (deps.runCaptureOpenshell) {
-    const captures: Array<[string, string[]]> = [
-      ["openshell-sandbox-get.txt", ["sandbox", "get", sandboxName]],
-      ["openshell-sandbox-list.txt", ["sandbox", "list"]],
-      ["openshell-logs.txt", ["doctor", "logs", "--name", "nemoclaw"]],
-    ];
-    for (const [fileName, args] of captures) {
+  const openShellDiagnosticArtifacts = snapshot?.openShellDiagnosticArtifacts;
+  if (openShellDiagnosticArtifacts) {
+    for (const artifact of openShellDiagnosticArtifacts) {
       try {
-        const output = deps.runCaptureOpenshell(args, {
-          ignoreError: true,
-          timeout: DOCKER_GPU_PATCH_TIMEOUT_MS,
-        });
-        if (output.trim()) writeDiagnosticText(fileName, output);
+        if (artifact.content.trim()) writeDiagnosticText(artifact.name, artifact.content);
       } catch {
-        // Best effort.
+        // Best-effort diagnostics must not hide the original failure.
       }
+    }
+  } else if (deps.openShellGpuDiagnostics) {
+    try {
+      const artifacts = deps.openShellGpuDiagnostics.collect({
+        target: { kind: "selected" },
+        sandboxName,
+        timeoutMs: DOCKER_GPU_PATCH_TIMEOUT_MS,
+        redact: redactor.redactText,
+      });
+      for (const artifact of artifacts) {
+        if (artifact.content.trim()) writeDiagnosticText(artifact.name, artifact.content);
+      }
+    } catch {
+      // Best-effort diagnostics must not hide the original failure.
     }
   }
 

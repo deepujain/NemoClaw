@@ -1,25 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { CLI_NAME } from "../../cli/branding";
 import { RD as _RD, R } from "../../cli/terminal-style";
+import { normalizeProcessExitCode } from "../../core/process-exit";
+import { hasValidDeferredN1xManagedVllmReplacementAuthority } from "../../domain/sandbox/n1x-managed-vllm-rebuild";
 import { MessagingSetupApplier, type SandboxMessagingPlan } from "../../messaging";
 import { markLastStartedStepFailed } from "../../onboard/exit-step-failure";
 import { gatewayOwnerFromCheckpoint } from "../../onboard/gateway-authority-checkpoint";
 import { sameGatewayOwner } from "../../onboard/gateway-ownership";
 import { applyReasoningEffortEnv } from "../../onboard/reasoning-mode";
-import * as shields from "../../shields";
+import { isOnboardDeferredExitError } from "../../onboard/session-bootstrap";
 import { decisionSelected, isDecisionSelected } from "../../state/onboard-checkpoint-decision";
 import { deriveCheckpointFromSession } from "../../state/onboard-checkpoint-migrate";
 import type { Session } from "../../state/onboard-session";
 import * as onboardSession from "../../state/onboard-session";
 import * as registry from "../../state/registry";
+import { cloneSandboxHostMounts } from "../../state/registry/host-mount";
 import type { RebuildBackupManifest } from "./rebuild-backup-phase";
 import type { RebuildBail, RebuildLog } from "./rebuild-credential-preflight";
 import type { RebuildDurableConfig } from "./rebuild-durable-config";
 import { isolateAmbientRecreateEnv } from "./rebuild-env-isolation";
 import {
   pinRebuildAgentBaseImageForRecreate,
+  pinRecordedOpenClawDashboardOriginForRecreate,
   type RebuildAgentBaseImagePreflight,
   type RebuildSandboxEntry,
 } from "./rebuild-flow-helpers";
@@ -27,16 +30,11 @@ import {
   getRebuildSandboxGpuOverrides,
   type RebuildRecreateOnboardOpts,
 } from "./rebuild-gpu-opt-out";
-import {
-  type McpRebuildPreparation,
-  printMcpRebuildRetryCommand,
-  restoreMcpRegistryForRebuildRetry,
-} from "./rebuild-mcp-phase";
+import { type McpRebuildPreparation, printMcpRebuildRetryCommand } from "./rebuild-mcp-phase";
 import { rebuildOnboardDependencies } from "./rebuild-onboard-dependencies";
 import type { RebuildRecreateJournal } from "./rebuild-recreate-journal";
 import type { RebuildRegistryRollback } from "./rebuild-registry-rollback";
 import type { RebuildResumeConfig } from "./rebuild-resume-config";
-import { printRebuildShieldsRecovery, type RebuildShieldsWindow } from "./rebuild-shields";
 
 export interface RebuildRecreatePhaseInput {
   sandboxName: string;
@@ -53,18 +51,26 @@ export interface RebuildRecreatePhaseInput {
   rebuildsHermesSandbox: boolean;
   hermesToolGateways: string[];
   hasHermesToolGateways: boolean;
-  sessionPolicyPresets: string[] | null;
+  policySourcePath?: string;
   credentialEnv: string | null;
   baseImagePreflight: RebuildAgentBaseImagePreflight;
   recoveryRecreate: boolean;
+  preparedBackupRecovery?: boolean;
   registryRollback: RebuildRegistryRollback;
   backupManifest: RebuildBackupManifest;
   mcpEntries: McpRebuildPreparation["entries"];
-  rebuildShieldsWindow: RebuildShieldsWindow;
-  relockShieldsIfNeeded: (sandboxStillExists: boolean) => boolean;
-  onCreated: () => void;
   log: RebuildLog;
   bail: RebuildBail;
+}
+
+/** Prefer the actionable nested failure over the recovery wrapper around it. */
+export function describeRebuildOnboardFailure(error: unknown): string {
+  if (error instanceof AggregateError) {
+    const nested = error.errors.find((entry) => entry instanceof Error);
+    if (nested) return describeRebuildOnboardFailure(nested);
+  }
+  if (error instanceof Error) return error.message;
+  return String(error);
 }
 
 /**
@@ -88,19 +94,20 @@ export async function runRebuildRecreatePhase(input: RebuildRecreatePhaseInput):
     rebuildsHermesSandbox,
     hermesToolGateways: rebuildHermesToolGateways,
     hasHermesToolGateways: hasRebuildHermesToolGateways,
-    sessionPolicyPresets: rebuildSessionPolicyPresets,
+    policySourcePath: rebuildPolicySourcePath,
     credentialEnv: rebuildCredentialEnv,
     baseImagePreflight: rebuildBaseImagePreflight,
     recoveryRecreate,
+    preparedBackupRecovery = false,
     registryRollback,
     backupManifest,
     mcpEntries: rebuildMcpEntries,
-    rebuildShieldsWindow,
-    relockShieldsIfNeeded,
-    onCreated,
     log,
     bail,
   } = input;
+  if (!rebuildPolicySourcePath) {
+    return input.bail("Rebuild has no captured OpenShell policy source.");
+  }
   console.log("");
   console.log("  Creating new sandbox with current image...");
 
@@ -153,6 +160,7 @@ export async function runRebuildRecreatePhase(input: RebuildRecreatePhaseInput):
       s,
       onboardSession.createSession({
         mode: "non-interactive",
+        servingProfileProvenance: sb.servingProfileProvenance,
         hermesAuthMethod: rebuildDurableConfig.hermesAuthMethod,
         webSearchConfig: rebuildDurableConfig.webSearchConfig,
         toolDisclosure: rebuildDurableConfig.toolDisclosure,
@@ -160,15 +168,18 @@ export async function runRebuildRecreatePhase(input: RebuildRecreatePhaseInput):
         observabilityRequestedExplicitly: recreateOptions.observabilityRequestedExplicitly,
         telegramConfig: sessionMatchesSandbox ? sessionBefore?.telegramConfig : null,
         wechatConfig: sessionMatchesSandbox ? sessionBefore?.wechatConfig : null,
-        migratedLegacyValueHashes: sessionMatchesSandbox
-          ? sessionBefore?.migratedLegacyValueHashes
-          : null,
-        routerPid: resumeConfig.provider === "nvidia-router" ? sessionBefore?.routerPid : undefined,
-        routerCredentialHash:
-          resumeConfig.provider === "nvidia-router" ? sessionBefore?.routerCredentialHash : null,
+        // The inner resume compares its requested host mounts against this
+        // recorded metadata, so the reset must carry the same mounts the
+        // recreate options hand to onboard. Omitting them recorded an empty
+        // mount set and aborted the resume after the old sandbox was already
+        // deleted (#9451).
         metadata: {
           gatewayName: recreateOptions.targetGatewayName,
           fromDockerfile: storedFromDockerfile,
+          fromImage: recreateOptions.fromImage,
+          ...(recreateOptions.hostMounts && recreateOptions.hostMounts.length > 0
+            ? { hostMounts: cloneSandboxHostMounts(recreateOptions.hostMounts) }
+            : {}),
         },
       }),
     );
@@ -186,9 +197,9 @@ export async function runRebuildRecreatePhase(input: RebuildRecreatePhaseInput):
     s.agent = rebuildAgent;
     s.messagingPlan = rebuildMessagingPlan;
     s.hermesToolGateways = rebuildsHermesSandbox ? rebuildHermesToolGateways : [];
-    s.policyPresets = rebuildSessionPolicyPresets;
     s.gpuPassthrough = rebuildGpuOverrides.sessionGpuPassthrough;
     s.metadata.fromDockerfile = storedFromDockerfile;
+    s.metadata.fromImage = recreateOptions.fromImage;
     s.provider = resumeConfig.provider;
     s.model = resumeConfig.model;
     s.nimContainer = resumeConfig.nimContainer;
@@ -218,25 +229,31 @@ export async function runRebuildRecreatePhase(input: RebuildRecreatePhaseInput):
     `Recreate env will target NEMOCLAW_SANDBOX_NAME=${sandboxName}; NEMOCLAW_RECREATE_SANDBOX=${process.env.NEMOCLAW_RECREATE_SANDBOX}`,
   );
   log(
-    `Calling onboard({ resume: true, nonInteractive: true, recreateSandbox: true, fromDockerfile: ${storedFromDockerfile} })`,
+    `Calling onboard({ resume: true, nonInteractive: true, recreateSandbox: true, fromDockerfile: ${storedFromDockerfile}, fromImage: ${recreateOptions.fromImage} })`,
   );
 
-  // Intercept process.exit so a failed inner onboard can preserve the backup
-  // and durable retry state instead of terminating the outer transaction.
   let onboardFailed = false;
   let onboardExitCode = 1;
-  const savedExit = process.exit;
-  process.exit = ((code) => {
-    onboardFailed = true;
-    onboardExitCode = typeof code === "number" ? code : 1;
-    const error = new Error(`onboard exited with code ${onboardExitCode}`);
-    error.name = "RebuildOnboardExit";
-    throw error;
-  }) as typeof process.exit;
-
   const restoreAmbientRecreateEnv = isolateAmbientRecreateEnv();
+  const replacementAuthorityValid = hasValidDeferredN1xManagedVllmReplacementAuthority(
+    recreateOptions,
+    sb,
+    resumeConfig,
+  );
+  if (replacementAuthorityValid && recreateOptions.reinstallDeferredN1xManagedVllm === true) {
+    process.env.NEMOCLAW_PROVIDER = "install-vllm";
+  }
   const previousSandboxName = process.env.NEMOCLAW_SANDBOX_NAME;
   const previousRecreateWithoutBackup = process.env.NEMOCLAW_RECREATE_WITHOUT_BACKUP;
+  const previousRestoreLatestBackup = process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE;
+  const restoreChatUiUrl = pinRecordedOpenClawDashboardOriginForRecreate({
+    sandboxName,
+    sandboxEntry: sb,
+    rebuildAgent,
+    controlUiPort: recreateOptions.controlUiPort,
+    replacementDashboard:
+      recreateOptions.managedWorkloadRebuild?.replacementProfile.profile.dashboard,
+  });
   process.env.NEMOCLAW_SANDBOX_NAME = sandboxName;
   // The outer rebuild already made its sole backup before the destroy phase deleted
   // the sandbox without tearing down the gateway/session needed by onboard --resume.
@@ -244,10 +261,10 @@ export async function runRebuildRecreatePhase(input: RebuildRecreatePhaseInput):
   // where a second backup is impossible after deletion. Keep the bypass scoped to
   // this call; remove it when onboard accepts an explicit outer-backup handoff.
   process.env.NEMOCLAW_RECREATE_WITHOUT_BACKUP = "1";
+  // The outer rebuild owns and has already validated this backup. Inner onboard
+  // must publish the replacement before the outer restore phase applies it.
+  delete process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE;
   if (rebuildMessagingPlan) MessagingSetupApplier.writePlanToEnv(rebuildMessagingPlan);
-  if (recreateOptions.policyTier) {
-    process.env.NEMOCLAW_POLICY_TIER = recreateOptions.policyTier;
-  }
   // Isolation removed the ambient reasoning inputs so an unrelated onboard
   // cannot steer this recreate (#5735). The recreate still has to reapply the
   // *recorded* compatible-endpoint reasoning configuration: both the recovered
@@ -261,23 +278,50 @@ export async function runRebuildRecreatePhase(input: RebuildRecreatePhaseInput):
   }
   const restoreRebuildBaseImageOverride =
     pinRebuildAgentBaseImageForRecreate(rebuildBaseImagePreflight);
+  const savedExitCode = process.exitCode;
+  process.exitCode = undefined;
   try {
+    if (!replacementAuthorityValid) {
+      throw new Error("Deferred N1x managed-vLLM replacement authority is invalid.");
+    }
     await rebuildOnboardDependencies.onboard({
       ...recreateOptions,
-      rebuildGatewayAuthority,
-      ...(rebuildsHermesSandbox && backupManifest?.preservedEnv
-        ? { rebuildPreservedEnv: backupManifest.preservedEnv }
+      ...(recreateJournal.runtimeSelection
+        ? { runtimeSelection: recreateJournal.runtimeSelection }
         : {}),
+      ...(preparedBackupRecovery ? { allowRemovedImmutabilityStateRecord: true } : {}),
+      rebuildGatewayAuthority,
+      rebuildPolicySourcePath,
       recreateJournalTargetIntentFingerprint: recreateJournal.targetIntentFingerprint,
     });
-    log("onboard() returned successfully");
+    const returnedExitCode = normalizeProcessExitCode(process.exitCode);
+    if (returnedExitCode !== 0) {
+      onboardFailed = true;
+      onboardExitCode = returnedExitCode;
+      log(`onboard() returned with exit code ${returnedExitCode}`);
+      console.error(
+        `  ${_RD}Sandbox recreate error:${R} Inner onboarding completed with exit code ${returnedExitCode}.`,
+      );
+    } else {
+      log("onboard() returned successfully");
+    }
   } catch (error) {
     onboardFailed = true;
-    const message = error instanceof Error ? error.message : String(error);
-    const name = error instanceof Error ? error.name : "";
-    if (name !== "RebuildOnboardExit") log(`onboard() threw: ${message}`);
+    const message = describeRebuildOnboardFailure(error);
+    if (isOnboardDeferredExitError(error)) {
+      onboardExitCode = error.code;
+      log(`onboard() exited with code ${onboardExitCode}`);
+      console.error(
+        `  ${_RD}Sandbox recreate error:${R} Inner onboarding exited with code ${onboardExitCode}.`,
+      );
+    } else {
+      log(`onboard() threw: ${message}`);
+      console.error(
+        `  ${_RD}Sandbox recreate error:${R} ${onboardSession.redactSensitiveText(message) ?? "Inner onboarding failed."}`,
+      );
+    }
   } finally {
-    process.exit = savedExit;
+    process.exitCode = savedExitCode;
     restoreRebuildBaseImageOverride();
     restoreAmbientRecreateEnv();
     if (previousSandboxName === undefined) delete process.env.NEMOCLAW_SANDBOX_NAME;
@@ -287,9 +331,14 @@ export async function runRebuildRecreatePhase(input: RebuildRecreatePhaseInput):
     } else {
       process.env.NEMOCLAW_RECREATE_WITHOUT_BACKUP = previousRecreateWithoutBackup;
     }
+    if (previousRestoreLatestBackup === undefined) {
+      delete process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE;
+    } else {
+      process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = previousRestoreLatestBackup;
+    }
+    restoreChatUiUrl();
   }
 
-  if (!onboardFailed) onCreated();
   if (onboardFailed) {
     try {
       markLastStartedStepFailed(onboardSession, "Rebuild recreate failed");
@@ -298,7 +347,7 @@ export async function runRebuildRecreatePhase(input: RebuildRecreatePhaseInput):
     }
 
     registryRollback.restoreForRetry();
-    restoreMcpRegistryForRebuildRetry(recoveryRecreate, rebuildMcpEntries, sb, log);
+    log("Recreate failed: preserved source-derived MCP handoff for retry");
 
     console.error("");
     if (recoveryRecreate) {
@@ -327,14 +376,11 @@ export async function runRebuildRecreatePhase(input: RebuildRecreatePhaseInput):
       },
     );
     if (backupManifest) {
-      console.error("    3. Then restore your workspace state:");
       console.error(
-        `       ${CLI_NAME} ${sandboxName} snapshot restore "${backupManifest.timestamp}"`,
+        "       The retry will restore the complete native agent home from this backup.",
       );
     }
-    printRebuildShieldsRecovery(sandboxName, rebuildShieldsWindow, CLI_NAME);
     console.error("");
-    relockShieldsIfNeeded(false);
     bail(
       backupManifest
         ? `Recreate failed (sandbox destroyed). Backup: ${backupManifest.backupPath}`
@@ -344,7 +390,6 @@ export async function runRebuildRecreatePhase(input: RebuildRecreatePhaseInput):
     return false;
   }
 
-  if (recoveryRecreate) shields.clearShieldsState(sandboxName);
   const preservedRegistryFields = {
     ...(hasRebuildHermesToolGateways ? { hermesToolGateways: [...rebuildHermesToolGateways] } : {}),
   };

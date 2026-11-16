@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { redactSensitiveText } from "../../security/redact";
+import type { OpenShellSandboxBufferedCommandRequest } from "../../adapters/openshell/sandbox-command";
+import {
+  namedOpenShellGateway,
+  selectedOpenShellGateway,
+} from "../../adapters/openshell/sandbox-observer";
 
 export type InferenceRouteProbeAgent = { name: string } | null;
 
@@ -30,8 +35,8 @@ const INFERENCE_ROUTE_CA_FROM_ENV = 'CA_BUNDLE="${CURL_CA_BUNDLE:-${SSL_CERT_FIL
 const INFERENCE_ROUTE_CA_VALIDATION =
   '[ -n "$CA_BUNDLE" ] && [ -f "$CA_BUNDLE" ] && [ -r "$CA_BUNDLE" ] || { printf \'UNAVAILABLE OpenShell CA bundle missing or unreadable\'; exit 1; }';
 const INFERENCE_ROUTE_PROBE_CORE_SCRIPT = [
-  "HTTP_CODE=$(/usr/bin/curl -q -s -o /dev/null -w '%{http_code}' --cacert \"$CA_BUNDLE\" --connect-timeout 3 --max-time 8 https://inference.local/v1/models 2>/dev/null) || HTTP_CODE=000",
-  'case "$HTTP_CODE" in [2-4][0-9][0-9]) printf \'OK %s\' "$HTTP_CODE" ;; *) printf \'BROKEN %s\' "$HTTP_CODE" ;; esac',
+  "HTTP_CODE=$(/usr/bin/curl -q -s -o /dev/null -w '%{http_code}' --cacert \"$CA_BUNDLE\" --connect-timeout 3 --max-time 8 https://inference.local/v1/models 2>/dev/null); CURL_EXIT=$?",
+  'if [ "$CURL_EXIT" -ne 0 ]; then printf \'BROKEN 000 curl_exit=%s\' "$CURL_EXIT"; else case "$HTTP_CODE" in [2-4][0-9][0-9]) printf \'OK %s\' "$HTTP_CODE" ;; *) printf \'BROKEN %s\' "$HTTP_CODE" ;; esac; fi',
 ].join("; ");
 export const INFERENCE_ROUTE_PROBE_SCRIPT = [
   INFERENCE_ROUTE_CA_FROM_ENV,
@@ -39,15 +44,14 @@ export const INFERENCE_ROUTE_PROBE_SCRIPT = [
   INFERENCE_ROUTE_PROBE_CORE_SCRIPT,
 ].join("; ");
 // Invalid state: OpenShell starts sandbox exec through a login shell before the
-// requested command (#8624; OpenShell#2668). Rebuilt DCode images reserve that
-// shell's first-match profile as a root-owned file which skips sandbox startup
-// state for the image-baked launcher. Older images can still emit output and
+// requested command (#8624; OpenShell#2668). DCode's image-owned system hook
+// selects the managed home before reading personal files. Older images can emit output and
 // create side effects before this probe begins. The launcher reconstructs the
 // managed proxy from root-owned, mode-0444 files without adding another
 // profile-sourcing shell, and the parser rejects inherited stderr or extra
 // stdout so startup output cannot become accepted probe evidence. Regression:
-// protected- and hostile-profile tests cover both image generations plus
-// inherited descriptors. Removal condition: use a raw probe only when OpenShell
+// system-hook and hostile-profile tests cover startup and inherited descriptors.
+// Removal condition: use a raw probe only when OpenShell
 // provides both a non-login exec path and the trusted proxy environment to every
 // sandbox exec process.
 // This separate regular-file install is intentionally absent from older images:
@@ -66,7 +70,7 @@ export function isDcodeManagedExecMissingDetail(detail: string): boolean {
   );
 }
 
-function formatUntrustedProbeDetail(detail: string): string {
+export function formatUntrustedProbeDetail(detail: string): string {
   const normalized = detail.replace(/\s+/g, " ").trim();
   if (isDcodeManagedExecMissingDetail(normalized)) return DCODE_MANAGED_EXEC_MISSING_DETAIL;
   return redactSensitiveText(normalized) ?? "";
@@ -81,40 +85,33 @@ export function classifyInferenceRouteFailureLabel(httpStatus: number): Inferenc
   return httpStatus >= 500 && httpStatus < 600 ? "unhealthy" : "unreachable";
 }
 
-export function buildSandboxInferenceRouteProbeArgs(
+/** Build the transport-neutral buffered request for an inference route probe. */
+export function buildSandboxInferenceRouteProbeRequest(
   sandboxName: string,
   agent: InferenceRouteProbeAgent,
-  gatewayName?: string,
-): string[] {
-  const targetArgs = [
-    "sandbox",
-    "exec",
-    "--name",
+  gatewayName: string | undefined,
+  timeoutMilliseconds: number,
+): OpenShellSandboxBufferedCommandRequest {
+  const dcode = agent?.name === "langchain-deepagents-code";
+  return {
     sandboxName,
-    ...(gatewayName ? ["-g", gatewayName] : []),
-  ];
-  if (agent?.name === "langchain-deepagents-code") {
-    return [
-      ...targetArgs,
-      "--no-tty",
-      "--env",
-      "HOME=/usr/local/lib/nemoclaw",
-      "--env",
-      "BASH_ENV=",
-      "--env",
-      "ENV=",
-      "--",
-      // The trusted launcher ignores ambient proxy overrides and does not add
-      // another startup-file read or rewrite persistent runtime state. The
-      // OpenShell transport-level login shell remains tracked in OpenShell#2668.
-      DCODE_MANAGED_EXEC_LAUNCHER,
-      "/bin/sh",
-      "-c",
-      INFERENCE_ROUTE_PROBE_SCRIPT,
-    ];
-  }
-
-  return [...targetArgs, "--", "sh", "-c", INFERENCE_ROUTE_PROBE_SCRIPT];
+    target:
+      gatewayName === undefined ? selectedOpenShellGateway() : namedOpenShellGateway(gatewayName),
+    command: dcode
+      ? [DCODE_MANAGED_EXEC_LAUNCHER, "/bin/sh", "-c", INFERENCE_ROUTE_PROBE_SCRIPT]
+      : ["sh", "-c", INFERENCE_ROUTE_PROBE_SCRIPT],
+    ...(dcode
+      ? {
+          sandboxEnvironment: {
+            BASH_ENV: "",
+            ENV: "",
+            HOME: "/usr/local/lib/nemoclaw",
+          },
+        }
+      : {}),
+    ...(dcode ? { tty: false } : {}),
+    timeoutMilliseconds,
+  };
 }
 
 /** Parse the shared route-probe output used by connect, status, and doctor. */

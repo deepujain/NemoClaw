@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import type { BaselineExclusionEntry } from "../state/registry";
+import type { NativeLocalProviderAttachment } from "../inference/native-local/contract";
+import type { NativeProviderAttachment } from "../inference/native-provider/contract";
+
 import type { SandboxHostMount } from "../state/registry/types";
+import type { NativeNvidiaProviderAttachment } from "../inference/native-nvidia";
+import type { MessagingChannelConfig } from "../messaging-channel-config";
 import type { DockerGpuRoutePlan } from "./docker-gpu-route";
 import type { InitialSandboxPolicy } from "./initial-policy";
-import type { ManagedHermesStateVolumeMount } from "./managed-workload/hermes-state-volume";
+import type { ManagedStateVolumeMount } from "./managed-workload/managed-state-volumes";
 import type { MessagingTokenDef } from "./messaging-prep";
 import type { MessagingChannel } from "./messaging-state";
 import type { SandboxGpuCreateConfig } from "./sandbox-gpu-create";
@@ -31,7 +35,6 @@ export type SandboxCreatePolicyRequest = {
     readonly hostLocalInferenceRouteOnly?: true;
     readonly agentName?: string | null;
     readonly policyTier: string | null;
-    readonly baselineExclusions: readonly BaselineExclusionEntry[];
   };
 };
 
@@ -48,6 +51,10 @@ export type SandboxCreatePolicyRequest = {
 export type SandboxCreateIntent = {
   readonly sandboxName: string;
   readonly inferenceProvider: string | null;
+  readonly nativeLocalProviderAttachment?: NativeLocalProviderAttachment;
+  readonly nativeNvidiaProviderAttachment?: NativeNvidiaProviderAttachment;
+  readonly nativeHostedProviderAttachment?: NativeProviderAttachment;
+  readonly hermesSwitchyard?: import("../hermes-switchyard-routing").SwitchyardBindingState;
   readonly activeMessagingChannels: readonly string[];
   readonly messagingProviderRequests: readonly SandboxCreateMessagingProviderRequest[];
   readonly reusableMessagingProviders: readonly string[];
@@ -55,6 +62,7 @@ export type SandboxCreateIntent = {
   readonly staleExtraProviders: readonly string[];
   readonly hermesToolGateways: readonly string[];
   readonly policy: SandboxCreatePolicyRequest;
+  readonly sandboxGpuDevice?: string | null;
   readonly gpuCreateArgs: readonly string[];
   readonly resourceCreateArgs: readonly string[];
   readonly hostMounts?: readonly SandboxHostMount[];
@@ -68,6 +76,10 @@ export type ResolveSandboxCreateIntentInput = {
   basePolicyPath: string;
   sandboxName: string;
   inferenceProvider?: string | null;
+  nativeLocalProviderAttachment?: NativeLocalProviderAttachment;
+  nativeNvidiaProviderAttachment?: NativeNvidiaProviderAttachment;
+  nativeHostedProviderAttachment?: NativeProviderAttachment;
+  hermesSwitchyard?: import("../hermes-switchyard-routing").SwitchyardBindingState;
   hostLocalInferenceRouteOnly?: boolean;
   channels: readonly MessagingChannel[];
   enabledChannels: string[] | null;
@@ -87,20 +99,33 @@ export type ResolveSandboxCreateIntentInput = {
   sandboxGpuLogMessage: string | null;
   extraPlaceholderKeys?: readonly string[];
   agentName?: string | null;
-  policyTier: string | null;
-  baselineExclusions?: readonly BaselineExclusionEntry[];
+  policyTier?: string | null;
 };
 
 export type MaterializeSandboxCreatePlanInput = {
   intent: SandboxCreateIntent;
   fromRef: string;
-  managedStateMount?: ManagedHermesStateVolumeMount | null;
+  /** Preserve raw command materialization for the Portable consumer deferred to #12119. */
+  portableLifecycle?: boolean;
+  managedStateMounts?: readonly ManagedStateVolumeMount[];
+  /** Opaque provider-owned OpenShell driver-config key for the managed state mount. */
+  managedStateMountDriverId?: string | null;
+  policylessCreate?: boolean;
+  /** Keep provider mutations and attachments behind the exact post-create identity gate. */
+  deferSandboxEffectsUntilIdentityVerification?: boolean;
+  /** A verified create resume must rebuild its plan without replaying provider mutations. */
+  skipProviderEffects?: boolean;
   messagingTokenDefs: MessagingTokenDef[];
-  runProviderPreDeleteCleanup(): void;
+  /** Non-secret config captured in the messaging plan that owns exact policy endpoints. */
+  messagingConfig?: MessagingChannelConfig | null;
   upsertMessagingProviders(
     tokenDefs: MessagingTokenDef[],
-    options: { replaceExisting: true },
-  ): string[];
+    options: {
+      replaceExisting: true;
+      allowedSandboxes: readonly [string];
+      revalidateSandboxIdentity?(operation: string): void;
+    },
+  ): string[] | Promise<string[]>;
   getHermesToolGatewayProviderName(sandboxName: string): string;
   discloseInitialSandboxPolicy?(policy: InitialSandboxPolicy): void;
   prepareInitialSandboxCreatePolicy?: PrepareInitialSandboxCreatePolicy;

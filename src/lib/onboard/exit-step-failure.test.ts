@@ -250,6 +250,29 @@ describe("incomplete-onboard --resume backstop (#6003)", () => {
     expect(runExitHandler(1)).not.toContain("--resume");
   });
 
+  it("preserves recovery-only cancellation through the later exit backstop (#9833)", () => {
+    const fingerprint = "a".repeat(64);
+    session.saveSession(
+      session.createSession({ lastStepStarted: "sandbox", sandboxName: "retained-sb" }),
+    );
+    session.markCancellationRecovery("retained-sb", fingerprint, {
+      gatewayName: "nemoclaw",
+      gatewayPort: 8080,
+      lifecycleGeneration: "generation-1",
+      createAttemptNonce: "c".repeat(62),
+    });
+    const beforeExit = requireLoadedSession();
+    expect(beforeExit.failure?.message).toContain(
+      "retained recovery blocks this sandbox name until destroy confirms absence",
+    );
+    expect(beforeExit.failure?.message).not.toContain("administrator");
+
+    const output = runExitHandler(1);
+
+    expect(output).not.toContain("--resume");
+    expect(requireLoadedSession()).toEqual(beforeExit);
+  });
+
   it("stays silent when cancel cleanup clears the session before a signal is re-raised", async () => {
     const signalListeners = new Map<"SIGINT" | "SIGTERM", () => void>();
     const kill = vi.fn();
@@ -286,32 +309,76 @@ describe("incomplete-onboard --resume backstop (#6003)", () => {
     errorSpy.mockRestore();
   });
 
+  it("records signals as terminal after validation preservation is latched (#9732)", async () => {
+    const signalListeners = new Map<"SIGINT" | "SIGTERM", () => void>();
+    const kill = vi.fn();
+    const processLike = {
+      once: vi.fn(),
+      on: (signal: "SIGINT" | "SIGTERM", listener: () => void) => {
+        signalListeners.set(signal, listener);
+      },
+      removeListener: (signal: "SIGINT" | "SIGTERM", listener: () => void) => {
+        expect(signalListeners.get(signal)).toBe(listener);
+        signalListeners.delete(signal);
+      },
+      kill,
+      pid: 4242,
+    };
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    session.saveSession(session.createSession({ lastStepStarted: "preflight" }));
+
+    try {
+      registerIncompleteOnboardExitFailureHandler(
+        session,
+        () => true,
+        "Onboarding exited before the step completed.",
+        processLike,
+      );
+      signalListeners.get("SIGTERM")?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const loaded = requireLoadedSession();
+      expect(loaded.status).toBe("failed");
+      expect(loaded.failure).toMatchObject({ step: "preflight", interrupted: true });
+      expect(loaded.machine.state).toBe("failed");
+      expect(kill).toHaveBeenCalledWith(4242, "SIGTERM");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it.skipIf(process.platform === "win32")(
-    "prints the resume hint before re-raising SIGINT in a real subprocess",
+    "releases the owned lock before re-raising SIGINT in a real subprocess",
     async () => {
       const childDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-resume-signal-"));
       const childScript = path.join(childDir, "signal-resume-hint.cjs");
       const helperPath = path.resolve("src/lib/onboard/exit-step-failure.ts");
+      const onboardSessionPath = path.resolve("src/lib/state/onboard-session.ts");
       fs.writeFileSync(
         childScript,
         `
 const { registerIncompleteOnboardExitFailureHandler } = require(${JSON.stringify(helperPath)});
+const onboardSession = require(${JSON.stringify(onboardSessionPath)});
+
+if (!onboardSession.acquireOnboardLock("signal cleanup test").acquired) process.exit(2);
 
 const resumableSession = { lastStepStarted: "inference" };
 registerIncompleteOnboardExitFailureHandler(
   {
     loadSession: () => resumableSession,
     finalizeIncompleteOnboardStep: () => resumableSession,
+    releaseOnboardLock: onboardSession.releaseOnboardLock,
   },
   () => false,
   "Onboarding exited before the step completed.",
 );
-process.stdout.write("ready\\n");
+process.stdout.write(JSON.stringify({ lockFile: onboardSession.LOCK_FILE }) + "\\n");
 setInterval(() => {}, 1_000);
 `,
       );
 
       const child = spawn(process.execPath, ["--require", "tsx/cjs", childScript], {
+        env: { ...process.env, HOME: childDir },
         stdio: ["ignore", "pipe", "pipe"],
       });
       let stderr = "";
@@ -322,13 +389,15 @@ setInterval(() => {}, 1_000);
 
       try {
         const [ready] = await once(child.stdout, "data");
-        expect(String(ready)).toContain("ready");
+        const { lockFile } = JSON.parse(String(ready)) as { lockFile: string };
+        expect(fs.existsSync(lockFile)).toBe(true);
         const exited = once(child, "exit");
         child.kill("SIGINT");
         const [code, signal] = await exited;
         expect(code).toBeNull();
         expect(signal).toBe("SIGINT");
         expect(stderr).toContain("onboard --resume");
+        expect(fs.existsSync(lockFile)).toBe(false);
       } finally {
         child.kill("SIGKILL");
         fs.rmSync(childDir, { recursive: true, force: true });

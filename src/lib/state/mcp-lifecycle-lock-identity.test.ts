@@ -11,6 +11,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   classifyMcpLifecycleLock,
   isMcpLifecycleLockOwner,
+  readMcpLockHostIdentity,
+  readMcpLockPidNamespaceIdentity,
   type LockObservation,
   type McpLifecycleLockIdentityProbes,
   type McpLifecycleLockOwner,
@@ -18,11 +20,18 @@ import {
 import {
   getMcpLifecycleLockPath,
   readMcpLifecycleLockObservation,
+  readMcpLifecycleLockObservationSync,
+  reclaimStaleMcpLifecycleLockGeneration,
+  reclaimStaleMcpLifecycleLockGenerationSync,
+  safelyReleaseMcpLifecycleLock,
+  safelyReleaseMcpLifecycleLockSync,
+  writeMcpLifecycleLockCandidateAndLink,
+  writeMcpLifecycleLockCandidateAndLinkSync,
 } from "./mcp-lifecycle-lock-storage";
 
 const PROPERTY_RUNS = 250;
 const PROPERTY_TIMEOUT_MS = 15_000;
-// Moved from test/mcp-lifecycle-lock.test.ts. The recorded seed is kept so a
+// Moved from test/mcp/mcp-lifecycle-lock.test.ts. The recorded seed is kept so a
 // failure replays the same counterexample that suite reported.
 const SEEDED_PROPERTY_PARAMETERS = { numRuns: PROPERTY_RUNS, seed: 0x5876c0de } as const;
 const SANDBOX_NAME = "property-sandbox";
@@ -93,6 +102,38 @@ function probes(
 }
 
 describe("MCP lifecycle lock identity properties", () => {
+  it("reclaims a zombie local owner without treating its PID as live", () => {
+    const localHostIdentity = readMcpLockHostIdentity();
+    const localPidNamespaceIdentity = readMcpLockPidNamespaceIdentity();
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+    const readFileSync = vi.spyOn(fs, "readFileSync").mockImplementation((filePath) => {
+      expect(filePath).toBe("/proc/4242/stat");
+      return "4242 (mutation owner) Z 1 2 3";
+    });
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    try {
+      expect(
+        classifyMcpLifecycleLock(
+          observation(
+            owner(4242, "linux:test-boot:10", {
+              hostIdentity: localHostIdentity,
+              pidNamespaceIdentity: localPidNamespaceIdentity,
+            }),
+          ),
+          SANDBOX_NAME,
+          0,
+          30_000,
+        ),
+      ).toBe("stale");
+      expect(kill).not.toHaveBeenCalled();
+    } finally {
+      kill.mockRestore();
+      readFileSync.mockRestore();
+      platform.mockRestore();
+    }
+  });
+
   it("keeps a matching live owner active across PID, start-tick, and clock boundaries", () => {
     fc.assert(
       fc.property(
@@ -417,14 +458,18 @@ describe("MCP lifecycle lock identity properties", () => {
             // fc draws ageMs and graceMs independently, so ageMs === graceMs is
             // almost never sampled. This loop tests the >= comparison at the exact ages.
 
-            expect([graceMs - 1, graceMs, graceMs + 1, ageMs].every((boundaryAgeMs) =>
+            expect(
+              [graceMs - 1, graceMs, graceMs + 1, ageMs].every(
+                (boundaryAgeMs) =>
                   classifyMcpLifecycleLock(
                     observation(lockOwner, 0),
                     SANDBOX_NAME,
                     boundaryAgeMs,
                     graceMs,
                     localProbes,
-                  ) === (boundaryAgeMs >= graceMs ? "stale" : "wait"))).toBe(true);
+                  ) === (boundaryAgeMs >= graceMs ? "stale" : "wait"),
+              ),
+            ).toBe(true);
           },
         ),
         SEEDED_PROPERTY_PARAMETERS,
@@ -457,6 +502,43 @@ describe("MCP lifecycle lock storage properties", () => {
 
   afterEach(() => {
     fs.rmSync(stateDir, { force: true, recursive: true });
+  });
+
+  it("leaves missing and foreign owner generations untouched during safe release", async () => {
+    const lockPath = getMcpLifecycleLockPath(SANDBOX_NAME, stateDir);
+    const lockOwner = owner(4242, "linux:test-boot:10");
+
+    await safelyReleaseMcpLifecycleLock(lockPath, "missing");
+    safelyReleaseMcpLifecycleLockSync(lockPath, "missing");
+
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, `${JSON.stringify(lockOwner)}\n`);
+    await safelyReleaseMcpLifecycleLock(lockPath, "foreign-token");
+    safelyReleaseMcpLifecycleLockSync(lockPath, "foreign-token");
+
+    expect(readMcpLifecycleLockObservationSync(lockPath)?.owner).toEqual(lockOwner);
+  });
+
+  it("reports an already-missing generation as not reclaimed", async () => {
+    const lockPath = getMcpLifecycleLockPath(SANDBOX_NAME, stateDir);
+    const expected = observation(owner(4242, "linux:test-boot:10"));
+
+    await expect(reclaimStaleMcpLifecycleLockGeneration(lockPath, expected)).resolves.toBe(false);
+    expect(reclaimStaleMcpLifecycleLockGenerationSync(lockPath, expected)).toBe(false);
+  });
+
+  it("rejects async and sync candidate publication over an existing owner", async () => {
+    const lockPath = getMcpLifecycleLockPath(SANDBOX_NAME, stateDir);
+    const existingOwner = owner(4242, "linux:test-boot:10", { token: "existing" });
+    const candidateOwner = owner(4343, "linux:test-boot:11", { token: "candidate" });
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, `${JSON.stringify(existingOwner)}\n`);
+
+    await expect(writeMcpLifecycleLockCandidateAndLink(lockPath, candidateOwner)).resolves.toBe(
+      false,
+    );
+    expect(writeMcpLifecycleLockCandidateAndLinkSync(lockPath, candidateOwner)).toBe(false);
+    expect(readMcpLifecycleLockObservationSync(lockPath)?.owner).toEqual(existingOwner);
   });
 
   it(

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 
 import type { GatewayRegistryEntry } from "../../state/gateway-registry";
@@ -24,6 +25,7 @@ function createDeps(overrides: Partial<StopModelRouterForDestroyedSandboxDeps> =
     sandboxName: "alpha",
     endpointUrl: routedSandbox.endpointUrl,
     routerPid: 4242,
+    routerPort: 4100,
     routerCredentialHash: "hash",
   } as Session;
   const deps: StopModelRouterForDestroyedSandboxDeps = {
@@ -37,7 +39,7 @@ function createDeps(overrides: Partial<StopModelRouterForDestroyedSandboxDeps> =
     }),
     expectedSession: session,
     inspectProcessForPort: vi.fn(() => ({ status: "absent" as const })),
-    isHealthy: vi.fn(async () => false),
+    isResponsive: vi.fn(async () => false),
     isRoutedProvider: vi.fn((provider: string | null | undefined) => provider === "nvidia-router"),
     listHostRegistryEntries: vi.fn(() => []),
     loadSession: vi.fn(() => session),
@@ -66,6 +68,47 @@ describe("resolveDestroyedSandboxRouterPort", () => {
 });
 
 describe("stopModelRouterForDestroyedSandbox", () => {
+  it.each([
+    [true, []],
+    [false, [[4242, 4100]]],
+  ] as const)(
+    "recognizes configured legacy router names during cleanup (same-port peer=%s)",
+    async (peerRemains, expectedCalls) => {
+      const read = vi
+        .spyOn(fs, "readFileSync")
+        .mockReturnValue(
+          "components:\n  inference:\n    profiles:\n      routed:\n        provider_name: legacy-router\n",
+        );
+      try {
+        const { deps } = createDeps({
+          isRoutedProvider: undefined,
+          listHostRegistryEntries: () =>
+            peerRemains
+              ? [
+                  {
+                    entry: {
+                      name: "peer",
+                      provider: "legacy-router",
+                      endpointUrl: routedSandbox.endpointUrl,
+                    } as GatewayRegistryEntry,
+                    gatewayPort: 8081,
+                    registryFile: "/tmp/peer/registry.json",
+                    stateRoot: "/tmp/peer",
+                  },
+                ]
+              : [],
+        });
+        await stopModelRouterForDestroyedSandbox(
+          { ...routedSandbox, provider: peerRemains ? "nvidia-router" : "legacy-router" },
+          deps,
+        );
+        expect(vi.mocked(deps.stopProcess!).mock.calls).toEqual(expectedCalls);
+      } finally {
+        read.mockRestore();
+      }
+    },
+  );
+
   it("stops the tracked router and clears its session identity for the last routed sandbox (#9098)", async () => {
     const { deps, session } = createDeps();
 
@@ -73,6 +116,7 @@ describe("stopModelRouterForDestroyedSandbox", () => {
 
     expect(deps.stopProcess).toHaveBeenCalledWith(4242, 4100);
     expect(session.routerPid).toBeNull();
+    expect(session.routerPort).toBeNull();
     expect(session.routerCredentialHash).toBeNull();
     expect(session.sandboxName).toBeNull();
     expect(deps.warn).not.toHaveBeenCalled();
@@ -189,9 +233,7 @@ describe("stopModelRouterForDestroyedSandbox", () => {
     } as Session;
     const compareAndSwapSession = vi.fn(
       (matches: (current: Session) => boolean, mutator: (current: Session) => Session | void) => {
-        return matches(reusedNameSession)
-          ? (mutator(reusedNameSession), "updated")
-          : "mismatch";
+        return matches(reusedNameSession) ? (mutator(reusedNameSession), "updated") : "mismatch";
       },
     );
     const { deps } = createDeps({
@@ -264,6 +306,7 @@ describe("stopModelRouterForDestroyedSandbox", () => {
 
     expect(deps.stopProcess).not.toHaveBeenCalled();
     expect(session.routerPid).toBeNull();
+    expect(session.routerPort).toBeNull();
     expect(session.routerCredentialHash).toBeNull();
   });
 
@@ -271,7 +314,7 @@ describe("stopModelRouterForDestroyedSandbox", () => {
     const { deps, session } = createDeps({
       ownsPort: vi.fn(() => false),
       inspectProcessForPort: vi.fn(() => ({ status: "unavailable" as const })),
-      isHealthy: vi.fn(async () => true),
+      isResponsive: vi.fn(async () => true),
     });
 
     await stopModelRouterForDestroyedSandbox(routedSandbox, deps);
@@ -284,11 +327,11 @@ describe("stopModelRouterForDestroyedSandbox", () => {
     expect(deps.warn).toHaveBeenCalledWith(expect.stringContaining("process inventory"));
   });
 
-  it("keeps router recovery identity when no process is visible but the router port stays healthy", async () => {
+  it("keeps router recovery identity when no process is visible but the router port responds", async () => {
     const { deps, session } = createDeps({
       ownsPort: vi.fn(() => false),
       inspectProcessForPort: vi.fn(() => ({ status: "absent" as const })),
-      isHealthy: vi.fn(async () => true),
+      isResponsive: vi.fn(async () => true),
     });
 
     await stopModelRouterForDestroyedSandbox(routedSandbox, deps);
@@ -297,7 +340,7 @@ describe("stopModelRouterForDestroyedSandbox", () => {
     expect(session.routerPid).toBe(4242);
     expect(session.routerCredentialHash).toBe("hash");
     expect(session.sandboxName).toBeNull();
-    expect(deps.warn).toHaveBeenCalledWith(expect.stringContaining("healthy port 4100"));
+    expect(deps.warn).toHaveBeenCalledWith(expect.stringContaining("responsive port 4100"));
   });
 
   it("clears a stale credential hash when the session records no router PID (#9098)", async () => {

@@ -14,11 +14,20 @@ import type { CurlProbeOptions, CurlProbeResult } from "../adapters/http/probe";
 import { runCurlProbe } from "../adapters/http/probe";
 import { normalizeCredentialValue, resolveProviderCredential } from "../credentials/store";
 import { getProviderSelectionConfig } from "./config";
-import type { LocalProviderHealthProbeOptions } from "./local";
-import { probeLocalProviderHealth } from "./local";
-import { MIN_PROBE_REPLY_TOKENS } from "./max-tokens-field";
+import {
+  getResolvedOllamaHost,
+  loadPersistedOllamaHost,
+  type LocalProviderHealthProbeOptions,
+  OLLAMA_PORT,
+  probeOllamaEndpointInventory,
+  probeLocalProviderHealth,
+  type RunCaptureFn,
+} from "./local";
+import { MIN_PROBE_REPLY_TOKENS, resolveProbeReplyTokens } from "./max-tokens-field";
 import { getChatCompletionsProbeCurlArgs } from "./onboard-probes";
+import { usesNvidiaEndpointProbePayload } from "./openai-probe-models";
 import { BUILD_ENDPOINT_URL } from "./provider-models";
+import { RETRIABLE_HTTP_PROBE_STATUSES } from "./probe/transient-http-policy";
 
 export interface ProviderHealthStatus {
   ok: boolean;
@@ -27,6 +36,8 @@ export interface ProviderHealthStatus {
   endpoint: string;
   detail: string;
   failureLabel?: "unreachable" | "unhealthy" | "unauthorized";
+  /** A trusted upstream transient result, not proof that the route is broken. */
+  degraded?: true;
   /**
    * Short qualifier rendered as `Inference (<probeLabel>):` so multi-hop
    * health (e.g. ollama backend vs. auth proxy) surfaces in the status
@@ -52,10 +63,35 @@ export interface ProviderHealthProbeOptions {
   model?: string | null;
   getCredentialImpl?: (envName: string) => string | null | undefined;
   isWsl?: boolean;
+  /** Sandbox route endpoint recorded at onboard; selects the bearerless local vLLM host port. */
+  recordedEndpointUrl?: string | null;
+}
+
+export type OllamaHostInventoryProbeOptions = {
+  getOllamaHost?: () => string;
+  runCaptureImpl?: RunCaptureFn;
+  prepareDockerEnvironment?: Parameters<typeof probeOllamaEndpointInventory>[3];
+};
+
+/** Probe the persisted raw Ollama daemon through its platform-specific host transport. */
+export function probeOllamaHostInventory(options: OllamaHostInventoryProbeOptions = {}): {
+  endpoint: string;
+  inventory: string[] | null;
+} {
+  const host = options.getOllamaHost
+    ? options.getOllamaHost()
+    : (loadPersistedOllamaHost() ?? getResolvedOllamaHost());
+  const endpoint = `http://${host}:${OLLAMA_PORT}/api/tags`;
+  const inventory = probeOllamaEndpointInventory(
+    host,
+    options.runCaptureImpl,
+    5_000,
+    options.prepareDockerEnvironment,
+  );
+  return { endpoint, inventory };
 }
 
 const COMPATIBLE_PROVIDERS = new Set(["compatible-endpoint", "compatible-anthropic-endpoint"]);
-const NVIDIA_MANAGED_PROVIDERS = new Set(["nvidia-prod", "nvidia-nim"]);
 const NVIDIA_HEALTH_CREDENTIAL_ENV = "NVIDIA_INFERENCE_API_KEY";
 const HEALTH_PROBE_CONNECT_TIMEOUT_SECONDS = "3";
 const HEALTH_PROBE_MAX_TIME_SECONDS = "5";
@@ -106,35 +142,24 @@ function useStatusProbeTiming(argv: string[]): string[] {
   );
 }
 
-function capStatusProbeOutput(argv: string[]): string[] {
-  const next = [...argv];
-  const dataIndex = next.indexOf("-d");
-  if (dataIndex < 0 || dataIndex + 1 >= next.length) return next;
-  const payload = parseJsonRecord(next[dataIndex + 1]);
-  if (!payload) return next;
-  if ("max_tokens" in payload) payload.max_tokens = HEALTH_PROBE_MAX_TOKENS;
-  if ("max_completion_tokens" in payload) {
-    payload.max_completion_tokens = HEALTH_PROBE_MAX_TOKENS;
-  }
-  next[dataIndex + 1] = JSON.stringify(payload);
-  return next;
-}
-
+/** Build curl arguments for an authenticated chat-completions health probe. */
 function buildChatCompletionsStatusProbeCurlArgs(
   model: string,
   endpoint: string,
   authArgs: readonly string[],
   isWsl?: boolean,
+  useNvidiaEndpointProbePayload = false,
+  replyBudget: number = HEALTH_PROBE_MAX_TOKENS,
 ): string[] {
-  const args = capStatusProbeOutput(
-    useStatusProbeTiming(
-      getChatCompletionsProbeCurlArgs({
-        credentialArgs: [],
-        model,
-        url: endpoint,
-        isWsl,
-      }),
-    ),
+  const args = useStatusProbeTiming(
+    getChatCompletionsProbeCurlArgs({
+      credentialArgs: [],
+      model,
+      url: endpoint,
+      isWsl,
+      useNvidiaEndpointProbePayload,
+      replyBudget,
+    }),
   );
   const url = args.pop() || endpoint;
   return [...args, ...authArgs, url];
@@ -216,13 +241,13 @@ function hasValidChatMessageFields(
   allowStreamingDelta: boolean,
 ): boolean {
   let recognizedField = false;
-  for (const field of ["content", "reasoning_content", "refusal"] as const) {
+  for (const field of ["content", "reasoning_content", "reasoning", "refusal"] as const) {
     if (!(field in message)) continue;
-    recognizedField = true;
     const value = message[field];
     const valid =
       field === "content" ? isValidChatContent(value) : value === null || typeof value === "string";
     if (!valid) return false;
+    if (value !== null) recognizedField = true;
   }
   if ("tool_calls" in message) {
     const toolCalls = message.tool_calls;
@@ -289,7 +314,7 @@ function validateChatCompletionsResponse(body: string): InferenceResponseValidat
     return hasChatCompletionsChoice(parsed, false)
       ? { ok: true }
       : notChatCompletionsResult(
-          "no choice carried a message with text content, a refusal, or tool calls",
+          "no choice carried a message with text content, reasoning_content, reasoning, a refusal, or tool calls",
         );
   }
 
@@ -390,6 +415,7 @@ function validateInvocationProbeResult(
 function isHealthProbeTimeout(result: CurlProbeResult): boolean {
   return (
     !result.ok &&
+    result.httpStatus === 0 &&
     (result.curlStatus === CURL_TIMEOUT_STATUS || result.curlStatus === NODE_SPAWN_TIMEOUT_STATUS)
   );
 }
@@ -420,6 +446,14 @@ function buildInvocationProbeDetail(
       `as proof that the model ran. (${result.message})`
     );
   }
+  if (classifyHealthProbeFailureLabel(result) === "unauthorized") {
+    return (
+      `${endpoint} rejected the ${route} request. ` +
+      `This probe authenticates with the host credential in ${credentialEnv}, not the provider ` +
+      `credential stored in the gateway. Check ${credentialEnv} where you run this command. ` +
+      `(${result.message})`
+    );
+  }
   return (
     `${route} at ${endpoint} did not succeed. ` +
     `Check your network connection or ${credentialEnv}. (${result.message})`
@@ -447,16 +481,35 @@ function timedOutHealthStatus(
   endpoint: string,
   credentialEnv: string,
   result: CurlProbeResult,
+  nvidia: boolean,
 ): ProviderHealthStatus {
   return {
     ok: true,
     probed: false,
+    ...(nvidia ? { degraded: true as const } : {}),
     providerLabel,
     endpoint,
     detail:
       `${providerLabel} model-invocation probe did not finish within the ` +
       `${HEALTH_PROBE_MAX_TIME_SECONDS}s status budget; model health was not verified. ` +
-      `Check your network connection or ${credentialEnv}. (${result.message})`,
+      (nvidia
+        ? `The upstream may be temporarily unavailable. (${result.message})`
+        : `Check your network connection or ${credentialEnv}. (${result.message})`),
+  };
+}
+
+function transientNvidiaHealthStatus(
+  providerLabel: string,
+  endpoint: string,
+  result: CurlProbeResult,
+): ProviderHealthStatus {
+  return {
+    ok: true,
+    probed: false,
+    degraded: true,
+    providerLabel,
+    endpoint,
+    detail: `${providerLabel} upstream returned HTTP ${result.httpStatus}; model inference was not verified.`,
   };
 }
 
@@ -492,6 +545,8 @@ function probeChatCompletionsProviderHealth(
   credentialEnv: string,
   endpoint: string,
   options: ProviderHealthProbeOptions,
+  useNvidiaEndpointProbePayload = false,
+  replyBudget: number = HEALTH_PROBE_MAX_TOKENS,
 ): ProviderHealthStatus {
   let apiKey = "";
   try {
@@ -515,7 +570,14 @@ function probeChatCompletionsProviderHealth(
   const rawResult = (() => {
     try {
       return runCurlProbeImpl(
-        buildChatCompletionsStatusProbeCurlArgs(model, endpoint, authConfig.args, options.isWsl),
+        buildChatCompletionsStatusProbeCurlArgs(
+          model,
+          endpoint,
+          authConfig.args,
+          options.isWsl,
+          useNvidiaEndpointProbePayload,
+          replyBudget,
+        ),
         { trustedConfigFiles: authConfig.trustedConfigFiles },
       );
     } finally {
@@ -523,7 +585,20 @@ function probeChatCompletionsProviderHealth(
     }
   })();
   if (isHealthProbeTimeout(rawResult)) {
-    return timedOutHealthStatus(providerLabel, endpoint, credentialEnv, rawResult);
+    return timedOutHealthStatus(
+      providerLabel,
+      endpoint,
+      credentialEnv,
+      rawResult,
+      useNvidiaEndpointProbePayload,
+    );
+  }
+  if (
+    useNvidiaEndpointProbePayload &&
+    rawResult.curlStatus === 0 &&
+    RETRIABLE_HTTP_PROBE_STATUSES.has(rawResult.httpStatus)
+  ) {
+    return transientNvidiaHealthStatus(providerLabel, endpoint, rawResult);
   }
   const result = validateInvocationProbeResult(rawResult, validateChatCompletionsResponse);
   const healthy = result.ok;
@@ -590,7 +665,7 @@ function probeAnthropicMessagesProviderHealth(
     }
   })();
   if (isHealthProbeTimeout(rawResult)) {
-    return timedOutHealthStatus(providerLabel, endpoint, credentialEnv, rawResult);
+    return timedOutHealthStatus(providerLabel, endpoint, credentialEnv, rawResult, false);
   }
   const result = validateInvocationProbeResult(rawResult, validateAnthropicMessagesResponse);
   const healthy = result.ok;
@@ -644,13 +719,15 @@ export function probeRemoteProviderHealth(
 
   if (!config?.model) return null;
 
-  if (NVIDIA_MANAGED_PROVIDERS.has(provider)) {
+  if (usesNvidiaEndpointProbePayload(provider)) {
     return probeChatCompletionsProviderHealth(
       providerLabel,
       config.model,
       NVIDIA_HEALTH_CREDENTIAL_ENV,
       `${BUILD_ENDPOINT_URL}/chat/completions`,
       options,
+      true,
+      resolveProbeReplyTokens(provider, config.model),
     );
   }
 
@@ -671,6 +748,8 @@ export function probeRemoteProviderHealth(
       config.credentialEnv,
       GEMINI_CHAT_COMPLETIONS_ENDPOINT,
       options,
+      false,
+      resolveProbeReplyTokens(provider),
     );
   }
 
@@ -698,6 +777,7 @@ export function probeProviderHealth(
   const localOptions: LocalProviderHealthProbeOptions = {
     model: options.model,
     runCurlProbeImpl: options.runCurlProbeImpl,
+    recordedEndpointUrl: options.recordedEndpointUrl,
   };
   const local = probeLocalProviderHealth(provider, localOptions);
   if (local) {

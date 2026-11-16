@@ -1,8 +1,48 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import {
+  readHermesSwitchyardRoutingEnvironment,
+  switchyardClientProfile,
+} from "../hermes-switchyard-routing";
+import type { ProviderSelectionResult } from "./machine/handlers/provider-inference";
+
+/** A routing file supplies the model selection; do not run the ordinary provider picker. */
+export function resolveSwitchyardProviderSelection(
+  environment: NodeJS.ProcessEnv,
+  agent: string | null | undefined,
+): ProviderSelectionResult | null {
+  const routing = readHermesSwitchyardRoutingEnvironment(environment);
+  if (!routing) return null;
+  if (agent !== "hermes") throw new Error("Switchyard provider selection requires Hermes.");
+  const profile = switchyardClientProfile(routing.capable.provider);
+  return {
+    model: routing.capable.model,
+    provider: routing.capable.provider,
+    endpointUrl: profile.baseUrl,
+    credentialEnv: profile.apiKeyEnv,
+    hermesAuthMethod: null,
+    hermesToolGateways: [],
+    preferredInferenceApi: null,
+    compatibleEndpointReasoning: null,
+    compatibleEndpointReasoningEffort: null,
+    nimContainer: null,
+  };
+}
+
+import {
+  selectedModelProvenance,
+  type ModelSelectionProvenance,
+} from "../domain/telemetry/provenance";
+import { isBedrockRuntimeEndpoint } from "../inference/bedrock-runtime";
 import { type ProviderOption, resolveProviderKeyFallback } from "./provider-key-fallback";
 import { providerNameToOptionKey, type RemoteProviderConfigEntryLike } from "./provider-recovery";
+
+export {
+  applyVllmInstallResumeDefaults,
+  readVllmInstallResumeModel,
+  vllmInstallRecoveryOptions,
+} from "./provider-recovery";
 
 export type ProviderSelectionFailureReason =
   | {
@@ -43,21 +83,38 @@ export type ProviderSelectionResolution<T extends ProviderOption> =
   | ProviderSelectionSuccess<T>
   | ProviderSelectionFailure;
 
+export function resolveSelectedEndpointSource(input: {
+  provider: string;
+  endpointUrl: string | null;
+  hasPinnedAddresses: boolean;
+  hasTrustedPrivateCapability: boolean;
+}): "onboard" | null {
+  if (input.hasPinnedAddresses || input.hasTrustedPrivateCapability) return "onboard";
+  if (input.provider !== "compatible-anthropic-endpoint") return null;
+  return isBedrockRuntimeEndpoint(input.endpointUrl) ? "onboard" : null;
+}
+
 export interface ProviderSelectionRecoveryReaders {
   readRecordedProvider(sandboxName: string | null | undefined): string | null;
   readRecordedNimContainer(sandboxName: string | null | undefined): string | null;
+  readRecordedManagedLlamaCpp?(sandboxName: string | null | undefined): boolean;
+  readRecordedManagedLlamaCppRecipeId?(sandboxName: string | null | undefined): string | null;
   readRecordedModel(sandboxName: string | null | undefined): string | null;
 }
 
-export interface ResolveRequestedProviderSelectionInput<T extends ProviderOption>
-  extends ProviderSelectionRecoveryReaders {
+export interface ResolveRequestedProviderSelectionInput<
+  T extends ProviderOption,
+> extends ProviderSelectionRecoveryReaders {
   options: T[];
   requestedProvider: string | null;
   sandboxName: string | null;
   remoteProviderConfig: Record<string, RemoteProviderConfigEntryLike>;
   isWsl: boolean;
   isWindowsHostOllama: boolean;
+  /** True when the selected container runtime can route to the Windows host. */
   windowsHostOllamaSupported: boolean;
+  /** True only when a Docker Desktop container reached the Windows daemon. */
+  windowsHostOllamaReachable?: boolean;
   hermesProviderAvailable: boolean;
   /**
    * True when the onboard probe already reached a live Ollama daemon, on
@@ -65,32 +122,22 @@ export interface ResolveRequestedProviderSelectionInput<T extends ProviderOption
    * probe result, which leaves an install request untouched.
    */
   ollamaRunning?: boolean;
-  /**
-   * On a platform where managed vLLM is the approved non-interactive default,
-   * an onboard with no requested/recorded provider should auto-select local
-   * vLLM instead of falling back to cloud `build` (#7293).
-   */
-  preferManagedVllmDefault?: boolean;
+  /** Platform-qualified default used only when no provider was requested or recorded. */
+  platformDefaultProviderKey?: "install-llama-cpp" | "install-ollama" | "install-vllm";
 }
 
-function findOption<T extends ProviderOption>(options: T[], key: string): T | undefined {
-  return options.find((option) => option.key === key);
-}
-
-/**
- * On a managed-vLLM-default platform (#7293), pick the available local vLLM menu
- * option: `vllm` when a server is already running (the menu exposes only that
- * entry), otherwise the managed install `install-vllm`. Returns null when the
- * preference is off or neither entry is present, so the caller falls back to
- * cloud `build`.
- */
-function resolveManagedVllmDefaultKey<T extends ProviderOption>(
-  input: ResolveRequestedProviderSelectionInput<T>,
-): string | null {
-  if (!input.preferManagedVllmDefault) return null;
-  if (findOption(input.options, "vllm")) return "vllm";
-  if (findOption(input.options, "install-vllm")) return "install-vllm";
-  return null;
+function findOption<T extends ProviderOption>(
+  options: T[],
+  key: string,
+  managedLlamaCppRecipeId: string | null = null,
+): T | undefined {
+  return options.find(
+    (option) =>
+      option.key === key &&
+      (managedLlamaCppRecipeId === null ||
+        (option as ProviderOption & { managedLlamaCppRecipeId?: string })
+          .managedLlamaCppRecipeId === managedLlamaCppRecipeId),
+  );
 }
 
 function findWindowsHostKey(options: ProviderOption[]): string | null {
@@ -107,15 +154,10 @@ function isWindowsHostOllamaRequest(providerKey: string): boolean {
 
 /**
  * A daemon that already answers on the Ollama port makes a Windows-host install
- * request unnecessary. Express emits `install-windows-ollama` from a Docker-only
- * check that never probes Ollama (`scripts/install.sh`), so the key arrives even
- * while the daemon is running. Under WSL mirrored networking the Windows daemon
- * answers on loopback, `isWindowsHostOllama` reads false, the menu keeps the
- * install entry, and onboarding reinstalls through PowerShell interop — the same
- * interop whose failure produced the false "no Windows Ollama" reading (#7472).
- *
- * Keyed on the observed daemon rather than on the networking mode, so a future
- * WSL networking mode needs no new condition here.
+ * request unnecessary only when Docker can reach that daemon. Express emits
+ * `install-windows-ollama` from a Docker-topology check that does not probe
+ * Ollama, so the key can arrive while a Windows daemon still binds to loopback.
+ * Route that state through the existing restart action before model selection.
  *
  * Scoped to the Windows-host key on purpose. This helper does not touch
  * `install-ollama`: `resolveOllamaInstallMenuEntry` keeps that entry for a
@@ -131,6 +173,9 @@ function collapseWindowsInstallToRunningDaemon<T extends ProviderOption>(
   // integration for the sandbox to reach it. Leave that request to the
   // unsupported-runtime rejection below instead of silently reusing it.
   if (input.isWindowsHostOllama && !input.windowsHostOllamaSupported) return undefined;
+  if (input.isWindowsHostOllama && input.windowsHostOllamaReachable !== true) {
+    return findOption(input.options, "start-windows-ollama");
+  }
   return findOption(input.options, "ollama");
 }
 
@@ -140,16 +185,27 @@ export function resolveRequestedProviderSelection<T extends ProviderOption>(
   let providerKey = input.requestedProvider;
   let recoveredFromSandbox = false;
   let recoveredModel: string | null = null;
+  let recoveredSelection: T | undefined;
+  const canUseWindowsHostOllama =
+    input.isWindowsHostOllama &&
+    input.windowsHostOllamaSupported &&
+    input.windowsHostOllamaReachable === true;
 
   if (!providerKey) {
     const recordedProvider = input.readRecordedProvider(input.sandboxName);
     const hasNimContainer = !!input.readRecordedNimContainer(input.sandboxName);
     const recoveredKey = providerNameToOptionKey(input.remoteProviderConfig, recordedProvider, {
+      hasManagedLlamaCpp: input.readRecordedManagedLlamaCpp?.(input.sandboxName) ?? false,
       hasNimContainer,
     });
 
     if (recoveredKey) {
-      if (input.isWsl && recordedProvider === "ollama-local" && input.isWindowsHostOllama) {
+      if (
+        input.isWsl &&
+        recordedProvider === "ollama-local" &&
+        input.isWindowsHostOllama &&
+        !canUseWindowsHostOllama
+      ) {
         return {
           kind: "failure",
           reason: {
@@ -159,7 +215,15 @@ export function resolveRequestedProviderSelection<T extends ProviderOption>(
         };
       }
 
-      if (!findOption(input.options, recoveredKey)) {
+      const recordedRecipeId =
+        recoveredKey === "install-llama-cpp"
+          ? (input.readRecordedManagedLlamaCppRecipeId?.(input.sandboxName) ?? null)
+          : null;
+      recoveredSelection =
+        recoveredKey === "install-llama-cpp" && recordedRecipeId === null
+          ? undefined
+          : findOption(input.options, recoveredKey, recordedRecipeId);
+      if (!recoveredSelection) {
         return {
           kind: "failure",
           reason: {
@@ -175,10 +239,36 @@ export function resolveRequestedProviderSelection<T extends ProviderOption>(
       recoveredFromSandbox = true;
       recoveredModel = input.readRecordedModel(input.sandboxName);
     } else {
-      // Prefer managed local vLLM when the caller has approved that platform
-      // default; otherwise fall back to cloud NVIDIA Endpoints (#7293).
-      providerKey = resolveManagedVllmDefaultKey(input) ?? "build";
+      const platformDefault = input.platformDefaultProviderKey;
+      providerKey =
+        platformDefault &&
+        (findOption(input.options, platformDefault) ||
+          resolveProviderKeyFallback(input.options, platformDefault, {
+            canUseWindowsHostOllama,
+          }))
+          ? platformDefault
+          : "build";
     }
+  }
+
+  if (providerKey === "ollama" && input.isWindowsHostOllama && !canUseWindowsHostOllama) {
+    if (!input.windowsHostOllamaSupported) {
+      return {
+        kind: "failure",
+        reason: {
+          kind: "unsupported-windows-host-ollama",
+          providerKey,
+        },
+      };
+    }
+    const restart = findOption(input.options, "start-windows-ollama");
+    if (restart) {
+      return { kind: "selected", selected: restart, recoveredFromSandbox, recoveredModel };
+    }
+    return {
+      kind: "failure",
+      reason: { kind: "requested-provider-unavailable", providerKey },
+    };
   }
 
   const runningDaemon = collapseWindowsInstallToRunningDaemon(input, providerKey);
@@ -186,7 +276,7 @@ export function resolveRequestedProviderSelection<T extends ProviderOption>(
     return { kind: "selected", selected: runningDaemon, recoveredFromSandbox, recoveredModel };
   }
 
-  const selected = findOption(input.options, providerKey);
+  const selected = recoveredSelection ?? findOption(input.options, providerKey);
   if (selected) {
     return { kind: "selected", selected, recoveredFromSandbox, recoveredModel };
   }
@@ -206,7 +296,7 @@ export function resolveRequestedProviderSelection<T extends ProviderOption>(
   }
 
   const fallback = resolveProviderKeyFallback(input.options, providerKey, {
-    canUseWindowsHostOllama: input.isWindowsHostOllama && input.windowsHostOllamaSupported,
+    canUseWindowsHostOllama,
   });
   if (fallback) {
     return {
@@ -231,4 +321,33 @@ export function resolveRequestedProviderSelection<T extends ProviderOption>(
       providerKey,
     },
   };
+}
+
+export interface SelectedModelOrigin {
+  model: string;
+  provider: string;
+  source: ModelSelectionProvenance["modelSource"];
+}
+
+/** Bind a proven picker origin, explicit request, or selected local runtime to its route. */
+export function selectedProviderModelProvenance(
+  input: Parameters<typeof selectedModelProvenance>[0] & {
+    requestedModel?: string | null;
+    selectedModelOrigin?: SelectedModelOrigin;
+  },
+): { modelSelectionProvenance?: ModelSelectionProvenance } {
+  const { requestedModel, selectedModelOrigin, ...route } = input;
+  const modelSource = ["ollama-local", "vllm-local", "llama-cpp-local", "nvidia-nim"].includes(
+    route.provider ?? "",
+  )
+    ? "local"
+    : selectedModelOrigin &&
+        selectedModelOrigin.provider === route.provider &&
+        selectedModelOrigin.model === route.model
+      ? selectedModelOrigin.source
+      : requestedModel === route.model
+        ? "custom"
+        : undefined;
+  const provenance = modelSource ? selectedModelProvenance({ ...route, modelSource }) : undefined;
+  return provenance ? { modelSelectionProvenance: provenance } : {};
 }

@@ -34,7 +34,7 @@ describe("rebuildSandbox flow: target credentials", () => {
 
   it("rejects recorded web search when the target agent does not support it", async () => {
     const harness = createRebuildFlowHarness({
-      sandboxEntry: { agent: "hermes", webSearchEnabled: true },
+      sandboxEntry: { agent: "hermes", provider: "build", webSearchEnabled: true },
     });
 
     await expect(
@@ -42,77 +42,6 @@ describe("rebuildSandbox flow: target credentials", () => {
     ).rejects.toThrow("Recorded Brave Search is unsupported");
 
     expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
-  });
-
-  it("rejects a Tavily credential already owned by MCP before rebuild mutation", async () => {
-    const harness = createRebuildFlowHarness({
-      sandboxEntry: {
-        webSearchEnabled: true,
-        webSearchProvider: "tavily",
-        mcp: {
-          bridges: {
-            search: {
-              server: "search",
-              agent: "openclaw",
-              url: "https://mcp.example.com/mcp",
-              env: ["TAVILY_API_KEY"],
-              policyName: "alpha-mcp-search",
-              addedAt: "2026-07-03T00:00:00.000Z",
-            },
-          },
-        },
-      },
-    });
-
-    await expect(
-      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
-    ).rejects.toThrow("Web Search and MCP credential ownership conflict");
-
-    expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
-    expect(harness.prepareMcpBridgesForRebuildSpy).not.toHaveBeenCalled();
-    expectNoSandboxDelete(harness.runOpenshellSpy);
-  });
-
-  it("preserves legacy Brave web search during a nonmatching-session rebuild", async () => {
-    const harness = createRebuildFlowHarness({
-      applyPreset: () => true,
-      sandboxEntry: { policies: ["brave"], webSearchEnabled: undefined },
-      sessionSandboxName: "some-other-sandbox",
-    });
-
-    await expect(
-      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
-    ).resolves.toBeUndefined();
-
-    expect(harness.ensureValidatedBraveSearchCredentialSpy).toHaveBeenCalledWith(
-      { fetchEnabled: true, provider: "brave" },
-      true,
-    );
-    expect(harness.session.webSearchConfig).toEqual({ fetchEnabled: true, provider: "brave" });
-  });
-
-  it("reconciles stale Brave policy state to the durable Tavily provider", async () => {
-    const harness = createRebuildFlowHarness({
-      applyPreset: (name) => name === "tavily",
-      backupPolicyPresets: ["brave"],
-      sandboxEntry: {
-        policies: ["brave"],
-        webSearchEnabled: true,
-        webSearchProvider: "tavily",
-      },
-      sessionSandboxName: "some-other-sandbox",
-    });
-
-    await expect(
-      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
-    ).resolves.toBeUndefined();
-
-    expect(harness.applyPresetSpy).toHaveBeenCalledWith("alpha", "tavily");
-    expect(harness.applyPresetSpy).not.toHaveBeenCalledWith("alpha", "brave");
-    expect(harness.session.webSearchConfig).toEqual({
-      fetchEnabled: true,
-      provider: "tavily",
-    });
   });
 
   it("restores the caller Tavily credential environment after rebuild", async () => {

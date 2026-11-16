@@ -40,6 +40,8 @@ export interface HostLocalInferenceEndpointInput {
   readonly networkId: string;
   /** Exact bridge gateway listener used by provider-network probes. */
   readonly networkGatewayIp: string;
+  /** Optional qualified host listener when it differs from the bridge IPAM gateway. */
+  readonly networkListenerIp?: string;
   readonly hostPort: number;
   readonly probeImageRef: string;
   /** Secret-free provider-native model identity used for a real inference proof. */
@@ -62,13 +64,15 @@ export interface HostLocalInferenceMount {
 }
 
 export interface HostLocalManagedInferenceInput extends HostLocalInferenceEndpointInput {
-  readonly service: "nim" | "vllm";
+  readonly service: "ollama" | "nim" | "vllm";
   readonly containerName: string;
   readonly containerPort: number;
   readonly imageRef: string;
   readonly gpuDevices: readonly string[];
   /** Environment variable names forwarded from the current process; values are never persisted. */
   readonly environment?: readonly string[];
+  /** Exact non-secret Ollama daemon context window persisted as managed runtime authority. */
+  readonly ollamaContextLength?: number;
   readonly mounts?: readonly HostLocalInferenceMount[];
   readonly sharedMemory?: string;
   readonly ipc?: "host" | "private";
@@ -81,10 +85,11 @@ export interface HostLocalInferenceLegacyEndpointAuthority {
   readonly networkName: string;
 }
 
-export interface HostLocalInferenceProofEndpointAuthority
-  extends HostLocalInferenceLegacyEndpointAuthority {
+export interface HostLocalInferenceProofEndpointAuthority extends HostLocalInferenceLegacyEndpointAuthority {
   readonly networkId: string;
   readonly networkGatewayIp: string;
+  /** Qualified host listener used by Portable sandboxes and provider probes. */
+  readonly networkListenerIp?: string;
   /** Digest of the exact inspected bridge configuration and ownership labels. */
   readonly networkAuthoritySha256: string;
 }
@@ -126,6 +131,8 @@ export type HostLocalInferenceRuntimeAuthority =
       readonly specSha256: string;
       /** Digest of the exact provider-translated create argv recorded by the engine. */
       readonly launchSha256?: string;
+      /** Provider-native digest of the exact model placed inside managed Ollama. */
+      readonly modelDigest?: string;
       /**
        * Declarative model identity for runtimes that bind one verified local
        * artifact. Host paths and executor-only filesystem identity never enter
@@ -234,9 +241,15 @@ export function hostLocalInferenceRollbackStatus(
 export type HostLocalInferencePublicationState = "unpublished" | "indeterminate" | "published";
 
 /**
- * Operation-scoped startup transaction. The provider returns this only after
- * Ready, GPU, and real inference proofs pass. Central routing commits the
- * receipt after its own route mutation, or restores the exact prior runtime.
+ * Operation-scoped startup transaction. Central routing validates the
+ * provider before its own route mutation, then commits the receipt or restores
+ * the exact prior runtime.
+ *
+ * The experimental published-resume path may return after starting the exact
+ * receipt-owned runtime but before its Ready and GPU proofs. That interval is
+ * deliberately unpublished and rollback-safe: the caller must validate then
+ * finalize, or roll back. If the caller is interrupted, the next recovery
+ * reconciles the same exact running receipt-owned runtime before publication.
  */
 export interface HostLocalInferencePreparedStartup {
   readonly receipt: HostLocalInferenceReceipt;
@@ -244,10 +257,21 @@ export interface HostLocalInferencePreparedStartup {
   readonly rollbackPriorState: HostLocalInferencePriorRuntimeState;
   /** Durable publication state used to decide whether exact rollback is still safe. */
   publicationState(): HostLocalInferencePublicationState;
-  /** Fresh provider-native proof while rollback is still safe. */
+  /**
+   * Revalidate the prepared runtime while rollback is still safe. Published
+   * recovery may defer semantic provider health to its caller's exact managed
+   * route proof; creation and ordinary recovery retain full provider-native
+   * validation.
+   */
   validateBeforeCommit(): HostLocalInferenceReceipt;
   /** Cross only the external publication boundary after validation succeeds. */
   commit(): HostLocalInferenceReceipt;
+  /**
+   * Finalize an exact published-runtime resume without writing the already
+   * published receipt again. The provider keeps rollback available until the
+   * caller's final published-authority assertion succeeds.
+   */
+  finalizePublishedResume?(assertPublishedAuthority: () => void): HostLocalInferenceReceipt;
   rollback(): HostLocalInferenceStartupRollbackResult;
 }
 
@@ -260,7 +284,9 @@ export interface HostLocalLlamaCppLifecycleInput {
   readonly authorityStore: PersistedEngineAuthorityStore;
   readonly apiKeyRootHostPath: string;
   readonly bindingSha256: string;
-  readonly bindings: LlamaCppHostLocalRuntimeBindings & { readonly hostPort: number };
+  readonly bindings: LlamaCppHostLocalRuntimeBindings & {
+    readonly hostPort: number;
+  };
   readonly cacheRootHostPath: string;
   readonly contract: LlamaCppHostLocalLaunchContract;
   readonly engine: ContainerEngine;
@@ -286,6 +312,66 @@ export interface HostLocalInferenceOperationInput {
   readonly env: NodeJS.ProcessEnv;
   /** Accepted request scope when constructing a managed local-inference operation. */
   readonly acceleration?: HostLocalOllamaAccelerationAuthority;
+  /** Shared absolute deadline for every provider observation in this operation. */
+  readonly deadlineMs?: number;
+}
+
+function remainingHostLocalInferenceBudget(deadlineMs: number): number {
+  const remainingMs = Math.floor(deadlineMs - Date.now());
+  if (remainingMs <= 0) {
+    throw new Error("host-local inference authority deadline expired");
+  }
+  return remainingMs;
+}
+
+/** Cap a streamed provider command to the same remaining lifecycle budget. */
+export function deadlineBoundHostLocalInferenceSpawner(
+  spawnCommand: HostLocalInferenceCommandSpawner,
+  deadlineMs?: number,
+): HostLocalInferenceCommandSpawner {
+  if (deadlineMs === undefined) return spawnCommand;
+  return (args, options) => {
+    const remainingMs = remainingHostLocalInferenceBudget(deadlineMs);
+    const requestedMs = options?.timeout;
+    const timeout =
+      requestedMs === undefined || requestedMs <= 0
+        ? remainingMs
+        : Math.min(requestedMs, remainingMs);
+    return spawnCommand(args, {
+      ...options,
+      timeout,
+      killSignal: options?.killSignal ?? "SIGKILL",
+    });
+  };
+}
+
+/** Cap every provider command to the remaining shared lifecycle budget. */
+export function deadlineBoundHostLocalInferenceEngine<T extends ContainerEngine>(
+  engine: T,
+  deadlineMs?: number,
+): T {
+  if (deadlineMs === undefined) return engine;
+  const timeout = (requestedMs?: number): number => {
+    const remainingMs = remainingHostLocalInferenceBudget(deadlineMs);
+    return requestedMs === undefined ? remainingMs : Math.min(requestedMs, remainingMs);
+  };
+  return Object.freeze({
+    ...engine,
+    capture: (args: readonly string[], timeoutMs?: number, input?: Buffer) =>
+      engine.capture(args, timeout(timeoutMs), input),
+    ...(engine.captureWithEnvironment === undefined
+      ? {}
+      : {
+          captureWithEnvironment: (
+            args: readonly string[],
+            environment: Readonly<Record<string, string>>,
+            timeoutMs?: number,
+            input?: Buffer,
+          ) => engine.captureWithEnvironment!(args, environment, timeout(timeoutMs), input),
+        }),
+    captureHost: (args: readonly string[], timeoutMs?: number) =>
+      engine.captureHost(args, timeout(timeoutMs)),
+  }) as T;
 }
 
 /**
@@ -297,6 +383,8 @@ export interface HostLocalInferenceOperation {
   readonly providerId: string;
   readonly engine: ContainerEngine;
   readonly bindingSha256: string;
+  /** Recheck the pinned executable and endpoint without repeating full provider qualification. */
+  readonly assertTransactionCurrent?: () => void;
   readonly assertAuthority: () => void;
   readonly spawn: HostLocalInferenceCommandSpawner;
   readonly createLlamaCppLifecycle: (
@@ -331,6 +419,29 @@ export interface HostLocalInferenceRuntime {
     receipt: HostLocalInferenceReceipt,
     writer: HostLocalInferenceReceiptWriter,
   ): HostLocalInferencePreparedStartup;
+  /** Reinspect a failed published resume using only exact rollback-safe authority. */
+  inspectPublishedRecoveryRestoration?(
+    receipt: HostLocalInferenceReceipt,
+  ): HostLocalManagedInferenceInspection;
+  /** Reinspect one published recovery through its retained transaction authority. */
+  inspectPublishedRecoveryCurrent?(
+    receipt: HostLocalInferenceReceipt,
+  ): HostLocalManagedInferenceInspection;
+  /**
+   * Admit one exact published runtime for connect recovery through the
+   * operation authority already qualified by the lifecycle owner. This path
+   * returns a detached transaction snapshot and never creates a second
+   * operation or falls back to generic destroy authority.
+   */
+  preparePublishedRecoveryEntry?(
+    receipt: HostLocalInferenceReceipt,
+  ): HostLocalManagedInferenceInspection;
+  /**
+   * Re-prove exact published-runtime authority and GPU identity before the
+   * caller performs its final managed route health proof. This path never
+   * replaces creation-time or explicit deep inference qualification.
+   */
+  validatePublishedResume?(receipt: HostLocalInferenceReceipt): HostLocalInferenceReceipt;
   inspectManaged(receipt: HostLocalInferenceReceipt): HostLocalManagedInferenceInspection;
   stopManaged(receipt: HostLocalInferenceReceipt): HostLocalManagedInferenceInspection;
   /**
@@ -433,7 +544,17 @@ function normalizeEndpoint(
   exactKeys(
     endpoint,
     proofReceipt
-      ? ["host", "networkAuthoritySha256", "networkGatewayIp", "networkId", "networkName", "port"]
+      ? "networkListenerIp" in endpoint
+        ? [
+            "host",
+            "networkAuthoritySha256",
+            "networkGatewayIp",
+            "networkId",
+            "networkListenerIp",
+            "networkName",
+            "port",
+          ]
+        : ["host", "networkAuthoritySha256", "networkGatewayIp", "networkId", "networkName", "port"]
       : ["host", "networkName", "port"],
     "endpoint authority",
   );
@@ -447,6 +568,11 @@ function normalizeEndpoint(
     ...common,
     networkId: exactText(endpoint.networkId, SHA256, "endpoint network identity"),
     networkGatewayIp: exactIpv4(endpoint.networkGatewayIp, "endpoint network gateway"),
+    ...("networkListenerIp" in endpoint
+      ? {
+          networkListenerIp: exactIpv4(endpoint.networkListenerIp, "endpoint network listener"),
+        }
+      : {}),
     networkAuthoritySha256: exactText(
       endpoint.networkAuthoritySha256,
       SHA256,
@@ -522,21 +648,32 @@ function normalizeRuntime(
     runtime,
     service === "llama-cpp"
       ? ["gpu", "imageRef", "kind", "model", "name", "probeImageRef", "runtimeId", "specSha256"]
-      : proofReceipt
+      : service === "ollama"
         ? [
             "gpu",
             "imageRef",
             "kind",
             "launchSha256",
+            "modelDigest",
             "name",
             "probeImageRef",
             "runtimeId",
             "specSha256",
           ]
-        : ["gpu", "imageRef", "kind", "name", "probeImageRef", "runtimeId", "specSha256"],
+        : proofReceipt
+          ? [
+              "gpu",
+              "imageRef",
+              "kind",
+              "launchSha256",
+              "name",
+              "probeImageRef",
+              "runtimeId",
+              "specSha256",
+            ]
+          : ["gpu", "imageRef", "kind", "name", "probeImageRef", "runtimeId", "specSha256"],
     "container authority",
   );
-  if (service === "ollama") fail("Ollama must use host-process authority");
   const gpu = exactRecord(runtime.gpu, "GPU authority");
   exactKeys(
     gpu,
@@ -549,7 +686,10 @@ function normalizeRuntime(
     | { readonly vendor: "nvidia"; readonly count: 1 };
   if (service === "llama-cpp") {
     if (gpu.count !== 1) fail("llama.cpp GPU authority must identify exactly one GPU");
-    normalizedGpu = Object.freeze({ vendor: "nvidia" as const, count: 1 as const });
+    normalizedGpu = Object.freeze({
+      vendor: "nvidia" as const,
+      count: 1 as const,
+    });
   } else {
     if (!Array.isArray(gpu.devices) || gpu.devices.length === 0) {
       fail("GPU authority must identify NVIDIA devices");
@@ -597,6 +737,11 @@ function normalizeRuntime(
           ),
         }),
     ...(model ? { model } : {}),
+    ...(service === "ollama"
+      ? {
+          modelDigest: exactText(runtime.modelDigest, SHA256_DIGEST, "Ollama model digest"),
+        }
+      : {}),
     gpu: normalizedGpu,
   });
 }
@@ -648,10 +793,13 @@ export function normalizeHostLocalInferenceReceipt(value: unknown): HostLocalInf
     fail("provider identity does not match engine authority");
   }
   const publication = proofReceipt ? normalizePublicationAuthority(receipt.publication) : undefined;
+  const runtime = normalizeRuntime(service, receipt.runtime, proofReceipt);
   if (
     publication !== undefined &&
-    ((service === "ollama" && publication.priorState !== "host-process") ||
-      ((service === "nim" || service === "vllm") && publication.priorState === "host-process"))
+    ((service === "ollama" &&
+      runtime.kind === "host" &&
+      publication.priorState !== "host-process") ||
+      (runtime.kind === "container" && publication.priorState === "host-process"))
   ) {
     fail("receipt publication prior state does not match the service lifecycle");
   }
@@ -661,7 +809,7 @@ export function normalizeHostLocalInferenceReceipt(value: unknown): HostLocalInf
     service,
     engineAuthority,
     endpoint: normalizeEndpoint(receipt.endpoint, proofReceipt),
-    runtime: normalizeRuntime(service, receipt.runtime, proofReceipt),
+    runtime,
     ...(!proofReceipt
       ? {}
       : {

@@ -9,6 +9,7 @@ import { loadServingCatalog, managedInferenceCatalogFromServingCatalog } from ".
 import { resolveManagedInferenceServing } from "./resolver.js";
 import type {
   CompiledServingCatalog,
+  ManagedInferenceReadinessSource,
   ServingPreset,
   ServingRecipe,
   ServingSelectionPolicy,
@@ -23,6 +24,8 @@ export interface ServingProfileListEntry {
   readonly topology: string;
   readonly selectionMode: ServingSelectionPolicy;
   readonly supportState: ServingSupportState;
+  readonly validationLevel?: "schema" | "software" | "hardware" | "unverified";
+  readonly validationEvidence?: string | null;
   readonly estimatedImageDownloadBytes: number | null;
   readonly estimatedModelDownloadBytes: number | null;
   readonly compatible: boolean;
@@ -64,28 +67,43 @@ function supportState(preset: ServingPreset): ServingSupportState {
   return preset.metadata.supportState ?? "experimental";
 }
 
+/**
+ * Onboarding provider that installs a serving backend, or null when onboarding
+ * cannot configure that backend. Profile discovery and `--profile` share this
+ * mapping so a listed compatible profile always has a provider to run through.
+ */
+export function servingBackendProviderKey(backend: string): string | null {
+  switch (backend) {
+    case "vllm":
+      return "install-vllm";
+    case "install-llama-cpp":
+      return "install-llama-cpp";
+    default:
+      return null;
+  }
+}
+
 function compatibility(
   catalog: CompiledServingCatalog,
   preset: ServingPreset,
   recipe: ServingRecipe,
+  readinessReports: readonly ManagedInferenceReadinessSource[],
 ): { compatible: boolean; incompatibilityReason: string | null } {
   if (preset.spec.selection === "disabled" || supportState(preset) === "disabled") {
     return { compatible: false, incompatibilityReason: "Profile is disabled." };
   }
-  if (recipe.spec.backend !== "vllm") {
+  if (servingBackendProviderKey(recipe.spec.backend) === null) {
     return {
       compatible: false,
-      incompatibilityReason: `Backend ${recipe.spec.backend} is not available through Express onboarding yet.`,
+      incompatibilityReason: `Backend ${recipe.spec.backend} is not available through onboarding.`,
     };
   }
+  // Managed vLLM and llama.cpp installation still invoke the Docker-backed
+  // installers. Keep Docker readiness authoritative here until onboarding
+  // starts them through the selected runtime provider's host-local operation.
   const resolution = resolveManagedInferenceServing(
     {
-      readinessReports: [
-        {
-          nodeId: os.hostname(),
-          report: createHostReadinessReport(getBuildIdentity()),
-        },
-      ],
+      readinessReports,
       topologyQualifications: [],
       intent: { preset: preset.metadata.id },
     },
@@ -98,6 +116,7 @@ function compatibility(
 
 export interface ListServingProfilesOptions {
   readonly evaluateCompatibility?: typeof compatibility;
+  readonly readinessReports?: readonly ManagedInferenceReadinessSource[];
 }
 
 export interface ResolveServingProfileOptions {
@@ -150,6 +169,12 @@ export function listServingProfiles(
   catalog: CompiledServingCatalog = loadServingCatalog(),
   options: ListServingProfilesOptions = {},
 ): ServingProfileListEntry[] {
+  const readinessReports = options.readinessReports ?? [
+    {
+      nodeId: os.hostname(),
+      report: createHostReadinessReport(getBuildIdentity()),
+    },
+  ];
   return [...catalog.presets]
     .sort((left, right) => left.metadata.id.localeCompare(right.metadata.id))
     .map((preset) => {
@@ -163,6 +188,8 @@ export function listServingProfiles(
           topology: "unknown",
           selectionMode: preset.spec.selection,
           supportState: supportState(preset),
+          validationLevel: preset.metadata.validation?.level ?? "unverified",
+          validationEvidence: preset.metadata.validation?.evidence ?? null,
           estimatedImageDownloadBytes: null,
           estimatedModelDownloadBytes: null,
           compatible: false,
@@ -182,9 +209,16 @@ export function listServingProfiles(
         topology: topologyLabel(recipe),
         selectionMode: preset.spec.selection,
         supportState: supportState(preset),
+        validationLevel: preset.metadata.validation?.level ?? "unverified",
+        validationEvidence: preset.metadata.validation?.evidence ?? null,
         estimatedImageDownloadBytes: imageDownloadBytes,
         estimatedModelDownloadBytes: modelDownloadBytes(recipe),
-        ...(options.evaluateCompatibility ?? compatibility)(catalog, preset, recipe),
+        ...(options.evaluateCompatibility ?? compatibility)(
+          catalog,
+          preset,
+          recipe,
+          readinessReports,
+        ),
       };
     });
 }
@@ -204,7 +238,7 @@ export function renderServingProfiles(entries: readonly ServingProfileListEntry[
       return [
         `${entry.id}  ${entry.displayName}`,
         `  backend=${entry.backend} model=${entry.model} topology=${entry.topology}`,
-        `  selection=${entry.selectionMode} support=${entry.supportState} image=${formatBytes(entry.estimatedImageDownloadBytes)} model-download=${formatBytes(entry.estimatedModelDownloadBytes)}`,
+        `  selection=${entry.selectionMode} support=${entry.supportState} validation=${entry.validationLevel ?? "unverified"}${entry.validationEvidence ? `:${entry.validationEvidence}` : ""} image=${formatBytes(entry.estimatedImageDownloadBytes)} model-download=${formatBytes(entry.estimatedModelDownloadBytes)}`,
         `  ${availability}`,
       ].join("\n");
     })

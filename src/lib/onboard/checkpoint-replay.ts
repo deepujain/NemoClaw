@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { listMessagingCredentialMetadata } from "../messaging/channels/metadata";
 import type { SandboxMessagingPlan } from "../messaging/manifest";
+import { MESSAGING_CREDENTIAL_PROVIDER_TYPE } from "../messaging/provider-profile";
 import { getActiveChannelIdsFromPlan } from "../messaging/plan-validation";
 import { isDecisionSelected } from "../state/onboard-checkpoint-decision";
 import type {
@@ -10,10 +12,14 @@ import type {
   CheckpointSandboxIdentity,
   OnboardCheckpoint,
 } from "../state/onboard-checkpoint-types";
-import { HERMES_TAVILY_PROVIDER_PROFILE_ID } from "./brave-provider-profile";
+import { webSearchProviderProfileId } from "../inference/web-search/provider-profile";
 import type { OnboardMachineState } from "./machine/types";
 import { ONBOARD_MACHINE_STATES } from "./machine/types";
-import { listMessagingBridgeProfiles } from "./messaging-bridge-provider";
+import {
+  listMessagingBridgeProfiles,
+  messagingBridgeProfilesForAgent,
+  staticMessagingProviderTypeForChannel,
+} from "./messaging-bridge-provider";
 
 export interface CheckpointedMachineSession {
   readonly checkpoint: OnboardCheckpoint | null;
@@ -129,33 +135,99 @@ export function requiredWebSearchProviderType(
   provider: "brave" | "tavily",
   agent: { name?: string } | null,
 ): string {
-  return provider === "tavily" && agent?.name?.trim().toLowerCase() === "hermes"
-    ? HERMES_TAVILY_PROVIDER_PROFILE_ID
-    : provider;
+  return webSearchProviderProfileId(provider, agent?.name);
+}
+
+/** Collect every active credential binding, including multiple keys owned by one provider. */
+export function collectRequiredMessagingProviderBindings(
+  sandboxName: string,
+  plan: SandboxMessagingPlan | null,
+  channelIds?: ReadonlySet<string>,
+): CheckpointProviderBinding[] {
+  if (!plan) return [];
+  const activeChannels = new Set(
+    getActiveChannelIdsFromPlan(plan).filter(
+      (channelId) => channelIds === undefined || channelIds.has(channelId),
+    ),
+  );
+  const profiles = messagingBridgeProfilesForAgent(plan.agent, listMessagingBridgeProfiles());
+  const bindings: CheckpointProviderBinding[] = [];
+  for (const binding of plan.credentialBindings) {
+    if (!activeChannels.has(binding.channelId)) continue;
+    bindings.push({
+      name: binding.providerName,
+      type:
+        staticMessagingProviderTypeForChannel(binding.channelId, plan.agent, profiles) ??
+        MESSAGING_CREDENTIAL_PROVIDER_TYPE,
+      credentialEnv: binding.providerEnvKey,
+    });
+  }
+  for (const profile of profiles) {
+    if (!activeChannels.has(profile.channelId)) continue;
+    const name = `${sandboxName}-${profile.channelId}-bridge`;
+    if (bindings.some((binding) => binding.name === name)) continue;
+    bindings.push({ name, type: profile.profileId, credentialEnv: profile.credentialKey });
+  }
+  return bindings;
+}
+
+/** Replace proven legacy provider names with the current manifest-owned names. */
+export function normalizeMessagingProviderBindings(
+  sandboxName: string,
+  plan: SandboxMessagingPlan,
+): SandboxMessagingPlan {
+  const providerNamesByCredential = new Map(
+    listMessagingCredentialMetadata({ agent: plan.agent }).map((credential) => [
+      `${credential.channelId}\0${credential.providerEnvKey}`,
+      credential.providerNameTemplate.replaceAll("{sandboxName}", sandboxName),
+    ]),
+  );
+  const currentProviderCredentialEnvs = new Map<string, Set<string>>();
+  for (const binding of plan.credentialBindings) {
+    const providerName = providerNamesByCredential.get(
+      `${binding.channelId}\0${binding.providerEnvKey}`,
+    );
+    if (providerName !== binding.providerName) continue;
+    const key = `${binding.channelId}\0${binding.providerName}`;
+    const credentialEnvs = currentProviderCredentialEnvs.get(key) ?? new Set<string>();
+    credentialEnvs.add(binding.providerEnvKey);
+    currentProviderCredentialEnvs.set(key, credentialEnvs);
+  }
+  let changed = false;
+  const credentialBindings = plan.credentialBindings.map((binding) => {
+    const currentProviderName = providerNamesByCredential.get(
+      `${binding.channelId}\0${binding.providerEnvKey}`,
+    );
+    if (!currentProviderName || currentProviderName === binding.providerName) return binding;
+    const siblingCredentialEnvs = currentProviderCredentialEnvs.get(
+      `${binding.channelId}\0${binding.providerName}`,
+    );
+    const hasCurrentSibling = [...(siblingCredentialEnvs ?? [])].some(
+      (providerEnvKey) => providerEnvKey !== binding.providerEnvKey,
+    );
+    if (!hasCurrentSibling) return binding;
+    changed = true;
+    return { ...binding, providerName: currentProviderName };
+  });
+  return changed ? { ...plan, credentialBindings } : plan;
 }
 
 export function requiredMessagingProviderBindings(
   sandboxName: string,
   plan: SandboxMessagingPlan | null,
+  channelIds?: ReadonlySet<string>,
 ): CheckpointProviderBinding[] {
   if (!plan) return [];
-  const activeChannels = new Set(getActiveChannelIdsFromPlan(plan));
-  const bindings = plan.credentialBindings
-    .filter((binding) => activeChannels.has(binding.channelId))
-    .map((binding) => ({
-      name: binding.providerName,
-      type: "generic",
-      credentialEnv: binding.providerEnvKey,
-    }));
-  for (const profile of listMessagingBridgeProfiles()) {
-    if (profile.agent !== plan.agent || !activeChannels.has(profile.channelId)) continue;
-    bindings.push({
-      name: `${sandboxName}-${profile.channelId}-bridge`,
-      type: profile.profileId,
-      credentialEnv: profile.credentialKey,
-    });
+  const registrationPlan = normalizeMessagingProviderBindings(sandboxName, plan);
+  const bindings = new Map<string, CheckpointProviderBinding>();
+  for (const binding of collectRequiredMessagingProviderBindings(
+    sandboxName,
+    registrationPlan,
+    channelIds,
+  )) {
+    bindings.set(binding.name, binding);
   }
-  return bindings;
+  return [...bindings.values()];
 }
 
 export interface SandboxCreateObservation {

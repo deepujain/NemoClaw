@@ -4,6 +4,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { liveTargetTimeoutContract } from "../../../tools/e2e/onboard-timeout-contract.mts";
+import { testTimeout } from "../../helpers/timeouts.ts";
 import { expect, test } from "../fixtures/e2e-test.ts";
 import { HOSTED_INFERENCE_SECRET } from "../fixtures/hosted-inference.ts";
 import { CLI_DIST_ENTRYPOINT, CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
@@ -12,23 +14,17 @@ import {
   type LifecycleProfile,
   readRegistrySandboxEntry,
 } from "../fixtures/phases/index.ts";
+import { liveTargetTestTitle } from "../registry/execution.ts";
 import { listTargets, requireTargets } from "../registry/registry.ts";
-import { liveTargetSupport, liveTargetTestName } from "../registry/runtime-support.ts";
-import { cloudExperimentalChecksForOnboarding } from "./cloud-experimental-check-list.ts";
 import { runE2eCloudExperimentalChecks } from "./cloud-experimental-checks.ts";
 import {
   captureDcodeBaseImageRuntimeEvidence,
   dcodeBaseImageReferenceForContract,
   loadDcodeBaseImagePublicationEvidence,
 } from "./dcode-base-image-runtime-evidence.ts";
-import { buildLiveTargetRunPlan } from "./run-plan.ts";
-import {
-  requireRegistryTargetSecrets,
-  verifyPersonalStockFetchForTarget,
-} from "./personal-egress-live-proof.ts";
+import { buildLiveTargetRunPlan, liveTargetProgressPhases } from "./run-plan.ts";
 
 const LIFECYCLE_PROFILES: ReadonlySet<LifecycleProfile> = new Set([
-  "post-reboot-recovery",
   "dcode-rebuild-invalid-credential",
 ]);
 
@@ -42,10 +38,7 @@ const E2E_CLOUD_EXPERIMENTAL_CHECKS_DIR = path.join(
 );
 process.env.NEMOCLAW_CLI_BIN ??= CLI_ENTRYPOINT;
 
-// The workflow filters by target ID via `-t "^${TARGET_ID}$"`.
-// When that env is set, surface the structured `[not wired]` reason for the
-// targeted unsupported target at module load so the job log/summary
-// captures it before Vitest reports the skipped test by ID.
+// The workflow filters by the stable target ID prefix via `-t "^${TARGET_ID}:"`.
 const SELECTED_TARGET_ID = process.env.TARGET_ID;
 // That selector matches nothing when the ID names no registered target, and an
 // empty ID builds the selector `-t "^$"`, which also matches nothing. Vitest
@@ -58,43 +51,35 @@ const SELECTED_TARGET_IDS = [SELECTED_TARGET_ID].filter(
   (targetId): targetId is string => targetId !== undefined,
 );
 requireTargets(SELECTED_TARGET_IDS);
-const REGISTRY_TARGET_PHASES = [
-  "resolve the target contract and run plan",
-  "confirm the target environment is ready",
-  "prepare the target lifecycle prerequisites",
-  "onboard the registry-selected sandbox",
-  "execute the target lifecycle boundary",
-  "verify the expected sandbox state",
-  "run target-specific cloud checks",
-  "verify the Personal stock fetch contract",
-  "record target completion evidence",
-] as const;
-
 for (const [targetIndex, target] of listTargets().entries()) {
-  const support = liveTargetSupport(target);
-  if (!support.supported) {
-    if (SELECTED_TARGET_ID === target.id) {
-      console.warn(`[not wired] ${target.id}: ${support.reasons.join("; ")}`);
-    }
-    test.skip(
-      liveTargetTestName(target),
-      { meta: { e2ePhases: REGISTRY_TARGET_PHASES } },
-      () => {},
-    );
-    continue;
-  }
+  const runPlan = buildLiveTargetRunPlan(target);
+  const checkScripts = runPlan.e2eCloudExperimentalChecks ?? [];
+  const runChecksFirst = checkScripts.length > 0;
+  const timeoutContract = liveTargetTimeoutContract(
+    target.environment.lifecycle,
+    target.configExport.expectation,
+  );
 
   test(
-    liveTargetTestName(target),
-    { meta: { e2ePhases: REGISTRY_TARGET_PHASES } },
+    liveTargetTestTitle(target),
+    {
+      meta: {
+        e2eArtifactRootId: target.id,
+        e2ePhases: liveTargetProgressPhases(runPlan),
+      },
+      ...(timeoutContract.testTimeoutMs === undefined
+        ? {}
+        : { timeout: testTimeout(timeoutContract.testTimeoutMs) }),
+    },
     async ({
       artifacts,
+      cleanup,
+      configExportValidation,
       environment,
       host,
       lifecycle,
       onboard,
       progress,
-      sandbox,
       secrets,
       stateValidation,
     }) => {
@@ -105,26 +90,18 @@ for (const [targetIndex, target] of listTargets().entries()) {
       const dcodeBaseImageReference = dcodeBaseContract
         ? dcodeBaseImageReferenceForContract(dcodeBaseContract)
         : undefined;
-      requireRegistryTargetSecrets(target.id, target.requiredSecrets ?? [], secrets);
+      target.requiredSecrets.forEach((secret) => secrets.required(secret));
 
       expect(
         fs.existsSync(CLI_DIST_ENTRYPOINT),
         "run `npm run build:cli` before live repo CLI targets",
       ).toBe(true);
-      if (!target.environment) {
-        throw new Error(`target '${target.id}' is missing environment`);
-      }
-      if (!target.expectedStateId) {
-        throw new Error(`target '${target.id}' is missing expectedStateId`);
-      }
-
       await artifacts.target.declare({
         id: target.id,
         boundary: "typed-registry",
-        pendingRuntimeSuites: support.pendingRuntimeSuites,
+        pendingRuntimeSuites: target.suiteIds,
       });
 
-      const runPlan = buildLiveTargetRunPlan(target);
       await artifacts.writeJson("run-plan.json", runPlan);
 
       progress.phase("confirm the target environment is ready");
@@ -139,20 +116,19 @@ for (const [targetIndex, target] of listTargets().entries()) {
         );
       }
       progress.phase("prepare the target lifecycle prerequisites");
-      await (lifecycleProfile === "post-reboot-recovery"
-        ? lifecycle.preparePostReboot()
-        : Promise.resolve());
       progress.phase("onboard the registry-selected sandbox");
       const instance = await onboard.from(ready, {
         sandboxName: `e2e-reg-${targetIndex.toString(36)}`,
         dcodeBaseImageReference,
+        ...(timeoutContract.commandTimeoutMs === undefined
+          ? {}
+          : { timeoutMs: timeoutContract.commandTimeoutMs }),
       });
 
       // Lifecycle phase runs between onboard and state-validation.
       // Targets opt in by setting `environment.lifecycle` to a
-      // whitelisted profile (see SUPPORTED_LIFECYCLES in
-      // runtime-support.ts). Profiles dispatch through
-      // LifecyclePhaseFixture before state validation.
+      // whitelisted profile. Profiles dispatch through LifecyclePhaseFixture
+      // before state validation.
       let lifecycleResult: Awaited<ReturnType<typeof lifecycle.simulate>> | undefined;
       // Every registry target crosses the optional lifecycle boundary before
       // state validation.
@@ -171,38 +147,32 @@ for (const [targetIndex, target] of listTargets().entries()) {
             : await lifecycle.simulate(lifecycleProfile, instance);
       }
 
-      progress.phase("verify the expected sandbox state");
-      const validation = await stateValidation.from(target.expectedStateId, instance);
-
-      progress.phase("run target-specific cloud checks");
-      const checkScripts = runPlan.e2eCloudExperimentalChecks ?? [];
-      expect(checkScripts).toEqual(
-        cloudExperimentalChecksForOnboarding(target.environment.onboarding),
-      );
-      expect(
-        checkScripts.every((scriptPath) =>
-          Object.is(fs.existsSync(path.join(REPO_ROOT, scriptPath)), true),
-        ),
-      ).toBe(true);
-      expect(fs.existsSync(E2E_CLOUD_EXPERIMENTAL_CHECKS_DIR)).toBe(true);
-      await runE2eCloudExperimentalChecks(target.id, instance.sandboxName, checkScripts, {
-        artifacts,
-        dcodeBaseImageReference,
-        host,
-        secrets,
-      });
-
-      const personalStockFetch = await verifyPersonalStockFetchForTarget(
-        target.id,
-        target.environment.policyTier,
-        instance.agent,
-        sandbox,
-        host,
-        artifacts,
-        secrets,
-        instance.sandboxName,
-        () => progress.phase("verify the Personal stock fetch contract"),
-      );
+      let validation!: Awaited<ReturnType<typeof stateValidation.from>>;
+      let configExport!: Awaited<ReturnType<typeof configExportValidation.from>>;
+      const validateState = async () => {
+        progress.phase("verify the expected sandbox state");
+        validation = await stateValidation.from(target.expectedStateId, instance);
+      };
+      const validateConfigExport = async () => {
+        progress.phase("validate the exported sandbox configuration");
+        configExport = await configExportValidation.from(target, instance);
+      };
+      const runCloudChecks = async () => {
+        progress.phase("run target-specific cloud checks");
+        expect(fs.existsSync(E2E_CLOUD_EXPERIMENTAL_CHECKS_DIR)).toBe(true);
+        await runE2eCloudExperimentalChecks(target.id, instance.sandboxName, checkScripts, {
+          artifacts,
+          cleanup,
+          dcodeBaseImageReference,
+          host,
+          secrets,
+        });
+      };
+      await (runChecksFirst ? undefined : validateState());
+      await (runChecksFirst ? undefined : validateConfigExport());
+      await runCloudChecks();
+      await (runChecksFirst ? validateConfigExport() : undefined);
+      await (runChecksFirst ? validateState() : undefined);
 
       progress.phase("record target completion evidence");
       const dcodeBaseImage = dcodeBaseContract
@@ -212,12 +182,17 @@ for (const [targetIndex, target] of listTargets().entries()) {
         id: target.id,
         expectedStateId: validation.state.id,
         probes: validation.probes.map((probe) => probe.id),
-        pendingRuntimeSuites: support.pendingRuntimeSuites,
+        configExport: {
+          expectation: configExport.expectation,
+          classification: configExport.classification,
+          contract: configExport.contract,
+          elapsedMs: configExport.elapsedMs,
+        },
+        pendingRuntimeSuites: target.suiteIds,
         dcodeBaseImage,
         lifecycle: lifecycleResult
           ? { profile: lifecycleResult.profile, steps: lifecycleResult.steps.map((s) => s.id) }
           : undefined,
-        ...(personalStockFetch ? { personalStockFetch } : {}),
       });
     },
   );

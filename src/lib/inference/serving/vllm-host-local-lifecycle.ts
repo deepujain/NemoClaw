@@ -5,10 +5,13 @@ import { timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { dockerCapture } from "../../adapters/docker/local-model-runtime";
+import { dockerCapture, dockerRun } from "../../adapters/docker/local-model-runtime";
+import { isPodmanGatewayRuntimeEnabled } from "../../onboard/runtime-provider/configured-runtime";
+import { resolveCurrentRuntimeProviderBundle } from "../../onboard/runtime-provider/current";
 import { writeLocalAdapterJsonFile } from "../local-adapter-lifecycle";
-import { loadManagedVllmApiKey, managedVllmStateDir } from "../vllm-api-key";
+import { loadManagedVllmApiKey, managedVllmApiKeyPath, managedVllmStateDir } from "../vllm-api-key";
 import { buildLocalManagedVllmDockerEnv } from "../vllm-docker-env";
+import { assertNoManagedDistributedVllmRuntimeReceipts } from "./managed-runtime-receipts";
 import { runtimeAuthFingerprint } from "./runtime-auth-fingerprint";
 import {
   resolveManagedVllmBridgeHost,
@@ -28,7 +31,7 @@ export const HOST_LOCAL_VLLM_RECIPE_LABEL = "com.nvidia.nemoclaw.serving-recipe"
 export const HOST_LOCAL_VLLM_RECIPE_DIGEST_LABEL =
   "com.nvidia.nemoclaw.serving-recipe-digest" as const;
 export const HOST_LOCAL_VLLM_RUNTIME_RECEIPT_FILE = "host-local-vllm-runtime.json" as const;
-const HOST_LOCAL_VLLM_PORT = 8000;
+const HOST_LOCAL_VLLM_CONTAINER_PORT = 8000;
 const DUAL_STATION_VLLM_ROLE_LABEL = "com.nvidia.nemoclaw.vllm-role";
 
 interface DockerInspectRow {
@@ -130,6 +133,9 @@ function readRuntimeReceipt(stateDir: string): unknown {
       (typeof process.getuid === "function" && stat.uid !== process.getuid())
     ) {
       throw new Error("Managed host-local vLLM runtime receipt is not owner-only.");
+    }
+    if (stat.size < 2 || stat.size > 64 * 1024) {
+      throw new Error("Managed host-local vLLM runtime receipt has an unexpected size.");
     }
     try {
       return JSON.parse(fs.readFileSync(fd, "utf8"));
@@ -268,15 +274,157 @@ function inspectHostLocalContainer(
 ): string {
   return capture(["container", "inspect", HOST_LOCAL_VLLM_CONTAINER_NAME], {
     env: dockerEnv,
+    replaceEnv: true,
     ignoreError: true,
     timeout: 10_000,
   });
 }
 
+export class UnsafeLegacyVllmBindingsError extends Error {
+  constructor() {
+    super(
+      "Managed bearerless vLLM has unsafe host bindings. Follow 'Handle a Running vLLM Server' in the vLLM setup guide before recreating the owned `nemoclaw-vllm` container. Preserve the original model and port settings.",
+    );
+  }
+}
+
+export class ManagedVllmInspectionError extends Error {
+  constructor() {
+    super(
+      "Managed vLLM container inspection failed. Verify access to Docker's default local daemon before retrying.",
+    );
+  }
+}
+
+/** Reject unsafe owned bearerless bindings and select their private probe address. */
+export function getLegacyHostLocalManagedVllmBridgeHost(
+  servingPort: number,
+  capture: typeof dockerCapture = dockerCapture,
+): string | null {
+  const dockerEnv = buildLocalManagedVllmDockerEnv();
+  const inspection = dockerRun(["container", "inspect", HOST_LOCAL_VLLM_CONTAINER_NAME], {
+    env: dockerEnv,
+    replaceEnv: true,
+    ignoreError: true,
+    suppressOutput: true,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  if (inspection.error || inspection.status !== 0) {
+    if (
+      !inspection.error &&
+      inspection.status === 1 &&
+      ["", "[]"].includes(String(inspection.stdout ?? "").trim()) &&
+      /^(?:Error response from daemon:\s*|Error:\s*)?No such (?:object|container): nemoclaw-vllm\.?$/iu.test(
+        String(inspection.stderr ?? "").trim(),
+      )
+    )
+      return null;
+    const missingDocker =
+      inspection.error !== undefined &&
+      "code" in inspection.error &&
+      inspection.error.code === "ENOENT";
+    let nativePodman = false;
+    if (
+      !inspection.error &&
+      inspection.status !== null &&
+      inspection.status > 0 &&
+      ["", "[]"].includes(String(inspection.stdout ?? "").trim()) &&
+      isPodmanGatewayRuntimeEnabled()
+    ) {
+      const runtime = resolveCurrentRuntimeProviderBundle();
+      nativePodman =
+        runtime.identity.id === "podman" &&
+        runtime.hostLocalInference.supported &&
+        runtime.hostLocalInference.services.includes("vllm");
+    }
+    if (missingDocker || nativePodman) {
+      // Existing-server attachment has no Docker dependency. Retained managed
+      // state still requires inspection, even after switching to native Podman.
+      try {
+        assertNoManagedDistributedVllmRuntimeReceipts();
+        for (const file of [runtimeReceiptPath(managedVllmStateDir()), managedVllmApiKeyPath()]) {
+          try {
+            fs.lstatSync(file);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+            throw error;
+          }
+          throw new ManagedVllmInspectionError();
+        }
+      } catch {
+        throw new ManagedVllmInspectionError();
+      }
+      return null;
+    }
+    throw new ManagedVllmInspectionError();
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(String(inspection.stdout));
+  } catch {
+    throw new ManagedVllmInspectionError();
+  }
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length !== 1 ||
+    !parsed[0] ||
+    typeof parsed[0] !== "object"
+  ) {
+    throw new ManagedVllmInspectionError();
+  }
+  const row = parsed[0] as DockerInspectRow;
+  const labels = row.Config?.Labels;
+  if (
+    typeof row.Id !== "string" ||
+    !/^[a-f0-9]{12,64}$/u.test(row.Id) ||
+    row.Name !== `/${HOST_LOCAL_VLLM_CONTAINER_NAME}` ||
+    typeof row.State?.Running !== "boolean" ||
+    labels === undefined ||
+    (labels !== null && (typeof labels !== "object" || Array.isArray(labels)))
+  ) {
+    throw new ManagedVllmInspectionError();
+  }
+  if (!row.State?.Running || labels === null) return null;
+  const labelMap = labels as Record<string, unknown>;
+  if (
+    labelMap[HOST_LOCAL_VLLM_MANAGED_LABEL] !== "true" ||
+    labelMap[HOST_LOCAL_VLLM_AUTH_LABEL] !== undefined ||
+    labelMap[DUAL_STATION_VLLM_ROLE_LABEL] !== undefined
+  )
+    return null;
+  const ports = row.NetworkSettings?.Ports;
+  const bindings =
+    ports && typeof ports === "object" && !Array.isArray(ports)
+      ? (ports as Record<string, unknown>)[`${String(HOST_LOCAL_VLLM_CONTAINER_PORT)}/tcp`]
+      : null;
+  const bridge = resolveManagedVllmBridgeHost(capture, dockerEnv);
+  const expectedHosts = new Set(["127.0.0.1", bridge]);
+  if (
+    !Array.isArray(bindings) ||
+    bindings.length !== 2 ||
+    !bindings.every(
+      (binding) =>
+        binding &&
+        typeof binding === "object" &&
+        binding.HostPort === String(servingPort) &&
+        expectedHosts.delete(binding.HostIp),
+    )
+  ) {
+    throw new UnsafeLegacyVllmBindingsError();
+  }
+  return bridge;
+}
+
 /** Recover only the exact authenticated host-local container with bounded host bindings. */
 export function recoverHostLocalManagedVllmEndpoint(
   options: RecoverHostLocalManagedVllmOptions = {},
-): { baseUrl: string; apiKey: string } | null {
+): {
+  baseUrl: string;
+  apiKey: string;
+  containerId: string;
+  serving?: HostLocalVllmServingIdentity;
+} | null {
   const capture = options.dockerCapture ?? dockerCapture;
   const dockerEnv = buildLocalManagedVllmDockerEnv();
   const source = (
@@ -308,7 +456,7 @@ export function recoverHostLocalManagedVllmEndpoint(
   const ports = row.NetworkSettings?.Ports;
   const portBindings =
     ports && typeof ports === "object" && !Array.isArray(ports)
-      ? (ports as Record<string, unknown>)["8000/tcp"]
+      ? (ports as Record<string, unknown>)[`${String(HOST_LOCAL_VLLM_CONTAINER_PORT)}/tcp`]
       : null;
   const bindings = Array.isArray(portBindings) ? portBindings : [];
   const loopbackBinding = bindings.find(
@@ -332,6 +480,18 @@ export function recoverHostLocalManagedVllmEndpoint(
   const configuredKeyRows = env.filter(
     (value): value is string => typeof value === "string" && value.startsWith("VLLM_API_KEY="),
   );
+  const loopbackHostPort =
+    loopbackBinding &&
+    typeof (loopbackBinding as { HostPort?: unknown }).HostPort === "string" &&
+    /^\d{4,5}$/u.test((loopbackBinding as { HostPort: string }).HostPort)
+      ? Number((loopbackBinding as { HostPort: string }).HostPort)
+      : Number.NaN;
+  const bridgeHostPort =
+    bridgeBinding &&
+    typeof (bridgeBinding as { HostPort?: unknown }).HostPort === "string" &&
+    /^\d{4,5}$/u.test((bridgeBinding as { HostPort: string }).HostPort)
+      ? Number((bridgeBinding as { HostPort: string }).HostPort)
+      : Number.NaN;
   if (
     row.Id === undefined ||
     typeof row.Id !== "string" ||
@@ -341,15 +501,19 @@ export function recoverHostLocalManagedVllmEndpoint(
     bindings.length !== 2 ||
     !loopbackBinding ||
     !bridgeBinding ||
-    (loopbackBinding as { HostPort?: unknown }).HostPort !== String(HOST_LOCAL_VLLM_PORT) ||
-    (bridgeBinding as { HostPort?: unknown }).HostPort !== String(HOST_LOCAL_VLLM_PORT) ||
+    !Number.isSafeInteger(loopbackHostPort) ||
+    loopbackHostPort < 1024 ||
+    loopbackHostPort > 65_535 ||
+    String(loopbackHostPort) !== (loopbackBinding as { HostPort: string }).HostPort ||
+    bridgeHostPort !== loopbackHostPort ||
+    String(bridgeHostPort) !== (bridgeBinding as { HostPort: string }).HostPort ||
     configuredKeyRows.length !== 1 ||
     typeof authFingerprint !== "string"
   ) {
     throw new Error("Managed host-local vLLM runtime identity is unsafe or incomplete.");
   }
 
-  validateHostLocalVllmRuntimeReceipt(
+  const serving = validateHostLocalVllmRuntimeReceipt(
     { containerId: row.Id, labels: labelMap, authFingerprint },
     options.stateDir ?? managedVllmStateDir(),
   );
@@ -364,5 +528,10 @@ export function recoverHostLocalManagedVllmEndpoint(
   ) {
     throw new Error("Managed host-local vLLM authentication is missing or mismatched.");
   }
-  return { baseUrl: `http://127.0.0.1:${String(HOST_LOCAL_VLLM_PORT)}`, apiKey };
+  return {
+    baseUrl: `http://127.0.0.1:${String(loopbackHostPort)}`,
+    apiKey,
+    containerId: row.Id,
+    ...(serving ? { serving } : {}),
+  };
 }

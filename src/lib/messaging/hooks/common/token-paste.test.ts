@@ -7,6 +7,7 @@ import { discordManifest, slackManifest, telegramManifest } from "../../channels
 import type { ChannelManifest } from "../../manifest";
 import { runMessagingHook } from "../hook-runner";
 import { MessagingHookRegistry } from "../registry";
+import { createBuiltInMessagingHookRegistry } from "../builtins";
 import {
   COMMON_CONFIG_PROMPT_HOOK_HANDLER_ID,
   COMMON_STATIC_OUTPUTS_HOOK_HANDLER_ID,
@@ -27,9 +28,6 @@ describe("common token-paste hook implementation", () => {
       COMMON_CONFIG_PROMPT_HOOK_HANDLER_ID,
     ]);
     expect(findHookByHandler(telegramManifest, COMMON_TOKEN_PASTE_HOOK_HANDLER_ID)?.handler).toBe(
-      COMMON_TOKEN_PASTE_HOOK_HANDLER_ID,
-    );
-    expect(findHookByHandler(discordManifest, COMMON_TOKEN_PASTE_HOOK_HANDLER_ID)?.handler).toBe(
       COMMON_TOKEN_PASTE_HOOK_HANDLER_ID,
     );
     expect(findHookByHandler(slackManifest, COMMON_TOKEN_PASTE_HOOK_HANDLER_ID)?.handler).toBe(
@@ -85,6 +83,33 @@ describe("common token-paste hook implementation", () => {
         },
       },
     });
+  });
+
+  it("rejects the documented Discord token placeholder without saving it (#10668)", async () => {
+    const logs: string[] = [];
+    const registry = createBuiltInMessagingHookRegistry({
+      common: {
+        env: { DISCORD_BOT_TOKEN: "<your-discord-bot-token>" },
+        saveCredential: () => {
+          throw new Error("placeholder must not be saved");
+        },
+        log: (message) => logs.push(message),
+      },
+    });
+
+    await expect(
+      runMessagingHook(
+        discordManifest.hooks.find((hook) => hook.id === "discord-token-paste")!,
+        registry,
+        {
+          channelId: "discord",
+          isInteractive: false,
+        },
+      ),
+    ).rejects.toThrow("Invalid token format for DISCORD_BOT_TOKEN");
+    expect(logs).toContain(
+      "  ✗ Invalid format. Replace the documentation placeholder with your real Discord bot token.",
+    );
   });
 
   it("collects Slack bot and app tokens through the shared token-paste hook", async () => {

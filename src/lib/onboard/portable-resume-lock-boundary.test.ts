@@ -214,7 +214,9 @@ describe("portable resume command lock boundary", () => {
             resolveResumeIntent: () => ({ effectiveResume: false, snapshot: null }),
             runOnboard: (options) => runWithObservedPreparation(onboardModule, options),
           }),
-        ).rejects.toThrow("exit:1");
+        ).rejects.toThrow(
+          "Cannot update onboarding recovery because the onboarding lock is unavailable.",
+        );
         expect(preparePortableHost).not.toHaveBeenCalled();
         expect(fs.existsSync(configWriteMarker)).toBe(false);
         expect(fs.existsSync(socketActivationMarker)).toBe(false);
@@ -346,6 +348,62 @@ describe("portable resume command lock boundary", () => {
     expect(fs.existsSync(portableHostFencePath(tempHome))).toBe(false);
     expect(process.listenerCount("exit")).toBe(exitListeners);
   });
+
+  it(
+    "fails fast against a process-bound host-fence owner without corrupting lock state",
+    testTimeoutOptions(30_000),
+    async () => {
+      const { portableHostFencePath, withPortableHostFenceTry } = boundaryModules.retirement;
+      const moduleUrl = new URL("../state/portable-uninstall-retirement.ts", import.meta.url).href;
+      const readyFile = path.join(tempHome, "host-fence-ready");
+      const releaseFile = path.join(tempHome, "host-fence-release");
+      const script = String.raw`
+      const fs = await import('node:fs');
+      const loaded = await import(process.argv[2]);
+      const { withPortableHostFence } = loaded.default ?? loaded;
+      await withPortableHostFence(process.argv[1], async () => {
+        fs.writeFileSync(process.argv[3], 'ready');
+        while (!fs.existsSync(process.argv[4])) await new Promise(resolve => setTimeout(resolve, 10));
+      });
+    `;
+      const child = spawn(
+        process.execPath,
+        [
+          "--no-warnings",
+          "--import",
+          "tsx",
+          "--input-type=module",
+          "-e",
+          script,
+          tempHome,
+          moduleUrl,
+          readyFile,
+          releaseFile,
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let childOutput = "";
+      child.stdout?.on("data", (chunk: Buffer) => (childOutput += chunk.toString()));
+      child.stderr?.on("data", (chunk: Buffer) => (childOutput += chunk.toString()));
+      try {
+        await vi.waitFor(
+          () => expect(fs.existsSync(readyFile)).toBe(true),
+          testTimeoutOptions(30_000),
+        );
+        expect(fs.existsSync(portableHostFencePath(tempHome))).toBe(true);
+        await expect(withPortableHostFenceTry(tempHome, () => undefined)).rejects.toThrow(
+          /Host maintenance is in progress/,
+        );
+        expect(fs.existsSync(portableHostFencePath(tempHome))).toBe(true);
+      } finally {
+        fs.writeFileSync(releaseFile, "release");
+        const [code] = await once(child, "exit");
+        expect(code, childOutput).toBe(0);
+      }
+      expect(fs.existsSync(portableHostFencePath(tempHome))).toBe(false);
+      await expect(withPortableHostFenceTry(tempHome, () => "acquired")).resolves.toBe("acquired");
+    },
+  );
 
   it("drains an admitted detached reentry before releasing the physical fence (#9189)", async () => {
     const { portableHostFencePath, withPortableHostFence } = boundaryModules.retirement;
@@ -526,14 +584,16 @@ describe("portable resume command lock boundary", () => {
       return directory;
     }) as typeof fs.mkdtempSync);
     const harnessModule = await import("../../../test/helpers/rebuild-flow-generic-harness");
-    const { rebuildOnboardDependencies } =
+    const { onboardSession: rebuildOnboardSession, rebuildOnboardDependencies } =
       await import("../../../test/helpers/rebuild-flow-harness");
     const actualOnboard = rebuildOnboardDependencies.onboard.bind(rebuildOnboardDependencies) as (
       options: import("./types").OnboardOptions,
     ) => Promise<void>;
     const { retirement } = boundaryModules;
     let innerObserved = false;
+    let innerError = "";
     const harness = harnessModule.createRebuildFlowHarness({
+      useRealPortableRetirementBoundary: true,
       onboard: async (_session, options) => {
         const lockPath = retirement.portableHostFencePath(tempHome);
         const outerInode = fs.lstatSync(lockPath, { bigint: true }).ino;
@@ -545,16 +605,19 @@ describe("portable resume command lock boundary", () => {
         try {
           await actualOnboard(options);
         } catch (error) {
+          innerError = String(error);
           innerObserved = String(error).includes("retirement record");
           expect(fs.lstatSync(lockPath, { bigint: true }).ino).toBe(outerInode);
           throw error;
         }
       },
     });
+    vi.mocked(rebuildOnboardSession.acquireOnboardLock).mockRestore();
+    vi.mocked(rebuildOnboardSession.releaseOnboardLock).mockRestore();
 
     try {
       await harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }).catch(() => {});
-      expect(innerObserved).toBe(true);
+      expect(innerObserved, innerError).toBe(true);
       expect(fs.existsSync(retirement.portableHostFencePath(tempHome))).toBe(false);
     } finally {
       mkdtemp.mockRestore();

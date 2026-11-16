@@ -62,21 +62,40 @@ export function mockRootReplayFilesystem(
   readonly afterRename: (callback: ((source: string, target: string) => void) | null) => void;
   readonly beforeLink: (callback: ((source: string, target: string) => void) | null) => void;
   readonly beforeUnlink: (callback: ((target: string) => void) | null) => void;
+  readonly chmodDirectory: (target: string, mode: number) => void;
   readonly hasFile: (target: string) => boolean;
   readonly linkCount: (target: string) => bigint;
+  readonly markDirectorySymlink: (target: string) => void;
   readonly readFile: (target: string) => string | null;
   readonly writeFile: (target: string, contents: string | Buffer, mode: number) => void;
 } {
   const directories = new Set([
     "/",
+    "/sandbox",
+    "/etc",
+    "/etc/ssl",
+    "/etc/ssl/certs",
     "/run",
     "/run/nemoclaw",
+    "/tmp",
+    "/usr",
+    "/usr/local",
+    "/usr/local/share",
+    "/usr/local/share/ca-certificates",
+    "/usr/sbin",
     "/var",
     "/var/lib",
     "/var/lib/nemoclaw",
   ]);
+  const fixtureFiles = new Map([
+    [
+      "/usr/sbin/update-ca-certificates",
+      { contents: "managed startup test executable", mode: 0o555 },
+    ],
+    ...seededFiles,
+  ]);
   const files: Map<string, Buffer> = new Map(
-    [...seededFiles].map(([target, file]) => [
+    [...fixtureFiles].map(([target, file]) => [
       target,
       Buffer.isBuffer(file.contents)
         ? Buffer.from(file.contents)
@@ -84,7 +103,13 @@ export function mockRootReplayFilesystem(
     ]),
   );
   const directoryModes = new Map([...directories].map((target) => [target, 0o755]));
-  const fileModes = new Map([...seededFiles].map(([target, file]) => [target, file.mode]));
+  const directoryUids = new Map([...directories].map((target) => [target, 0]));
+  const directoryGids = new Map([...directories].map((target) => [target, 0]));
+  directoryUids.set("/sandbox", 999);
+  directoryGids.set("/sandbox", 999);
+  directoryModes.set("/tmp", 0o1777);
+  const symlinkDirectories = new Set<string>();
+  const fileModes = new Map([...fixtureFiles].map(([target, file]) => [target, file.mode]));
   let nextFileInode = 2n;
   const fileInodes = new Map<string, bigint>();
   const fileCtimes = new Map<string, bigint>();
@@ -131,21 +156,21 @@ export function mockRootReplayFilesystem(
         descriptorSnapshots.set(descriptor, { ...snapshot, ctimeNs: nextCtime });
     }
   };
-  const stat = (kind: "directory" | "file", mode: number) =>
+  const stat = (kind: "directory" | "file" | "symlink", mode: number, uid = 0, gid = 0) =>
     ({
-      gid: 0,
+      gid,
       isDirectory: () => kind === "directory",
       isFile: () => kind === "file",
-      isSymbolicLink: () => false,
+      isSymbolicLink: () => kind === "symlink",
       mode,
       nlink: 1,
-      uid: 0,
+      uid,
     }) as fs.Stats;
   const bigDirectoryStat = (target: string) =>
     ({
       ctimeNs: 1n,
       dev: 1n,
-      gid: 0n,
+      gid: BigInt(directoryGids.get(target) ?? 0),
       ino: 1n,
       isDirectory: () => true,
       isFile: () => false,
@@ -154,7 +179,7 @@ export function mockRootReplayFilesystem(
       mtimeNs: 1n,
       nlink: 1n,
       size: 0n,
-      uid: 0n,
+      uid: BigInt(directoryUids.get(target) ?? 0),
     }) as fs.BigIntStats;
   const bigFileStat = (bytes: Buffer, mode: number, ino: bigint, ctimeNs: bigint, nlink: bigint) =>
     ({
@@ -202,7 +227,12 @@ export function mockRootReplayFilesystem(
     return directories.has(resolved)
       ? options?.bigint
         ? bigDirectoryStat(resolved)
-        : stat("directory", directoryModes.get(resolved) ?? 0o755)
+        : stat(
+            symlinkDirectories.has(resolved) ? "symlink" : "directory",
+            directoryModes.get(resolved) ?? 0o755,
+            directoryUids.get(resolved) ?? 0,
+            directoryGids.get(resolved) ?? 0,
+          )
       : bytes === undefined
         ? missing()
         : options?.bigint
@@ -227,7 +257,12 @@ export function mockRootReplayFilesystem(
     directoryModes.set(resolved, options?.mode ?? 0o777);
     return undefined;
   }) as typeof fs.mkdirSync);
-  vi.spyOn(fs, "chownSync").mockImplementation(() => undefined);
+  vi.spyOn(fs, "chownSync").mockImplementation(((target: fs.PathLike, uid: number, gid: number) => {
+    const resolved = String(target);
+    if (!directories.has(resolved)) missing();
+    directoryUids.set(resolved, uid);
+    directoryGids.set(resolved, gid);
+  }) as typeof fs.chownSync);
   vi.spyOn(fs, "chmodSync").mockImplementation(((target: fs.PathLike, mode: fs.Mode) => {
     const resolved = String(target);
     const numeric = typeof mode === "number" ? mode : Number.parseInt(mode, 8);
@@ -411,8 +446,16 @@ export function mockRootReplayFilesystem(
     beforeUnlink: (callback) => {
       unlinkObserver = callback;
     },
+    chmodDirectory: (target, mode) => {
+      if (!directories.has(target)) missing();
+      directoryModes.set(target, mode);
+    },
     hasFile: (target) => files.has(target),
     linkCount: (target) => fileLinkCount(fileInodes.get(target) ?? missing()),
+    markDirectorySymlink: (target) => {
+      if (!directories.has(target)) missing();
+      symlinkDirectories.add(target);
+    },
     readFile: (target) => files.get(target)?.toString("utf8") ?? null,
     writeFile: (target, contents, mode) => {
       if (files.has(target)) deleteExistingFile(target);

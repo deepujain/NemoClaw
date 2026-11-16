@@ -18,8 +18,10 @@ import {
  * - `crashed`: the build/render or executor threw before reaching the
  *   sandbox; treated as an unexpected regression and re-emitted via the
  *   `unexpected` callback so it does not vanish into a generic catch.
+ * - `skipped`: the sandbox agent does not use the OpenClaw workspace, so
+ *   there is nothing to refresh.
  */
-export type PolicyContextRefreshOutcome = "ok" | "unreachable" | "failed" | "crashed";
+export type PolicyContextRefreshOutcome = "ok" | "unreachable" | "failed" | "crashed" | "skipped";
 
 export interface RefreshOutcome extends WritePolicyContextResult {
   outcome: PolicyContextRefreshOutcome;
@@ -44,16 +46,16 @@ const DEFAULT_UNEXPECTED = (error: unknown) => {
   console.error(`  Unexpected error refreshing ${POLICY_CONTEXT_SANDBOX_PATH}: ${message}`);
 };
 
-export function refreshSandboxPolicyContextFile(
+export async function refreshSandboxPolicyContextFile(
   sandboxName: string,
   deps: RefreshDeps = {},
-): RefreshOutcome {
+): Promise<RefreshOutcome> {
   const write = deps.write ?? writePolicyContextToSandbox;
   const warn = deps.warn ?? DEFAULT_WARN;
   const unexpected = deps.unexpected ?? DEFAULT_UNEXPECTED;
   let result: WritePolicyContextResult;
   try {
-    result = write(sandboxName);
+    result = await write(sandboxName);
   } catch (error: unknown) {
     unexpected(error);
     return {
@@ -64,6 +66,9 @@ export function refreshSandboxPolicyContextFile(
   }
   if (result.written) {
     return { ...result, outcome: "ok" };
+  }
+  if (result.failure === "unsupported-agent") {
+    return { ...result, outcome: "skipped" };
   }
   if (result.failure === "unexpected-loader") {
     unexpected(

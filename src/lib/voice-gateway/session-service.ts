@@ -66,6 +66,24 @@ function grantMatches(value: string, expectedHash: Buffer): boolean {
   return timingSafeEqual(hashBearer(value), expectedHash);
 }
 
+function deriveAgentSessionKey(
+  options: Pick<
+    VoiceSessionServiceOptions,
+    "agent" | "runtimeIdentity" | "runtimeProfile" | "sandbox"
+  >,
+  runtimeConversationId: string,
+): string {
+  const binding = JSON.stringify([
+    options.agent,
+    options.runtimeProfile,
+    options.runtimeIdentity,
+    options.sandbox,
+    runtimeConversationId,
+  ]);
+  const bindingHash = createHash("sha256").update(binding).digest("base64url").toLowerCase();
+  return `agent:${options.agent}:nemoclaw-voice:${bindingHash}`;
+}
+
 /** Owns one runtime-neutral voice session and its single committed turn. */
 export class VoiceSessionService {
   private readonly options: Required<
@@ -113,7 +131,7 @@ export class VoiceSessionService {
 
     const now = this.options.now();
     const voiceSessionId = this.options.randomId();
-    const agentSessionKey = `agent:${this.options.agent}:nemoclaw-voice:${this.options.randomId()}`;
+    const agentSessionKey = deriveAgentSessionKey(this.options, runtimeConversationId);
     const grant = this.options.randomGrant().toString("base64url");
     const expiresAt = now + this.options.sessionLifetimeMs;
     const session: ActiveSession = {
@@ -270,12 +288,10 @@ export class VoiceSessionService {
           },
         }),
       )
-      .catch(
-        (): Awaited<ReturnType<AgentTurnClient["runTurn"]>> => ({
-          outcome: "failed",
-          reason: "agent_gateway_unavailable",
-        }),
-      );
+      .catch((): Awaited<ReturnType<AgentTurnClient["runTurn"]>> => ({
+        outcome: "failed",
+        reason: "agent_gateway_unavailable",
+      }));
 
     const result = await Promise.race([runResult, timeoutResult]);
     if (timeout) clearTimeout(timeout);

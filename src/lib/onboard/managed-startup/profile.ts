@@ -4,13 +4,23 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
+import { isLoopbackDashboardUrl } from "../../dashboard/url.ts";
+import {
+  type HermesSwitchyardRoutingIntent,
+  type SwitchyardProviderBindings,
+  validateHermesSwitchyardRoutingIntent,
+  validateSwitchyardProviderBindings,
+} from "../../hermes-switchyard-routing.ts";
+import { listMessagingCredentialEnvAssignments } from "../../messaging/channels/metadata.ts";
+import { authorizeMessagingManagedStartupFields } from "../../messaging/managed-startup-placeholders.ts";
 import { isValidDcodeUpstreamProvider } from "./dcode-upstream-provider.ts";
 
 /**
  * Versioned, bounded schema for managed-image startup intent.
  * Runtime-specific construction and activation stay outside this module.
  */
-export const MANAGED_STARTUP_PROFILE_SCHEMA_VERSION = 1 as const;
+const LEGACY_MANAGED_STARTUP_PROFILE_SCHEMA_VERSION = 1 as const;
+export const MANAGED_STARTUP_PROFILE_SCHEMA_VERSION = 2 as const;
 
 /** Profiles are configuration, not a general-purpose transport. */
 export const MANAGED_STARTUP_PROFILE_MAX_BYTES = 64 * 1024;
@@ -56,9 +66,23 @@ const NON_SECRET_KEY_METADATA_NAMES = new Set([
   "installCacheEnvKey",
   "providerEnvKey",
   "stateKey",
+  "targetEnvKey",
 ]);
 const MESSAGING_CREDENTIAL_PLACEHOLDER_RE =
-  /^(?:openshell:resolve:env:|[A-Za-z0-9]+-OPENSHELL-RESOLVE-ENV-)(?:v[0-9]+_)?[A-Z][A-Z0-9_]*$/u;
+  /^(?:openshell:resolve:env:|[A-Za-z0-9]+-OPENSHELL-RESOLVE-ENV-)(?:(?:v[0-9]{1,20}|s[a-f0-9]{64})_)?[A-Z][A-Z0-9_]*$/u;
+const MESSAGING_CREDENTIAL_ENV_ALIASES = new Set(
+  listMessagingCredentialEnvAssignments()
+    .filter(({ sourceEnvKey, targetEnvKey }) => sourceEnvKey !== targetEnvKey)
+    .map(({ agent, sourceEnvKey, targetEnvKey }) => `${agent}\0${sourceEnvKey}\0${targetEnvKey}`),
+);
+const MESSAGING_CREDENTIAL_RUNTIME_ENV_ALIASES = new Set(
+  listMessagingCredentialEnvAssignments()
+    .filter(({ sourceEnvKey, targetEnvKey }) => sourceEnvKey !== targetEnvKey)
+    .map(
+      ({ agent, channelId, sourceEnvKey, targetEnvKey }) =>
+        `${agent}\0${channelId}\0${sourceEnvKey}\0${targetEnvKey}`,
+    ),
+);
 const JSON_ARRAY_INDEX_SEGMENT_RE = /^\[(?:0|[1-9][0-9]*)\]$/u;
 const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
   /nvapi-[A-Za-z0-9_-]{10,}/u,
@@ -105,8 +129,6 @@ export const MANAGED_STARTUP_HERMES_TOOL_GATEWAYS = [
 export type ManagedStartupHermesToolGateway = (typeof MANAGED_STARTUP_HERMES_TOOL_GATEWAYS)[number];
 export type ManagedStartupInputModality = "text" | "image";
 export type ManagedStartupWebSearchProvider = "brave" | "tavily";
-export type ManagedStartupDeviceAuthOptOutSource = "operator" | "managed-onboard";
-
 export const MANAGED_STARTUP_AGENTS = [
   "openclaw",
   "hermes",
@@ -132,6 +154,8 @@ export interface ManagedStartupInference {
   readonly routeProvider: string;
   /** User-selected provider upstream of the managed inference route. */
   readonly upstreamProvider: string;
+  /** Exact managed-inference catalog preset, when onboarding selected one. */
+  readonly servingPreset?: string | null;
   readonly model: string;
   /** Sandbox-facing managed inference route (normally inference.local). */
   readonly routedBaseUrl: string;
@@ -172,8 +196,10 @@ export interface ManagedStartupOpenClawDashboard {
 export interface ManagedStartupHermesDashboardDisabled {
   readonly agent: "hermes";
   readonly mode: "disabled";
-  /** CHAT_UI_URL remains a stock image input even when host forwarding is off. */
+  /** Loopback URL retained for the OpenShell forwarding contract. */
   readonly url: string;
+  /** Browser-facing URL supplied to Hermes. Absent only in profiles created before this field. */
+  readonly browserUrl?: string;
   readonly publicPort: null;
   readonly internalPort: null;
   readonly tuiEnabled: false;
@@ -182,7 +208,10 @@ export interface ManagedStartupHermesDashboardDisabled {
 export interface ManagedStartupHermesDashboardForwarded {
   readonly agent: "hermes";
   readonly mode: "loopback-forwarded";
+  /** Loopback URL retained for the OpenShell forwarding contract. */
   readonly url: string;
+  /** Browser-facing URL supplied to Hermes. Absent only in profiles created before this field. */
+  readonly browserUrl?: string;
   readonly publicPort: number;
   readonly internalPort: number;
   readonly tuiEnabled: boolean;
@@ -267,11 +296,6 @@ export interface ManagedStartupOpenClawOtel {
   readonly sampleRate: number;
 }
 
-export interface ManagedStartupDeviceAuth {
-  readonly disabled: boolean;
-  readonly optOutSource: ManagedStartupDeviceAuthOptOutSource;
-}
-
 export interface ManagedStartupOpenClawConfig {
   readonly agent: "openclaw";
   readonly webSearch: ManagedStartupWebSearch;
@@ -279,13 +303,15 @@ export interface ManagedStartupOpenClawConfig {
   readonly agentTimeoutSeconds: number;
   readonly heartbeatEvery: string | null;
   readonly extraAgents: ManagedStartupExtraAgents;
-  readonly deviceAuth: ManagedStartupDeviceAuth;
   readonly minimalBootstrap: boolean;
 }
 
 export interface ManagedStartupHermesConfig {
   readonly agent: "hermes";
   readonly webSearch: ManagedStartupWebSearch;
+  /** Absent only on canonical profiles created before Switchyard integration. */
+  readonly switchyardRouting?: HermesSwitchyardRoutingIntent | null;
+  readonly switchyardBindings?: SwitchyardProviderBindings | null;
 }
 
 export interface ManagedStartupDcodeConfig {
@@ -308,7 +334,7 @@ export interface ManagedStartupProfile {
   readonly schemaVersion: typeof MANAGED_STARTUP_PROFILE_SCHEMA_VERSION;
   readonly agent: ManagedStartupAgent;
   readonly agentConfig: ManagedStartupAgentConfig;
-  readonly inference: ManagedStartupInference;
+  readonly inference: ManagedStartupInference | null;
   readonly proxy: ManagedStartupProxy;
   readonly dashboard: ManagedStartupDashboard;
   readonly tools: ManagedStartupTools;
@@ -379,7 +405,7 @@ const PROFILE_CAPABILITIES = {
     supportsAgentTimeout: true,
     supportsHeartbeat: true,
     supportsExtraAgents: true,
-    supportsDeviceAuth: true,
+    supportsDeviceAuth: false,
     observability: "openclaw-otel",
     supportsMinimalBootstrap: true,
   },
@@ -490,6 +516,7 @@ export const MANAGED_STARTUP_PROFILE_AFFORDANCE_INVENTORY = {
     affordance("NEMOCLAW_MODEL", "inference.model"),
     affordance("NEMOCLAW_INFERENCE_PROVIDER_ID", "inference.routeProvider"),
     affordance("NEMOCLAW_UPSTREAM_PROVIDER", "inference.upstreamProvider"),
+    affordance("NEMOCLAW_SERVING_PRESET", "inference.servingPreset"),
     affordance("NEMOCLAW_PRIMARY_MODEL_REF", "inference.primaryModelRef"),
     affordance("NEMOCLAW_INFERENCE_BASE_URL", "inference.routedBaseUrl"),
     affordance("NEMOCLAW_INFERENCE_API", "inference.api"),
@@ -503,8 +530,6 @@ export const MANAGED_STARTUP_PROFILE_AFFORDANCE_INVENTORY = {
     affordance("NEMOCLAW_AGENT_TIMEOUT", "agentConfig.agentTimeoutSeconds"),
     affordance("NEMOCLAW_AGENT_HEARTBEAT_EVERY", "agentConfig.heartbeatEvery"),
     affordance("NEMOCLAW_EXTRA_AGENTS_JSON_B64", "agentConfig.extraAgents"),
-    affordance("NEMOCLAW_DISABLE_DEVICE_AUTH", "agentConfig.deviceAuth.disabled"),
-    affordance("NEMOCLAW_DEVICE_AUTH_OPT_OUT_SOURCE", "agentConfig.deviceAuth.optOutSource"),
     affordance("NEMOCLAW_WEB_SEARCH_ENABLED", "agentConfig.webSearch.enabled"),
     affordance("NEMOCLAW_WEB_SEARCH_PROVIDER", "agentConfig.webSearch.provider"),
     affordance("NEMOCLAW_OPENCLAW_OTEL", "agentConfig.otel.enabled"),
@@ -542,10 +567,20 @@ export const MANAGED_STARTUP_PROFILE_AFFORDANCE_INVENTORY = {
       "derived",
     ),
     affordance("NEMOCLAW_HERMES_TOOL_GATEWAY_PRESETS_B64", "tools.enabledGateways"),
+    affordance(
+      "NEMOCLAW_HERMES_SWITCHYARD_ROUTING_B64",
+      "agentConfig.switchyardRouting",
+      "runtime-env",
+    ),
+    affordance(
+      "NEMOCLAW_HERMES_SWITCHYARD_BINDINGS_B64",
+      "agentConfig.switchyardBindings",
+      "runtime-env",
+    ),
     affordance("NEMOCLAW_WEB_SEARCH_ENABLED", "agentConfig.webSearch.enabled"),
     affordance("NEMOCLAW_WEB_SEARCH_PROVIDER", "agentConfig.webSearch.provider"),
     affordance("NEMOCLAW_MESSAGING_PLAN_B64", "messaging.plan"),
-    affordance("CHAT_UI_URL", "dashboard.url"),
+    affordance("CHAT_UI_URL", "dashboard.browserUrl"),
     affordance("NEMOCLAW_DASHBOARD_PORT", "dashboard.publicPort", "runtime-env"),
     affordance("NEMOCLAW_HERMES_DASHBOARD", "dashboard.mode", "runtime-env"),
     affordance("NEMOCLAW_HERMES_DASHBOARD_PORT", "dashboard.publicPort", "runtime-env"),
@@ -791,76 +826,171 @@ export const MANAGED_STARTUP_PROFILE_EXCLUDED_DOCKER_INPUTS = {
   openclaw: [
     { input: "BASE_IMAGE", reason: "release-composition" },
     { input: "OPENCLAW_VERSION", reason: "release-composition" },
-    { input: "OPENCLAW_2026_7_1_INTEGRITY", reason: "integrity-pin" },
-    { input: "OPENCLAW_2026_7_1_TARBALL", reason: "release-composition" },
-    { input: "OPENCLAW_DIAGNOSTICS_OTEL_2026_7_1_INTEGRITY", reason: "integrity-pin" },
-    { input: "OPENCLAW_BRAVE_PLUGIN_2026_7_1_INTEGRITY", reason: "integrity-pin" },
-    { input: "NEMOCLAW_E2E_FIXTURE_LEGACY_OPENCLAW", reason: "release-composition" },
-    { input: "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION", reason: "release-composition" },
-    { input: "OPENCLAW_2026_3_11_INTEGRITY", reason: "integrity-pin" },
-    { input: "OPENCLAW_2026_3_11_TARBALL", reason: "release-composition" },
-    { input: "OPENCLAW_2026_4_24_INTEGRITY", reason: "integrity-pin" },
-    { input: "OPENCLAW_2026_4_24_TARBALL", reason: "release-composition" },
+    { input: "OPENCLAW_2026_10_5_INTEGRITY", reason: "integrity-pin" },
+    { input: "OPENCLAW_2026_10_5_TARBALL", reason: "release-composition" },
+    {
+      input: "OPENCLAW_DIAGNOSTICS_OTEL_2026_10_5_INTEGRITY",
+      reason: "integrity-pin",
+    },
+    {
+      input: "OPENCLAW_BRAVE_PLUGIN_2026_10_5_INTEGRITY",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION",
+      reason: "release-composition",
+    },
     { input: "CODEX_ACP_0_11_1_INTEGRITY", reason: "integrity-pin" },
-    { input: "CODEX_ACP_LINUX_AMD64_0_11_1_INTEGRITY", reason: "integrity-pin" },
-    { input: "CODEX_ACP_LINUX_ARM64_0_11_1_INTEGRITY", reason: "integrity-pin" },
+    {
+      input: "CODEX_ACP_LINUX_AMD64_0_11_1_INTEGRITY",
+      reason: "integrity-pin",
+    },
+    {
+      input: "CODEX_ACP_LINUX_ARM64_0_11_1_INTEGRITY",
+      reason: "integrity-pin",
+    },
     { input: "MCPORTER_VERSION", reason: "release-composition" },
     { input: "MCPORTER_0_7_3_INTEGRITY", reason: "integrity-pin" },
     { input: "MCPORTER_0_7_3_TARBALL", reason: "release-composition" },
     { input: "NEMOCLAW_BUILD_ID", reason: "build-provenance" },
     { input: "NEMOCLAW_DARWIN_VM_COMPAT", reason: "platform-build" },
     { input: "TARGETARCH", reason: "platform-build" },
-    { input: "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER", reason: "fixed-image-contract" },
+    {
+      input: "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER",
+      reason: "fixed-image-contract",
+    },
   ],
   hermes: [
     { input: "BASE_IMAGE", reason: "release-composition" },
     { input: "SSL_CERT_FILE", reason: "fixed-image-contract" },
-    { input: "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION", reason: "release-composition" },
-    { input: "NEMOCLAW_HERMES_PROFILE_POLICY_PATCHER_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_GATEWAY_RUNTIME_METADATA_PATCHER_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_GATEWAY_PROCESS_IDENTITY_PATCHER_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_CRON_RESTORE_DRAIN_PATCHER_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_DRAIN_CONTROL_SOURCE_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_GATEWAY_RUN_SOURCE_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_DRAIN_CONTROL_PATCHED_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_GATEWAY_RUN_DRAIN_PATCHED_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_CRON_RESTORE_CONTROLLER_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_CRON_RUNTIME_PATCHER_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_IMAGE_BUILD_PROBES_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_CRON_EXECUTIONS_SOURCE_SHA256", reason: "integrity-pin" },
+    {
+      input: "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION",
+      reason: "release-composition",
+    },
+    {
+      input: "NEMOCLAW_HERMES_PROFILE_POLICY_PATCHER_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_GATEWAY_RUNTIME_METADATA_PATCHER_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_GATEWAY_PROCESS_IDENTITY_PATCHER_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_CRON_RESTORE_DRAIN_PATCHER_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_DRAIN_CONTROL_SOURCE_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_GATEWAY_RUN_SOURCE_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_DRAIN_CONTROL_PATCHED_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_GATEWAY_RUN_DRAIN_PATCHED_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_CRON_RESTORE_CONTROLLER_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_CRON_RUNTIME_PATCHER_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_IMAGE_BUILD_PROBES_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_AUXILIARY_TOKEN_LIMIT_PATCHER_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_CRON_EXECUTIONS_SOURCE_SHA256",
+      reason: "integrity-pin",
+    },
     { input: "NEMOCLAW_HERMES_BACKUP_SOURCE_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_SQLITE_TEMP_STORE_PATCHER_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_DISCORD_RECOVERY_PATCHER_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_LANGFUSE_PATCHER_SHA256", reason: "integrity-pin" },
+    {
+      input: "NEMOCLAW_HERMES_SQLITE_TEMP_STORE_PATCHER_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_DISCORD_RECOVERY_PATCHER_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_LANGFUSE_PATCHER_SHA256",
+      reason: "integrity-pin",
+    },
     { input: "NEMOCLAW_HERMES_WRAPPER_SHA256", reason: "integrity-pin" },
     { input: "NEMOCLAW_HERMES_CLI_ADAPTER_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_CLI_ADAPTER_VALIDATOR_SHA256", reason: "integrity-pin" },
+    {
+      input: "NEMOCLAW_HERMES_CLI_ADAPTER_VALIDATOR_SHA256",
+      reason: "integrity-pin",
+    },
     { input: "NEMOCLAW_HERMES_VALIDATOR_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_TIRITH_FINALIZER_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_NEUTRAL_PLATFORM_PATCHER_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_POST_PROFILE_GATEWAY_CONFIG_SHA256", reason: "integrity-pin" },
-    { input: "NEMOCLAW_HERMES_NEUTRAL_PLATFORM_OUTPUT_SHA256", reason: "integrity-pin" },
+    {
+      input: "NEMOCLAW_HERMES_TIRITH_FINALIZER_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_NEUTRAL_PLATFORM_PATCHER_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_POST_PROFILE_GATEWAY_CONFIG_SHA256",
+      reason: "integrity-pin",
+    },
+    {
+      input: "NEMOCLAW_HERMES_NEUTRAL_PLATFORM_OUTPUT_SHA256",
+      reason: "integrity-pin",
+    },
     { input: "NEMOCLAW_BUILD_ID", reason: "build-provenance" },
     { input: "NEMOCLAW_DARWIN_VM_COMPAT", reason: "platform-build" },
     { input: "TARGETARCH", reason: "platform-build" },
-    { input: "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER", reason: "fixed-image-contract" },
+    {
+      input: "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER",
+      reason: "fixed-image-contract",
+    },
   ],
   "langchain-deepagents-code": [
     { input: "BASE_IMAGE", reason: "release-composition" },
-    { input: "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION", reason: "release-composition" },
+    {
+      input: "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION",
+      reason: "release-composition",
+    },
     { input: "NEMOCLAW_BUILD_ID", reason: "build-provenance" },
     { input: "NEMOCLAW_DARWIN_VM_COMPAT", reason: "platform-build" },
     { input: "TARGETARCH", reason: "platform-build" },
-    { input: "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER", reason: "fixed-image-contract" },
+    {
+      input: "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER",
+      reason: "fixed-image-contract",
+    },
   ],
   pi: [
     { input: "BASE_IMAGE", reason: "release-composition" },
-    { input: "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION", reason: "release-composition" },
+    {
+      input: "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION",
+      reason: "release-composition",
+    },
     { input: "PI_VERSION", reason: "integrity-pin" },
     { input: "NEMOCLAW_BUILD_ID", reason: "build-provenance" },
     { input: "NEMOCLAW_DARWIN_VM_COMPAT", reason: "platform-build" },
     { input: "TARGETARCH", reason: "platform-build" },
-    { input: "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER", reason: "fixed-image-contract" },
+    {
+      input: "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER",
+      reason: "fixed-image-contract",
+    },
   ],
 } as const satisfies Record<ManagedStartupAgent, readonly ManagedStartupExcludedDockerInput[]>;
 
@@ -886,6 +1016,7 @@ const PROFILE_KEYS = new Set([
 const INFERENCE_KEYS = new Set([
   "routeProvider",
   "upstreamProvider",
+  "servingPreset",
   "model",
   "routedBaseUrl",
   "upstreamEndpointUrl",
@@ -913,6 +1044,7 @@ const HERMES_DASHBOARD_KEYS = new Set([
   "agent",
   "mode",
   "url",
+  "browserUrl",
   "publicPort",
   "internalPort",
   "tuiEnabled",
@@ -935,16 +1067,22 @@ const OPENCLAW_CONFIG_KEYS = new Set([
   "agentTimeoutSeconds",
   "heartbeatEvery",
   "extraAgents",
-  "deviceAuth",
   "minimalBootstrap",
 ]);
-const HERMES_CONFIG_KEYS = new Set(["agent", "webSearch"]);
+const LEGACY_OPENCLAW_CONFIG_KEYS = new Set([...OPENCLAW_CONFIG_KEYS, "deviceAuth"]);
+const LEGACY_DEVICE_AUTH_KEYS = new Set(["disabled", "optOutSource"]);
+const LEGACY_DEVICE_AUTH_OPT_OUT_SOURCES = new Set(["operator", "managed-onboard"]);
+const HERMES_CONFIG_KEYS = new Set([
+  "agent",
+  "webSearch",
+  "switchyardRouting",
+  "switchyardBindings",
+]);
 const DCODE_CONFIG_KEYS = new Set(["agent", "autoApprovalMode", "observabilityEnabled"]);
 const PI_CONFIG_KEYS = new Set(["agent"]);
 const PI_DASHBOARD_KEYS = new Set(["agent", "mode"]);
 const WEB_SEARCH_KEYS = new Set(["enabled", "provider"]);
 const OTEL_KEYS = new Set(["enabled", "endpointUrl", "serviceName", "sampleRate"]);
-const DEVICE_AUTH_KEYS = new Set(["disabled", "optOutSource"]);
 const EXTRA_AGENTS_KEYS = new Set(["agents", "defaults", "main"]);
 const MANAGED_STARTUP_AGENT_SET = new Set<string>(MANAGED_STARTUP_AGENTS);
 const DCODE_AUTO_APPROVAL_MODE_SET = new Set<string>(MANAGED_STARTUP_DCODE_AUTO_APPROVAL_MODES);
@@ -993,8 +1131,19 @@ function valueLooksLikeSecret(value: string): boolean {
   return false;
 }
 
-function isMessagingCredentialPlaceholder(path: readonly string[], value: unknown): boolean {
+function isMessagingCredentialPlaceholder(
+  path: readonly string[],
+  value: unknown,
+  allowedBuildStepPlaceholders: ReadonlySet<string>,
+  allowedMessagingCredentialFields: ReadonlySet<string>,
+): boolean {
   if (typeof value !== "string" || !MESSAGING_CREDENTIAL_PLACEHOLDER_RE.test(value)) {
+    return false;
+  }
+  if (
+    requiresMessagingSchemaFieldAuthorization(path) &&
+    !allowedMessagingCredentialFields.has(messagingAuthorizedFieldKey(path))
+  ) {
     return false;
   }
   const isCredentialBindingPlaceholder =
@@ -1011,7 +1160,27 @@ function isMessagingCredentialPlaceholder(path: readonly string[], value: unknow
     path[2] === "agentRender" &&
     JSON_ARRAY_INDEX_SEGMENT_RE.test(path[3] ?? "") &&
     path[4] === "value";
-  return isCredentialBindingPlaceholder || isAgentRenderValuePlaceholder;
+  const isAuthorizedBuildStepPlaceholder = allowedBuildStepPlaceholders.has(
+    buildStepPlaceholderKey(path, value),
+  );
+  return (
+    isCredentialBindingPlaceholder ||
+    isAgentRenderValuePlaceholder ||
+    isAuthorizedBuildStepPlaceholder
+  );
+}
+
+function requiresMessagingSchemaFieldAuthorization(path: readonly string[]): boolean {
+  const fieldName = path[path.length - 1];
+  return fieldName === "webhook";
+}
+
+function messagingAuthorizedFieldKey(path: readonly string[]): string {
+  return JSON.stringify(path);
+}
+
+function buildStepPlaceholderKey(path: readonly string[], value: string): string {
+  return JSON.stringify([path, value]);
 }
 
 function messagingCredentialPlaceholderEnvKey(value: string): string | null {
@@ -1020,7 +1189,7 @@ function messagingCredentialPlaceholderEnvKey(value: string): string | null {
     ? "openshell:resolve:env:"
     : "-OPENSHELL-RESOLVE-ENV-";
   const key = value.slice(value.indexOf(marker) + marker.length);
-  return key.replace(/^v[0-9]+_/u, "");
+  return key.replace(/^(?:v[0-9]{1,20}|s[a-f0-9]{64})_/u, "");
 }
 
 function containsMessagingCredentialPlaceholder(value: string): boolean {
@@ -1028,6 +1197,7 @@ function containsMessagingCredentialPlaceholder(value: string): boolean {
 }
 
 function isMessagingCredentialPlaceholderAssignment(
+  selectedAgent: unknown,
   path: readonly string[],
   value: string,
 ): boolean {
@@ -1045,8 +1215,15 @@ function isMessagingCredentialPlaceholderAssignment(
   const separator = value.indexOf("=");
   if (separator <= 0 || value.indexOf("=", separator + 1) !== -1) return false;
   const envKey = value.slice(0, separator);
-  const placeholderEnvKey = messagingCredentialPlaceholderEnvKey(value.slice(separator + 1));
-  return CREDENTIAL_ENV_NAME_PATTERN.test(envKey) && envKey === placeholderEnvKey;
+  const placeholder = value.slice(separator + 1);
+  const placeholderEnvKey = messagingCredentialPlaceholderEnvKey(placeholder);
+  return (
+    CREDENTIAL_ENV_NAME_PATTERN.test(envKey) &&
+    placeholderEnvKey !== null &&
+    (envKey === placeholderEnvKey ||
+      (typeof selectedAgent === "string" &&
+        MESSAGING_CREDENTIAL_ENV_ALIASES.has(`${selectedAgent}\0${placeholderEnvKey}\0${envKey}`)))
+  );
 }
 
 function isMessagingRuntimeEnvAliasPath(path: readonly string[]): boolean {
@@ -1066,19 +1243,34 @@ function ownDataPropertyValue(value: Record<string, unknown>, key: string): unkn
 }
 
 function isCanonicalMessagingRuntimeEnvAlias(
+  selectedAgent: unknown,
   path: readonly string[],
   value: Record<string, unknown>,
 ): boolean {
   if (!isMessagingRuntimeEnvAliasPath(path)) return false;
+  const channelId = ownDataPropertyValue(value, "channelId");
   const envKey = ownDataPropertyValue(value, "envKey");
+  const targetEnvKey = ownDataPropertyValue(value, "targetEnvKey");
   const match = ownDataPropertyValue(value, "match");
   const placeholder = ownDataPropertyValue(value, "value");
+  const expectedMatch =
+    targetEnvKey === undefined
+      ? `^openshell:resolve:env:((?:v[0-9]{1,20}|s[a-f0-9]{64})_)?${envKey}$`
+      : `^openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_${envKey}$`;
   return (
     typeof envKey === "string" &&
     CREDENTIAL_ENV_NAME_PATTERN.test(envKey) &&
-    match === `^openshell:resolve:env:(v[0-9]+_)?${envKey}$` &&
+    match === expectedMatch &&
     typeof placeholder === "string" &&
-    messagingCredentialPlaceholderEnvKey(placeholder) === envKey
+    messagingCredentialPlaceholderEnvKey(placeholder) === envKey &&
+    (targetEnvKey === undefined ||
+      (typeof selectedAgent === "string" &&
+        typeof channelId === "string" &&
+        typeof targetEnvKey === "string" &&
+        CREDENTIAL_ENV_NAME_PATTERN.test(targetEnvKey) &&
+        MESSAGING_CREDENTIAL_RUNTIME_ENV_ALIASES.has(
+          `${selectedAgent}\0${channelId}\0${envKey}\0${targetEnvKey}`,
+        )))
   );
 }
 
@@ -1093,7 +1285,7 @@ function isAllowedMessagingRuntimeAliasStringPath(
     path[2] === "runtimeSetup" &&
     path[3] === "envAliases" &&
     allowedAliasIndexes.has(path[4] ?? "") &&
-    (path[5] === "match" || path[5] === "value")
+    (path[5] === "match" || path[5] === "value" || path[5] === "targetEnvKey")
   );
 }
 
@@ -1355,7 +1547,9 @@ function cloneJsonValue(
 function requireJsonObjectOrNull(value: unknown, where: string): ManagedStartupJsonObject | null {
   if (value === null) return null;
   if (!isPlainObject(value)) invalid(`${where} must be null or a plain JSON object`);
-  return cloneJsonValue(value, where, { nullPrototypeObjects: true }) as ManagedStartupJsonObject;
+  return cloneJsonValue(value, where, {
+    nullPrototypeObjects: true,
+  }) as ManagedStartupJsonObject;
 }
 
 function requireJsonObject(value: unknown, where: string): ManagedStartupJsonObject {
@@ -1419,16 +1613,6 @@ function requireManagedProxyHost(value: unknown, where: string): string {
   return host;
 }
 
-function isLoopbackUrl(value: string): boolean {
-  const hostname = new URL(value).hostname.toLowerCase();
-  return (
-    hostname === "localhost" ||
-    hostname === "127.0.0.1" ||
-    hostname === "::1" ||
-    hostname === "[::1]"
-  );
-}
-
 function configuredDashboardPort(value: string): number {
   const explicit = new URL(value).port;
   return explicit === "" ? 18_789 : Number(explicit);
@@ -1448,6 +1632,9 @@ function assertPayloadStructureAndCredentialShapes(root: unknown): void {
     path: readonly string[];
   }> = [{ value: root, depth: 0, path: [] }];
   const allowedRuntimeAliasIndexes = new Set<string>();
+  const allowedMessagingCredentialFields = new Set<string>();
+  const allowedBuildStepPlaceholders = new Set<string>();
+  const selectedAgent = isPlainObject(root) ? ownDataPropertyValue(root, "agent") : undefined;
   let discoveredNodes = 1;
   let observedBytes = 0;
 
@@ -1476,8 +1663,13 @@ function assertPayloadStructureAndCredentialShapes(root: unknown): void {
       observeText(current.value);
       if (
         !isAllowedMessagingRuntimeAliasStringPath(current.path, allowedRuntimeAliasIndexes) &&
-        !isMessagingCredentialPlaceholder(current.path, current.value) &&
-        !isMessagingCredentialPlaceholderAssignment(current.path, current.value) &&
+        !isMessagingCredentialPlaceholder(
+          current.path,
+          current.value,
+          allowedBuildStepPlaceholders,
+          allowedMessagingCredentialFields,
+        ) &&
+        !isMessagingCredentialPlaceholderAssignment(selectedAgent, current.path, current.value) &&
         (valueLooksLikeSecret(current.value) ||
           containsMessagingCredentialPlaceholder(current.value))
       ) {
@@ -1535,8 +1727,29 @@ function assertPayloadStructureAndCredentialShapes(root: unknown): void {
       if ("toJSON" in current.value) {
         invalid("payload must not define a custom JSON serializer");
       }
-      if (isCanonicalMessagingRuntimeEnvAlias(current.path, current.value)) {
+      if (isCanonicalMessagingRuntimeEnvAlias(selectedAgent, current.path, current.value)) {
         allowedRuntimeAliasIndexes.add(current.path[4] as string);
+      }
+      const messagingPlanSection = current.path[2];
+      if (
+        current.path.length === 4 &&
+        current.path[0] === "messaging" &&
+        current.path[1] === "plan" &&
+        (messagingPlanSection === "buildSteps" || messagingPlanSection === "agentRender") &&
+        JSON_ARRAY_INDEX_SEGMENT_RE.test(current.path[3] ?? "")
+      ) {
+        for (const authorization of authorizeMessagingManagedStartupFields(
+          current.value,
+          messagingPlanSection,
+        )) {
+          const authorizedPath = [...current.path, ...authorization.path];
+          allowedMessagingCredentialFields.add(messagingAuthorizedFieldKey(authorizedPath));
+          if (typeof authorization.value === "string") {
+            allowedBuildStepPlaceholders.add(
+              buildStepPlaceholderKey(authorizedPath, authorization.value),
+            );
+          }
+        }
       }
       const keys = Object.getOwnPropertyNames(current.value);
       if (
@@ -1567,7 +1780,15 @@ function assertPayloadStructureAndCredentialShapes(root: unknown): void {
         const child = descriptor.value;
         if (
           isCredentialShapedName(key) &&
-          !isMessagingCredentialPlaceholder([...current.path, key], child) &&
+          !allowedMessagingCredentialFields.has(
+            messagingAuthorizedFieldKey([...current.path, key]),
+          ) &&
+          !isMessagingCredentialPlaceholder(
+            [...current.path, key],
+            child,
+            allowedBuildStepPlaceholders,
+            allowedMessagingCredentialFields,
+          ) &&
           !isMessagingPackagePin([...current.path, key], child)
         ) {
           invalid(
@@ -1651,22 +1872,10 @@ function validateExtraAgents(value: unknown): ManagedStartupExtraAgents {
   };
 }
 
-function validateDeviceAuth(value: unknown): ManagedStartupDeviceAuth {
-  const deviceAuth = requireRecord(value, "agentConfig.deviceAuth");
-  rejectUnknownKeys(deviceAuth, DEVICE_AUTH_KEYS, "agentConfig.deviceAuth");
-  return {
-    disabled: requireBoolean(deviceAuth.disabled, "agentConfig.deviceAuth.disabled"),
-    optOutSource: requireStringEnum<ManagedStartupDeviceAuthOptOutSource>(
-      deviceAuth.optOutSource,
-      new Set(["operator", "managed-onboard"]),
-      "agentConfig.deviceAuth.optOutSource",
-    ),
-  };
-}
-
 function validateAgentConfig(
   value: unknown,
   expectedAgent: ManagedStartupAgent,
+  allowStoredLegacyRouting: boolean,
 ): ManagedStartupAgentConfig {
   const config = requireRecord(value, "agentConfig");
   const agent = requireStringEnum<ManagedStartupAgent>(
@@ -1699,13 +1908,33 @@ function validateAgentConfig(
       ),
       heartbeatEvery,
       extraAgents: validateExtraAgents(config.extraAgents),
-      deviceAuth: validateDeviceAuth(config.deviceAuth),
       minimalBootstrap: requireBoolean(config.minimalBootstrap, "agentConfig.minimalBootstrap"),
     };
   }
   if (agent === "hermes") {
     rejectUnknownKeys(config, HERMES_CONFIG_KEYS, "agentConfig");
-    return { agent, webSearch: validateWebSearch(config.webSearch, agent) };
+    const hasSwitchyardRouting = Object.hasOwn(config, "switchyardRouting");
+    const switchyardRouting =
+      !hasSwitchyardRouting || config.switchyardRouting === null
+        ? null
+        : validateHermesSwitchyardRoutingIntent(config.switchyardRouting);
+    const hasBindings = Object.hasOwn(config, "switchyardBindings");
+    const legacyUnboundRouting =
+      allowStoredLegacyRouting && switchyardRouting?.judge.mode === "reuse-capable" && !hasBindings;
+    const switchyardBindings =
+      switchyardRouting && !legacyUnboundRouting
+        ? validateSwitchyardProviderBindings(config.switchyardBindings, switchyardRouting)
+        : null;
+    if (!switchyardRouting && config.switchyardBindings != null)
+      invalid("Switchyard bindings require an explicit routing configuration");
+    return {
+      agent,
+      webSearch: validateWebSearch(config.webSearch, agent),
+      ...(hasSwitchyardRouting ? { switchyardRouting } : {}),
+      ...(hasBindings || (switchyardRouting && !legacyUnboundRouting)
+        ? { switchyardBindings }
+        : {}),
+    };
   }
 
   if (agent === "pi") {
@@ -1754,7 +1983,8 @@ function validateDashboard(
       "dashboard.bindAddress",
     );
     const wslExposure = requireBoolean(dashboard.wslExposure, "dashboard.wslExposure");
-    const hasRemoteExposure = !isLoopbackUrl(url) || bindAddress === "0.0.0.0" || wslExposure;
+    const hasRemoteExposure =
+      !isLoopbackDashboardUrl(url) || bindAddress === "0.0.0.0" || wslExposure;
     if ((mode === "remote") !== hasRemoteExposure) {
       invalid("OpenClaw dashboard.mode must reflect its URL, bind address, and WSL exposure");
     }
@@ -1783,8 +2013,19 @@ function validateDashboard(
       "dashboard.mode",
     );
     const url = requireHttpUrl(dashboard.url, "dashboard.url");
-    if (!isLoopbackUrl(url)) {
+    if (!isLoopbackDashboardUrl(url)) {
       invalid("Hermes dashboard.url must remain loopback; OpenShell owns the host forward");
+    }
+    const browserUrl =
+      dashboard.browserUrl === undefined
+        ? undefined
+        : requireHttpUrl(dashboard.browserUrl, "dashboard.browserUrl");
+    if (
+      browserUrl !== undefined &&
+      !isLoopbackDashboardUrl(browserUrl) &&
+      new URL(browserUrl).protocol !== "https:"
+    ) {
+      invalid("Hermes dashboard.browserUrl must use HTTPS unless it is loopback");
     }
     if (mode === "disabled") {
       if (
@@ -1798,6 +2039,7 @@ function validateDashboard(
         agent,
         mode,
         url,
+        ...(browserUrl === undefined ? {} : { browserUrl }),
         publicPort: null,
         internalPort: null,
         tuiEnabled: false,
@@ -1816,10 +2058,18 @@ function validateDashboard(
     if (configuredDashboardPort(url) !== publicPort) {
       invalid("Hermes dashboard.publicPort must match dashboard.url");
     }
+    if (
+      browserUrl !== undefined &&
+      isLoopbackDashboardUrl(browserUrl) &&
+      configuredDashboardPort(browserUrl) !== publicPort
+    ) {
+      invalid("Hermes dashboard.publicPort must match dashboard.browserUrl");
+    }
     return {
       agent,
       mode,
       url,
+      ...(browserUrl === undefined ? {} : { browserUrl }),
       publicPort,
       internalPort,
       tuiEnabled: requireBoolean(dashboard.tuiEnabled, "dashboard.tuiEnabled"),
@@ -1839,7 +2089,15 @@ function validateDashboard(
   return { agent, mode: "disabled" };
 }
 
-function validateInference(value: unknown, agent: ManagedStartupAgent): ManagedStartupInference {
+function validateInference(
+  value: unknown,
+  agent: ManagedStartupAgent,
+): ManagedStartupInference | null {
+  if (value === null) {
+    if (agent !== "openclaw" && agent !== "hermes")
+      invalid(`${agent} requires inference configuration`);
+    return null;
+  }
   const inference = requireRecord(value, "inference");
   rejectUnknownKeys(inference, INFERENCE_KEYS, "inference");
   const routeProvider = requireBoundedString(inference.routeProvider, "inference.routeProvider");
@@ -1847,6 +2105,12 @@ function validateInference(value: unknown, agent: ManagedStartupAgent): ManagedS
     inference.upstreamProvider,
     "inference.upstreamProvider",
   );
+  const servingPreset =
+    inference.servingPreset === undefined
+      ? undefined
+      : inference.servingPreset === null
+        ? null
+        : requireBoundedString(inference.servingPreset, "inference.servingPreset");
   const model = requireBoundedString(inference.model, "inference.model", MAX_MODEL_BYTES);
   const api = requireStringEnum<ManagedStartupInferenceApi>(
     inference.api,
@@ -1894,10 +2158,7 @@ function validateInference(value: unknown, agent: ManagedStartupAgent): ManagedS
     if (primaryModelRef !== null || compatibility !== null || inputModalities !== null) {
       invalid(`${agent} does not support primaryModelRef, compatibility, or inputModalities`);
     }
-    if (
-      agent === "langchain-deepagents-code" &&
-      !isValidDcodeUpstreamProvider(upstreamProvider)
-    ) {
+    if (agent === "langchain-deepagents-code" && !isValidDcodeUpstreamProvider(upstreamProvider)) {
       invalid(
         "inference.upstreamProvider must start with an ASCII letter or digit and contain 1-64 ASCII letters, digits, dots, underscores, or hyphens for DCode",
       );
@@ -1907,6 +2168,7 @@ function validateInference(value: unknown, agent: ManagedStartupAgent): ManagedS
   return {
     routeProvider,
     upstreamProvider,
+    ...(servingPreset === undefined ? {} : { servingPreset }),
     model,
     routedBaseUrl: requireHttpUrl(inference.routedBaseUrl, "inference.routedBaseUrl"),
     upstreamEndpointUrl,
@@ -2010,8 +2272,17 @@ function validateTuning(value: unknown, agent: ManagedStartupAgent): ManagedStar
  * lists are sorted so all producers fingerprint the same resolved intent.
  */
 export function validateManagedStartupProfile(value: unknown): ManagedStartupProfile {
+  return validateManagedStartupProfileValue(value, false);
+}
+
+function validateManagedStartupProfileValue(
+  value: unknown,
+  allowStoredLegacyRouting: boolean,
+): ManagedStartupProfile {
   assertPayloadStructureAndCredentialShapes(value);
-  const ownedValue = cloneJsonValue(value, "profile", { nullPrototypeObjects: true });
+  const ownedValue = cloneJsonValue(value, "profile", {
+    nullPrototypeObjects: true,
+  });
   assertPayloadWithinByteLimit(ownedValue);
   const profile = requireRecord(ownedValue, "profile");
   rejectUnknownKeys(profile, PROFILE_KEYS, "profile");
@@ -2039,7 +2310,6 @@ export function validateManagedStartupProfile(value: unknown): ManagedStartupPro
   ) {
     invalid("messaging.plan must be a version 1 plan for the selected agent");
   }
-
   const corporateCa = requireRecord(profile.corporateCa, "corporateCa");
   rejectUnknownKeys(corporateCa, CORPORATE_CA_KEYS, "corporateCa");
   const bundleSha256 = corporateCa.bundleSha256;
@@ -2050,16 +2320,8 @@ export function validateManagedStartupProfile(value: unknown): ManagedStartupPro
     invalid("corporateCa.bundleSha256 must be null or a lowercase SHA-256 digest");
   }
 
-  const agentConfig = validateAgentConfig(profile.agentConfig, agent);
+  const agentConfig = validateAgentConfig(profile.agentConfig, agent, allowStoredLegacyRouting);
   const dashboard = validateDashboard(profile.dashboard, agent);
-  if (
-    agentConfig.agent === "openclaw" &&
-    dashboard.agent === "openclaw" &&
-    dashboard.mode === "remote" &&
-    !agentConfig.deviceAuth.disabled
-  ) {
-    invalid("remote OpenClaw dashboard exposure requires device auth to be disabled");
-  }
 
   return {
     schemaVersion: MANAGED_STARTUP_PROFILE_SCHEMA_VERSION,
@@ -2074,6 +2336,54 @@ export function validateManagedStartupProfile(value: unknown): ManagedStartupPro
     },
     tuning: validateTuning(profile.tuning, agent),
     corporateCa: { bundleSha256 },
+  };
+}
+
+interface ManagedStartupProfileDecodeMigration {
+  readonly value: unknown;
+  readonly migratedLegacyProfile: boolean;
+}
+
+function migrateDecodedManagedStartupProfile(value: unknown): ManagedStartupProfileDecodeMigration {
+  const profile = requireRecord(value, "profile");
+  if (profile.schemaVersion !== LEGACY_MANAGED_STARTUP_PROFILE_SCHEMA_VERSION) {
+    return {
+      value,
+      migratedLegacyProfile: false,
+    };
+  }
+
+  rejectUnknownKeys(profile, PROFILE_KEYS, "profile");
+  if (profile.agent !== "openclaw") {
+    return {
+      value: {
+        ...profile,
+        schemaVersion: MANAGED_STARTUP_PROFILE_SCHEMA_VERSION,
+      },
+      migratedLegacyProfile: true,
+    };
+  }
+
+  const agentConfig = requireRecord(profile.agentConfig, "agentConfig");
+  rejectUnknownKeys(agentConfig, LEGACY_OPENCLAW_CONFIG_KEYS, "agentConfig");
+  const deviceAuth = requireRecord(agentConfig.deviceAuth, "agentConfig.deviceAuth");
+  rejectUnknownKeys(deviceAuth, LEGACY_DEVICE_AUTH_KEYS, "agentConfig.deviceAuth");
+  requireBoolean(deviceAuth.disabled, "agentConfig.deviceAuth.disabled");
+  requireStringEnum(
+    deviceAuth.optOutSource,
+    LEGACY_DEVICE_AUTH_OPT_OUT_SOURCES,
+    "agentConfig.deviceAuth.optOutSource",
+  );
+
+  const migratedAgentConfig = { ...agentConfig };
+  Reflect.deleteProperty(migratedAgentConfig, "deviceAuth");
+  return {
+    value: {
+      ...profile,
+      schemaVersion: MANAGED_STARTUP_PROFILE_SCHEMA_VERSION,
+      agentConfig: migratedAgentConfig,
+    },
+    migratedLegacyProfile: true,
   };
 }
 
@@ -2094,14 +2404,17 @@ function canonicalizeJson(value: unknown): unknown {
   return result;
 }
 
-/** Canonical JSON used by both the transport and fingerprint. */
-export function serializeManagedStartupProfile(profile: ManagedStartupProfile): string {
-  const validated = validateManagedStartupProfile(profile);
-  const serialized = JSON.stringify(canonicalizeJson(validated));
+function serializeValidatedManagedStartupProfile(profile: ManagedStartupProfile): string {
+  const serialized = JSON.stringify(canonicalizeJson(profile));
   if (Buffer.byteLength(serialized, "utf8") > MANAGED_STARTUP_PROFILE_MAX_BYTES) {
     invalid(`canonical payload exceeds ${String(MANAGED_STARTUP_PROFILE_MAX_BYTES)} bytes`);
   }
   return serialized;
+}
+
+/** Canonical JSON used by both the transport and fingerprint. */
+export function serializeManagedStartupProfile(profile: ManagedStartupProfile): string {
+  return serializeValidatedManagedStartupProfile(validateManagedStartupProfile(profile));
 }
 
 /** Encode canonical JSON as unpadded base64url for transport through argv or an environment variable. */
@@ -2109,8 +2422,15 @@ export function encodeManagedStartupProfile(profile: ManagedStartupProfile): str
   return Buffer.from(serializeManagedStartupProfile(profile), "utf8").toString("base64url");
 }
 
-/** Decode only the canonical representation produced by encodeManagedStartupProfile. */
+/** Decode the current canonical representation or migrate one canonical prior-version profile. */
 export function decodeManagedStartupProfile(encoded: string): ManagedStartupProfile {
+  return decodeManagedStartupProfileValue(encoded, false);
+}
+
+function decodeManagedStartupProfileValue(
+  encoded: string,
+  allowStoredLegacyRouting: boolean,
+): ManagedStartupProfile {
   if (
     typeof encoded !== "string" ||
     encoded.length === 0 ||
@@ -2141,11 +2461,27 @@ export function decodeManagedStartupProfile(encoded: string): ManagedStartupProf
   } catch {
     invalid("payload is not valid JSON");
   }
-  const profile = validateManagedStartupProfile(parsed);
-  if (serializeManagedStartupProfile(profile) !== raw) {
+  const migration = migrateDecodedManagedStartupProfile(parsed);
+  const profile = validateManagedStartupProfileValue(migration.value, allowStoredLegacyRouting);
+  const canonicalPayload = migration.migratedLegacyProfile
+    ? JSON.stringify(canonicalizeJson(parsed))
+    : serializeValidatedManagedStartupProfile(profile);
+  if (canonicalPayload !== raw) {
     invalid("payload is not in canonical form");
   }
   return profile;
+}
+
+/** Read historical receipt identity without exposing an unbound profile for execution. */
+export function readStoredManagedStartupProfileMetadata(encoded: string): {
+  readonly agent: ManagedStartupAgent;
+  readonly corporateCaBundleSha256: string | null;
+} {
+  const profile = decodeManagedStartupProfileValue(encoded, true);
+  return {
+    agent: profile.agent,
+    corporateCaBundleSha256: profile.corporateCa.bundleSha256,
+  };
 }
 
 /** SHA-256 over canonical decoded JSON, independent of object key insertion order. */

@@ -7,6 +7,7 @@ import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import ts from "typescript";
+import type {} from "vitest";
 import { createVitest } from "vitest/node";
 
 import { REPO_ROOT } from "../../test/e2e/fixtures/paths.ts";
@@ -21,7 +22,7 @@ import {
 } from "./workflow-boundary.mts";
 import { buildE2eWorkflowPlan } from "./workflow-plan.mts";
 
-declare module "@vitest/runner" {
+declare module "vitest" {
   interface TaskMeta {
     e2ePhases?: readonly string[];
   }
@@ -369,13 +370,29 @@ type ObservedChildProgressPolicy = { kind: "path"; path: string };
 // retain the unforgeable TestProgress capability enforced by TypeScript.
 const OBSERVED_CHILD_PROGRESS_POLICIES = new Map<string, ObservedChildProgressPolicy>([
   [
+    "test/e2e/fixtures/forward-restart-observation.ts#observeForwardRestart",
+    { kind: "path", path: "options.progress" },
+  ],
+  [
     "test/e2e/fixtures/fake-openai-compatible.ts#startFakeOpenAiCompatibleServer",
     { kind: "path", path: "options.progress" },
   ],
   ["test/e2e/fixtures/shell-probe.ts#run", { kind: "path", path: "this.progress" }],
+  [
+    "test/e2e/fixtures/portable-sandbox-build-diagnostics.ts#runPodmanBuild",
+    { kind: "path", path: "progress" },
+  ],
+  [
+    "tools/e2e/dgx-station-cleanup.mts#runStationCleanupCommand",
+    { kind: "path", path: "options.progress" },
+  ],
   ["test/e2e/fixtures/docker-probe.ts#run", { kind: "path", path: "this.progress" }],
   [
     "test/e2e/live/openshell-gateway-auth-source-contract-helpers.ts#runOpenShellGatewayAuthSourceContractScenarioUnchecked",
+    { kind: "path", path: "progress" },
+  ],
+  [
+    "test/e2e/live/external-gateway-health-helpers.ts#startPreparedExternalTlsGateway",
     { kind: "path", path: "progress" },
   ],
   [
@@ -387,6 +404,7 @@ const OBSERVED_CHILD_PROGRESS_POLICIES = new Map<string, ObservedChildProgressPo
     { kind: "path", path: "options.progress" },
   ],
   ["test/e2e/live/ollama-auth-proxy.test.ts#spawnLogged", { kind: "path", path: "progress" }],
+  ["test/e2e/live/gpu-e2e-helpers.ts#startAttachedOllama", { kind: "path", path: "progress" }],
   [
     "test/e2e/live/podman-cpu-lifecycle-helpers.ts#startPinnedGateway",
     { kind: "path", path: "progress" },
@@ -409,6 +427,14 @@ const OBSERVED_CHILD_PROGRESS_POLICIES = new Map<string, ObservedChildProgressPo
   ],
   [
     "test/e2e/live/onboard-interactive-pty.ts#driveInteractiveCommand",
+    { kind: "path", path: "options.progress" },
+  ],
+  [
+    "test/e2e/live/dashboard-connect-handoff.ts#runDashboardConnectUntilForwardHandoff",
+    { kind: "path", path: "options.progress" },
+  ],
+  [
+    "test/e2e/fixtures/hermes-acp-live.ts#runHermesAcpLiveScenario",
     { kind: "path", path: "options.progress" },
   ],
 ]);

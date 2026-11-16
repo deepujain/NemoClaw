@@ -44,16 +44,21 @@ describe("base image resolution flow", () => {
     vi.clearAllMocks();
   });
 
-  it.each([
-    "1",
-    "true",
-    "YES",
-    "on",
-  ])("recognizes the %s refresh environment value (#4680)", (value) => {
-    expect(isSandboxBaseImageRefreshRequested({ NEMOCLAW_SANDBOX_BASE_IMAGE_REFRESH: value })).toBe(
-      true,
-    );
+  it("does not inspect Docker for a recorded Podman image during recreate", () => {
+    const context = createBaseImageResolutionContext({ fresh: false, env: {} });
+    captureBaseResolution(context, "registry.example/agent@sha256:" + "a".repeat(64), "podman");
+    expect(context.resolutionHint).toBeNull();
+    expect(mocks.dockerImageInspectFormat).not.toHaveBeenCalled();
   });
+
+  it.each(["1", "true", "YES", "on"])(
+    "recognizes the %s refresh environment value (#4680)",
+    (value) => {
+      expect(
+        isSandboxBaseImageRefreshRequested({ NEMOCLAW_SANDBOX_BASE_IMAGE_REFRESH: value }),
+      ).toBe(true);
+    },
+  );
 
   it("captures a recorded hint for warm runs and exposes patch options (#4680)", () => {
     mocks.dockerImageInspectFormat.mockReturnValue(
@@ -117,6 +122,46 @@ describe("base image resolution flow", () => {
       forceBaseImageRefresh: true,
     });
     expect(context.preResolvedMetadata).toBe(resolvedMetadata);
+  });
+
+  it("uses the authenticated outer rebuild resolution instead of the source sandbox hint", () => {
+    const targetMetadata: SandboxBaseImageResolutionMetadata = {
+      ...recordedMetadata,
+      key: "target-key",
+      ref: "ghcr.io/nvidia/nemoclaw/sandbox-base@sha256:target",
+      digest: "sha256:target",
+      imageId: "sha256:target-image",
+    };
+    const context = createBaseImageResolutionContext({
+      fresh: false,
+      initialHint: recordedMetadata,
+      initialPreResolvedMetadata: targetMetadata,
+      env: {},
+    });
+    const createAgentSandbox = vi.fn(() => ({
+      buildCtx: "/tmp/hermes-build",
+      stagedDockerfile: "/tmp/hermes-build/Dockerfile",
+      baseImageResolutionMetadata: targetMetadata,
+    }));
+
+    createAgentSandboxWithResolution(
+      context,
+      { name: "hermes" } as AgentDefinition,
+      createAgentSandbox,
+    );
+
+    expect(createAgentSandbox).toHaveBeenCalledWith(
+      { name: "hermes" },
+      {
+        resolutionHint: targetMetadata,
+        forceBaseImageRefresh: false,
+      },
+    );
+    expect(getBaseImageResolutionPatchOptions(context)).toEqual({
+      resolutionHint: targetMetadata,
+      preResolvedBaseImageMetadata: targetMetadata,
+      forceBaseImageRefresh: false,
+    });
   });
 
   it("retains canonical outer metadata when a bound local lease emits no metadata", () => {

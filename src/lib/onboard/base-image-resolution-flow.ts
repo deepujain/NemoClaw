@@ -41,9 +41,13 @@ export function createBaseImageResolutionContext(options: {
   initialPreResolvedMetadata?: SandboxBaseImageResolutionMetadata | null;
   env?: NodeJS.ProcessEnv;
 }): BaseImageResolutionContext {
+  const preResolvedMetadata = options.initialPreResolvedMetadata ?? null;
   return {
-    resolutionHint: options.initialHint ?? null,
-    preResolvedMetadata: options.initialPreResolvedMetadata ?? null,
+    // A rebuild's authenticated outer resolution is the create authority. The
+    // source sandbox hint is cleanup/recovery context and must not select the
+    // replacement image when both values are present.
+    resolutionHint: preResolvedMetadata ?? options.initialHint ?? null,
+    preResolvedMetadata,
     forceRefresh: options.fresh || isSandboxBaseImageRefreshRequested(options.env ?? process.env),
   };
 }
@@ -51,9 +55,10 @@ export function createBaseImageResolutionContext(options: {
 export function captureBaseResolution(
   context: BaseImageResolutionContext,
   sandboxImageRef: string | null | undefined,
+  driverName?: string | null,
 ): void {
   if (!context.forceRefresh && !context.resolutionHint && sandboxImageRef) {
-    context.resolutionHint = readSandboxBaseImageResolutionMetadata(sandboxImageRef);
+    context.resolutionHint = readSandboxBaseImageResolutionMetadata(sandboxImageRef, driverName);
   }
 }
 

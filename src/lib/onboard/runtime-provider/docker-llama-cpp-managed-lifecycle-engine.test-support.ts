@@ -4,7 +4,10 @@
 import { vi } from "vitest";
 
 import type { ContainerEngine } from "../../adapters/container-engine";
-import { buildLlamaCppHostLocalServerArgv } from "../../inference/llama-cpp/host-local-runtime";
+import {
+  buildLlamaCppHostLocalServerArgv,
+  LLAMA_CPP_HOST_LOCAL_SERVER_PATH,
+} from "../../inference/llama-cpp/host-local-runtime";
 import {
   contract,
   IMAGE,
@@ -32,8 +35,10 @@ export interface DockerFixture {
   }) => void;
   readonly setOpenShellBridgeSubnet: (value: string) => void;
   readonly driftHardening: () => void;
+  readonly driftEntrypoint: () => void;
   readonly dropTmpfs: () => void;
   readonly driftGpuRequest: (driver: string | undefined, count: number) => void;
+  readonly driftGpuDeviceIds: (ids: readonly string[]) => void;
   readonly driftExtraDeviceAuthority: (kind: "cap-add" | "legacy-device") => void;
   readonly failInspectWithDaemonError: () => void;
   readonly setAbsentNetworkInspectError: (value: string) => void;
@@ -52,6 +57,7 @@ interface DockerFixturePaths {
   readonly apiKeyPath: string;
   readonly modelPath: string;
   readonly networkName: string;
+  readonly serverPort?: number;
 }
 
 export function createDockerFixture(
@@ -60,7 +66,13 @@ export function createDockerFixture(
   publishedHostPort?: string,
   publishedHostIp = "127.0.0.1",
   publishedBindingCount = 0,
+  imageReference = IMAGE,
 ): DockerFixture {
+  const launchContract = {
+    ...contract(),
+    serve: { ...contract().serve, port: paths.serverPort ?? contract().serve.port },
+  };
+  const portKey = `${launchContract.serve.port}/tcp`;
   const effectivePublishedHostPort = publishedHostPort ?? (configuredHostPort || "49152");
   let networkId = NETWORK_ID;
   let networkPresent = false;
@@ -81,6 +93,7 @@ export function createDockerFixture(
   };
   let gpuDriver: string | undefined = "nvidia";
   let gpuCount = 1;
+  let gpuDeviceIds: readonly string[] | null = null;
   let capAdd: null | string[] = null;
   let legacyDevices: null | object[] = null;
   let inspectDaemonError = false;
@@ -99,6 +112,7 @@ export function createDockerFixture(
         status: string;
         transactionId: string;
         command: string[];
+        entrypoint: string[];
       }
     | undefined;
   const inspection = () => [
@@ -106,8 +120,9 @@ export function createDockerFixture(
       Id: RUNTIME_ID,
       Name: "/nemoclaw-llama-cpp",
       Config: {
-        Image: IMAGE,
+        Image: imageReference,
         User: "1001:1001",
+        Entrypoint: container?.entrypoint ?? [],
         Cmd: container?.command ?? [],
         Labels: container?.labels ?? {},
       },
@@ -115,7 +130,7 @@ export function createDockerFixture(
         NetworkMode: paths.networkName,
         RestartPolicy: { Name: "unless-stopped", MaximumRetryCount: 0 },
         PortBindings: configuredHostPort
-          ? { "8081/tcp": [{ HostIp: "127.0.0.1", HostPort: configuredHostPort }] }
+          ? { [portKey]: [{ HostIp: "127.0.0.1", HostPort: configuredHostPort }] }
           : {},
         ReadonlyRootfs: !hardeningDrift,
         CapDrop: ["ALL"],
@@ -127,7 +142,7 @@ export function createDockerFixture(
           {
             ...(gpuDriver === undefined ? {} : { Driver: gpuDriver }),
             Count: gpuCount,
-            DeviceIDs: null,
+            DeviceIDs: gpuDeviceIds,
             Capabilities: [["gpu"]],
             Options: {},
           },
@@ -149,7 +164,7 @@ export function createDockerFixture(
           },
         },
         Ports: {
-          "8081/tcp":
+          [portKey]:
             startedOnce && publishedBindingCount > 0
               ? Array.from({ length: publishedBindingCount }, () => ({
                   HostIp: publishedHostIp,
@@ -177,6 +192,8 @@ export function createDockerFixture(
   const capture = vi.fn((args: readonly string[]) => {
     const unexpected = `unexpected Docker command: ${args.join(" ")}`;
     switch (args[0]) {
+      case "version":
+        return { status: 0, stdout: "29.8.0", stderr: "" };
       case "network":
         switch (args[1]) {
           case "inspect":
@@ -286,12 +303,20 @@ export function createDockerFixture(
             )
             .filter(([name, value]) => Boolean(name && value)),
         );
+        const requestedGpus = args[args.indexOf("--gpus") + 1] ?? "";
+        if (requestedGpus.startsWith("driver=nvidia,device=")) {
+          gpuCount = 0;
+          gpuDeviceIds = [requestedGpus.slice("driver=nvidia,device=".length)];
+        }
         container = {
           labels,
           running: false,
           status: "created",
           transactionId: labels["io.nvidia.nemoclaw.host-local-inference.transaction-sha256"] ?? "",
-          command: args.slice(args.indexOf(IMAGE) + 1),
+          command: args.slice(args.indexOf(imageReference) + 1),
+          entrypoint: args.includes("--entrypoint")
+            ? [String(args[args.indexOf("--entrypoint") + 1] ?? "")]
+            : [LLAMA_CPP_HOST_LOCAL_SERVER_PATH],
         };
         createHook?.();
         return { status: 0, stdout: createStdout, stderr: "" };
@@ -363,11 +388,16 @@ export function createDockerFixture(
     failSandboxBridgeProbe: (result) => (sandboxBridgeProbeFailure = result),
     setOpenShellBridgeSubnet: (value) => (openShellBridgeSubnet = value),
     driftHardening: () => (hardeningDrift = true),
+    driftEntrypoint: () => {
+      invariant(container !== undefined, "cannot drift an absent fixture container");
+      container.entrypoint = ["/usr/local/bin/unexpected-server"];
+    },
     dropTmpfs: () => (tmpfs = null),
     driftGpuRequest: (driver, count) => {
       gpuDriver = driver;
       gpuCount = count;
     },
+    driftGpuDeviceIds: (ids) => (gpuDeviceIds = [...ids]),
     driftExtraDeviceAuthority: (kind) => {
       kind === "cap-add"
         ? (capAdd = ["SYS_ADMIN"])
@@ -410,8 +440,19 @@ export function createDockerFixture(
         running,
         status: running ? "running" : "created",
         transactionId: journal.transactionId,
-        command: [...buildLlamaCppHostLocalServerArgv(contract())],
+        command: [...buildLlamaCppHostLocalServerArgv(launchContract)],
+        entrypoint: [LLAMA_CPP_HOST_LOCAL_SERVER_PATH],
       };
     },
   };
+}
+
+export function dockerCommandPrefixes(fixture: DockerFixture): unknown[] {
+  return fixture.capture.mock.calls.map((call) => call[0]?.slice(0, 2));
+}
+
+export function hostNetworkRuns(fixture: DockerFixture): readonly (readonly string[])[] {
+  return fixture.capture.mock.calls
+    .map(([argv]) => argv as readonly string[])
+    .filter((argv) => argv[0] === "run" && argv[argv.indexOf("--network") + 1] === "host");
 }

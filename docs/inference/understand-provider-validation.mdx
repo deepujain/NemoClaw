@@ -10,11 +10,14 @@ content:
   type: "concept"
 ---
 NemoClaw validates the selected provider and model before it creates a sandbox.
-The exact request depends on the provider API that the agent uses.
+The request depends on the provider API that the agent uses.
 
 ## Credential Validation
 
-When credential validation fails, the onboarding wizard lets you re-enter the API key, choose another provider, retry, or exit.
+Credential recovery requires interactive terminals for both standard input and standard error.
+When both streams are available, choose `retry` to open the secure API-key prompt, `back` to choose another provider, or `exit` to stop onboarding.
+If either stream is not an interactive terminal, NemoClaw exits with a nonzero status.
+Rerun onboarding with both streams attached to retry credential entry.
 NemoClaw retries transient upstream failures before it reports a provider failure.
 After a fatal provider or inference-validation failure before sandbox creation, NemoClaw attempts to release an unowned NemoClaw-managed OpenShell gateway and remove its registration so provider credentials do not remain in a live process.
 It preserves a gateway that another registered sandbox uses, an external supervisor owns, or whose teardown authority cannot be proven.
@@ -24,6 +27,12 @@ The `nvapi-` prefix check applies only to `NVIDIA_INFERENCE_API_KEY`.
 OpenRouter keys must be non-empty and begin with `sk-or-`.
 Other provider keys use provider-aware validation during the retry flow.
 
+## Native Local Provider Profile Verification
+
+During native local endpoint onboarding, NemoClaw retains the expected OpenShell provider profile after a successful inspection and checks it again after attaching the provider.
+If the profile changed or the follow-up export fails or times out, NemoClaw warns the gateway operator without rolling back the attachment.
+Ask the gateway operator to inspect the profile before you rely on its credential boundary.
+
 ## Provider Requests
 
 NemoClaw sends a provider-specific request that exercises the API surface intended for the route.
@@ -31,7 +40,7 @@ NemoClaw sends a provider-specific request that exercises the API surface intend
 | Provider | Validation request |
 |---|---|
 | OpenAI | Tries `/responses`, then `/chat/completions`. |
-| NVIDIA Endpoints | Uses `/v1/chat/completions` and skips `/v1/responses`. |
+| NVIDIA Endpoints | Uses `/v1/chat/completions` for model and smoke validation and skips `/v1/responses`. |
 | OpenRouter | Uses `/v1/chat/completions` for catalog, model, and smoke validation. |
 | Google Gemini | Uses the OpenAI-compatible chat-completions path and skips `/v1/responses`. |
 | Other OpenAI-compatible endpoint | Tries `/v1/responses` with tool-calling and streaming checks, then falls back to `/v1/chat/completions`. |
@@ -49,8 +58,23 @@ If the last retry fails or times out, validation stops without another Chat Comp
 
 <AgentOnly variant="deepagents">
 
-The managed Deep Agents runtime keeps `use_responses_api = false` and uses Chat Completions through `https://inference.local/v1`.
+The managed Deep Agents runtime keeps `use_responses_api = false` and uses Chat Completions.
+NVIDIA Endpoints, supported fixed hosted providers, and new Ollama, standalone vLLM, llama.cpp, and qualifying host-local compatible selections use native endpoints through sandbox-attached OpenShell providers.
+Hosted compatible endpoints normally use the same native path.
+Fresh Personal-tier onboarding instead keeps a hosted compatible endpoint on `inference.local` and creates no native provider attachment.
+NemoClaw refuses Personal for an existing sandbox that already has a custom native provider attachment.
+Owned Local NVIDIA NIM and retained legacy shared routes use `inference.local`.
 `NEMOCLAW_PREFERRED_API` does not change that runtime selection.
+
+</AgentOnly>
+
+<AgentOnly variant="openclaw">
+
+New OpenClaw Ollama, standalone vLLM, llama.cpp, and hosted compatible selections outside the Personal tier use their recorded sandbox-attached provider for validation.
+Local NVIDIA NIM, new Personal-tier hosted compatible selections, and retained shared routes use `inference.local`.
+An older OpenClaw Ollama, standalone vLLM, or llama.cpp sandbox without a native attachment can use supported shared-route model switches, but cannot resume or rebuild.
+Back it up and re-onboard with `--fresh --name <sandbox-name> --recreate-sandbox`.
+Owned Local NVIDIA NIM sandboxes can resume or rebuild on the shared route.
 
 </AgentOnly>
 
@@ -103,6 +127,13 @@ NemoClaw sends another validation request in any of these cases:
 
 An endpoint that is reachable only through `http://host.openshell.internal:<port>` cannot receive the host-side API probe.
 Verify that route from inside the sandbox after onboarding.
+
+<AgentOnly variant="openclaw">
+
+For a shared OpenClaw `compatible-endpoint` selection, the compatible endpoint check validates `inference.local` from inside the sandbox.
+The check runs whether or not you select a messaging channel and stops onboarding if the route fails.
+
+</AgentOnly>
 
 ## Related Topics
 

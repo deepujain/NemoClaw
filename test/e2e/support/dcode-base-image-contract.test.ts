@@ -51,6 +51,21 @@ describe("Deep Agents Code E2E base contract", () => {
     );
   });
 
+  it("requires the base contract reference recorded by the exact PR managed image", () => {
+    expect(
+      validateDcodeBaseImageContract(contract(), {
+        ...expected,
+        baseReference: AMD64_REFERENCE,
+      }).platformReferences[DCODE_BASE_IMAGE_TARGET_PLATFORM],
+    ).toBe(AMD64_REFERENCE);
+    expect(() =>
+      validateDcodeBaseImageContract(contract(), {
+        ...expected,
+        baseReference: `${IMAGE}@sha256:${"e".repeat(64)}`,
+      }),
+    ).toThrow("does not match the exact PR managed image");
+  });
+
   it.each([
     ["a mutable reference", { reference: `${IMAGE}:latest` }, /reference must match/u],
     ["the wrong source revision", { sourceRevision: "e".repeat(40) }, /source revision/u],
@@ -65,7 +80,7 @@ describe("Deep Agents Code E2E base contract", () => {
   });
 
   it("proves both imports from the selected platform digest in a locked-down container (#9386)", () => {
-    const runDocker = vi.fn(() => "nemoclaw-dcode-base-imports-ok");
+    const runDocker = vi.fn(() => "nemoclaw-dcode-runtime-contract-ok");
     const platformReference = `${IMAGE}@sha256:${"c".repeat(64)}`;
     validateDcodeBaseImageImports(platformReference, runDocker);
 
@@ -87,8 +102,7 @@ describe("Deep Agents Code E2E base contract", () => {
       "/opt/venv/bin/python3",
       platformReference,
       "-I",
-      "-c",
-      'import deepagents; import deepagents_code; print("nemoclaw-dcode-base-imports-ok")',
+      "/usr/local/lib/nemoclaw/validate-dcode-runtime-contract.py",
     ]);
   });
 
@@ -98,7 +112,7 @@ describe("Deep Agents Code E2E base contract", () => {
     const outputPath = join(directory, "github-output");
     const contractValue = contract();
     const platformReference = `${IMAGE}@sha256:${"c".repeat(64)}`;
-    const runDocker = vi.fn(() => "nemoclaw-dcode-base-imports-ok");
+    const runDocker = vi.fn(() => "nemoclaw-dcode-runtime-contract-ok");
     try {
       writeFileSync(contractPath, JSON.stringify(contractValue), "utf8");
 
@@ -106,6 +120,7 @@ describe("Deep Agents Code E2E base contract", () => {
         [contractPath],
         {
           GITHUB_OUTPUT: outputPath,
+          EXPECTED_BASE_REF: platformReference,
           PUBLICATION_HEAD_SHA: HEAD_SHA,
           PUBLICATION_RUN_ATTEMPT: String(RUN_ATTEMPT),
           PUBLICATION_RUN_ID: String(RUN_ID),
@@ -126,8 +141,7 @@ describe("Deep Agents Code E2E base contract", () => {
 
   it("rejects missing or noisy import evidence (#9049)", () => {
     expect(() => validateDcodeBaseImageImports(`${IMAGE}@${DIGEST}`, () => "")).toThrow(
-      /did not prove both required imports/u,
+      /returned invalid evidence/u,
     );
   });
-
 });

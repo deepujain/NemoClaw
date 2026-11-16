@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import YAML from "yaml";
 
 import { auditOpenShellPolicyBoundaryDependencies } from "../../scripts/checks/verify-openshell-policy-boundary-dependencies.mts";
+import { npmPackFilePaths } from "../helpers/npm-pack-result";
 import { createPackageFixture } from "./helpers/package-fixture";
 
 const repoRoot = path.join(import.meta.dirname, "..", "..");
@@ -24,27 +25,56 @@ function packageFiles(packageRoot: string): string[] {
   return packageJson.files ?? [];
 }
 
+function collectPackedPaths(): ReadonlySet<string> {
+  const fixtureRoot = createPackageFixture({
+    prefix: "nemoclaw-agent-assets-pack-",
+    entries: ["agents"],
+  });
+  try {
+    const paths = npmPackFilePaths(
+      execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+        cwd: fixtureRoot,
+        encoding: "utf8",
+        maxBuffer: 10 * 1024 * 1024,
+      }),
+    );
+    return new Set(paths);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+}
+
+const packedPaths = collectPackedPaths();
+
 describe("OpenShell policy boundary package contract", () => {
   it.each([repoRoot, path.join(repoRoot, "nemoclaw")])(
     "pins the YAML parser used by both production package boundaries [case %#]",
     (packageRoot) => {
-      const dependencyVersion = JSON.parse(
-        execFileSync("npm", ["pkg", "get", "dependencies.yaml"], {
-          cwd: packageRoot,
-          encoding: "utf8",
-        }),
-      ) as string;
+      const output = execFileSync("npm", ["pkg", "get", "dependencies.yaml"], {
+        cwd: packageRoot,
+        encoding: "utf8",
+      }).trim();
+      const dependencyVersion = output.startsWith('"') ? (JSON.parse(output) as string) : output;
 
       expect(dependencyVersion).toBe("2.8.3");
     },
   );
 
-  it("routes the CommonJS CLI and ESM plugin through one canonical CJS boundary", async () => {
-    const cliPolicy = require("../../dist/lib/policy/merge.js") as {
+  it("keeps the CommonJS CLI and ESM plugin policy behavior compatible", async () => {
+    const cliPolicy = require("../../dist/lib/adapters/openshell/policy-boundary.js") as {
+      assertPolicyRequirementContainment: (...args: unknown[]) => void;
       parseOpenShellPolicy: (raw: string) => {
         yamlBody: string;
         policy: Record<string, unknown>;
       };
+      parseActiveGlobalPolicyMetadata: (raw: string) => {
+        state: string;
+        inspection?: { policySource: string };
+      };
+      parseSandboxPolicyMetadata: (
+        raw: string,
+        sandboxName: string,
+      ) => { policySource: string; effectivePolicy: Record<string, unknown> };
       withoutProviderComposedPolicies: (
         policies: Record<string, unknown>,
       ) => Record<string, unknown>;
@@ -59,20 +89,18 @@ describe("OpenShell policy boundary package contract", () => {
         path.join(repoRoot, "nemoclaw", "dist", "shared", "openshell-policy-boundary.cjs"),
       ).href
     )) as {
+      assertPolicyRequirementContainment: typeof cliPolicy.assertPolicyRequirementContainment;
       parseOpenShellPolicy: (raw: string) => {
         yamlBody: string;
         policy: Record<string, unknown>;
       };
+      parseActiveGlobalPolicyMetadata: typeof cliPolicy.parseActiveGlobalPolicyMetadata;
+      parseSandboxPolicyMetadata: typeof cliPolicy.parseSandboxPolicyMetadata;
       withoutProviderComposedPolicies: (
         policies: Record<string, unknown>,
       ) => Record<string, unknown>;
       stripProviderComposedPolicies: (policy: string) => string;
     };
-    const canonicalBoundary =
-      require("../../nemoclaw/dist/shared/openshell-policy-boundary.cjs") as {
-        parseOpenShellPolicy: typeof cliPolicy.parseOpenShellPolicy;
-        stripProviderComposedPolicies: typeof cliPolicy.stripProviderComposedPolicies;
-      };
     expect(
       pluginBoundary.withoutProviderComposedPolicies({ safe: {}, _provider_generated: {} }),
     ).toEqual({ safe: {} });
@@ -82,19 +110,63 @@ describe("OpenShell policy boundary package contract", () => {
       future_policy: { keep: true },
       network_policies: { safe: {}, _provider_generated: {} },
     });
-    expect(YAML.parse(cliPolicy.stripProviderComposedPolicies(policy))).toEqual(
-      YAML.parse(pluginBoundary.stripProviderComposedPolicies(policy)),
+    const expectedPolicy = {
+      version: 1,
+      future_policy: { keep: true },
+      network_policies: { safe: {} },
+    };
+    expect(YAML.parse(cliPolicy.stripProviderComposedPolicies(policy))).toEqual(expectedPolicy);
+    expect(YAML.parse(pluginBoundary.stripProviderComposedPolicies(policy))).toEqual(
+      expectedPolicy,
     );
     expect(() => cliPolicy.stripProviderComposedPolicies("version: [unterminated")).toThrow();
     expect(() => pluginBoundary.stripProviderComposedPolicies("version: [unterminated")).toThrow();
 
     const policyOutput = ["Version: 1", "Hash: sha256:test", "---", policy].join("\n");
-    expect(cliPolicy.parseOpenShellPolicy(policyOutput)).toEqual(
-      pluginBoundary.parseOpenShellPolicy(policyOutput),
+    const expectedParsedPolicy = { yamlBody: policy.trim(), policy: YAML.parse(policy) };
+    expect(cliPolicy.parseOpenShellPolicy(policyOutput)).toEqual(expectedParsedPolicy);
+    expect(pluginBoundary.parseOpenShellPolicy(policyOutput)).toEqual(expectedParsedPolicy);
+    const sandboxMetadata = JSON.stringify({
+      scope: "sandbox",
+      sandbox: "alpha",
+      status: "effective",
+      policy_source: "global",
+      hash: "sha256:sandbox",
+      active_version: 1,
+      policy: { version: 1, network_policies: {} },
+    });
+    const expectedSandboxMetadata = {
+      policySource: "global",
+      effectivePolicy: { version: 1, network_policies: {} },
+      policyIdentity: { hash: "sha256:sandbox", activeVersion: 1 },
+    };
+    expect(cliPolicy.parseSandboxPolicyMetadata(sandboxMetadata, "alpha")).toEqual(
+      expectedSandboxMetadata,
     );
-    expect(cliPolicy.parseOpenShellPolicy).toBe(canonicalBoundary.parseOpenShellPolicy);
-    expect(cliPolicy.stripProviderComposedPolicies).toBe(
-      canonicalBoundary.stripProviderComposedPolicies,
+    expect(pluginBoundary.parseSandboxPolicyMetadata(sandboxMetadata, "alpha")).toEqual(
+      expectedSandboxMetadata,
+    );
+    const globalMetadata = JSON.stringify({
+      scope: "global",
+      status: "loaded",
+      policy_source: "global",
+      hash: "sha256:global",
+      active_version: 1,
+      policy: { version: 1, network_policies: {} },
+    });
+    const expectedGlobalMetadata = {
+      state: "active",
+      inspection: {
+        policySource: "global",
+        effectivePolicy: { version: 1, network_policies: {} },
+        policyIdentity: { hash: "sha256:global", activeVersion: 1 },
+      },
+    };
+    expect(cliPolicy.parseActiveGlobalPolicyMetadata(globalMetadata)).toEqual(
+      expectedGlobalMetadata,
+    );
+    expect(pluginBoundary.parseActiveGlobalPolicyMetadata(globalMetadata)).toEqual(
+      expectedGlobalMetadata,
     );
 
     const pluginRunner = await import(
@@ -181,17 +253,15 @@ describe("OpenShell policy boundary package contract", () => {
     ).toBe(false);
   });
 
-  it.each(
-    [
-        "managed-tool-gateway-matrix.json",
-        "runtime-refresh-credentials.ts",
-        "tool-gateway-broker.ts",
-        "tool-gateway-control-contract.ts",
-      ],
-  )("ships the Hermes host broker with its canonical sandbox-name boundary [%s]", (file) => {
+  it.each([
+    "managed-tool-gateway-matrix.json",
+    "runtime-refresh-credentials.ts",
+    "tool-gateway-broker.ts",
+    "tool-gateway-control-contract.ts",
+  ])("ships the Hermes host broker with its canonical sandbox-name boundary [%s]", (file) => {
     expect(packageFiles(repoRoot)).toContain("agents/hermes/host/");
 
-    expect(fs.existsSync(path.join(repoRoot, "agents", "hermes", "host", file))).toBe(true);
+    expect(packedPaths).toContain(`agents/hermes/host/${file}`);
 
     const controlContractPath = path.join(
       repoRoot,
@@ -204,7 +274,6 @@ describe("OpenShell policy boundary package contract", () => {
       execFileSync(
         process.execPath,
         [
-          "--experimental-strip-types",
           "--no-warnings",
           "--eval",
           `const contract = require(${JSON.stringify(controlContractPath)}); process.stdout.write(JSON.stringify([contract.isValidName("packaged-hermes"), contract.isValidName("../packaged-hermes")]));`,
@@ -215,9 +284,18 @@ describe("OpenShell policy boundary package contract", () => {
     expect(validation).toEqual([true, false]);
   });
 
-  it("ships agent manifests and generated state lock plans (#8006)", () => {
-    expect(packageFiles(repoRoot)).toContain("agents/*/manifest.yaml");
-    expect(packageFiles(repoRoot)).toContain("agents/*/state-lock-plan.json");
+  it("ships agent manifests", () => {
+    expect(packageFiles(repoRoot)).toEqual(expect.arrayContaining(["agents/*/manifest.yaml"]));
+    expect(packedPaths).toContain("agents/openclaw/manifest.yaml");
+  });
+
+  it("ships the complete repository-owned NemoCUA agent definition (#9649)", () => {
+    expect(packageFiles(repoRoot)).toEqual(
+      expect.arrayContaining(["agents/nemocua/Dockerfile", "agents/nemocua/policy-additions.yaml"]),
+    );
+    expect(packedPaths).toContain("agents/nemocua/manifest.yaml");
+    expect(packedPaths).toContain("agents/nemocua/Dockerfile");
+    expect(packedPaths).toContain("agents/nemocua/policy-additions.yaml");
   });
 
   it("ships an out-of-tree runtime sandbox-policy schema validator", { timeout: 240_000 }, () => {
@@ -272,6 +350,7 @@ describe("OpenShell policy boundary package contract", () => {
         "ajv",
         "fast-deep-equal",
         "fast-uri",
+        "json5",
         "json-schema-traverse",
         "require-from-string",
         "yaml",
@@ -345,7 +424,7 @@ process.stdout.write("validated");
       "openshell-policy-boundary.cjs",
     );
     expect(auditOpenShellPolicyBoundaryDependencies(fs.readFileSync(boundaryPath, "utf8"))).toEqual(
-      ["yaml"],
+      ["node:util", "yaml"],
     );
 
     expect(() =>

@@ -207,34 +207,54 @@ function assertDirectoryIdentity(directory: DirectoryHandle, destination: string
   }
 }
 
+/**
+ * Split an absolute directory path into its root and the components below it.
+ */
+function directoryComponents(resolved: string): { root: string; components: string[] } {
+  const root = path.parse(resolved).root;
+  return {
+    root,
+    components: path
+      .relative(root, resolved)
+      .split(path.sep)
+      .filter((component) => component.length > 0),
+  };
+}
+
 function ensureDirectoryNoFollow(directory: string, destination: string): DirectoryHandle {
   const resolved = path.resolve(directory);
+  const { root, components } = directoryComponents(resolved);
   const missing: string[] = [];
-  let existing = resolved;
+  let existing = root;
 
-  while (true) {
+  // Walk down from the root rather than up from `resolved`: `lstat()` declines
+  // to follow only the final component, so a check that starts at the full
+  // parent path resolves every component above it silently. A destination
+  // whose parent chain already exists then reached publication with no
+  // component inspected at all, and `realpathSync()` below rewrote it to the
+  // symbolic link's target (#12866). Each component is now classified against
+  // a parent that is already known not to be a link.
+  for (const [index, component] of components.entries()) {
+    const candidate = path.join(existing, component);
+    let stat: fs.Stats;
     try {
-      const stat = fs.lstatSync(existing);
-      if (stat.isSymbolicLink()) {
-        throw symlinkDestinationError(destination, existing);
-      }
-      if (!stat.isDirectory()) {
-        throw new Error(
-          `Refusing to publish the download to '${destination}': destination path '${existing}' is not a directory.`,
-        );
-      }
-      break;
+      stat = fs.lstatSync(candidate);
     } catch (error) {
       if (errnoCode(error) !== "ENOENT") {
         throw error;
       }
-      const parent = path.dirname(existing);
-      if (parent === existing) {
-        throw error;
-      }
-      missing.unshift(path.basename(existing));
-      existing = parent;
+      missing.push(...components.slice(index));
+      break;
     }
+    if (stat.isSymbolicLink()) {
+      throw symlinkDestinationError(destination, candidate);
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(
+        `Refusing to publish the download to '${destination}': destination path '${candidate}' is not a directory.`,
+      );
+    }
+    existing = candidate;
   }
 
   let current = fs.realpathSync(existing);
@@ -491,6 +511,27 @@ function publishEntry(source: string, destination: string): void {
 }
 
 /**
+ * Reject existing symlinks and special files before publication starts, so a
+ * fresh destination is not created before rejection (#10636). `publishEntry`
+ * repeats the checks to catch later changes.
+ */
+function assertStagedTreeIsPublishable(source: string): void {
+  const sourceStat = fs.lstatSync(source);
+  if (sourceStat.isSymbolicLink()) {
+    throw new Error(`Refusing to publish symbolic link from staged artifact '${source}'.`);
+  }
+  if (sourceStat.isDirectory()) {
+    for (const entry of fs.readdirSync(source)) {
+      assertStagedTreeIsPublishable(path.join(source, entry));
+    }
+    return;
+  }
+  if (!sourceStat.isFile()) {
+    throw new Error(`Refusing to publish unsupported staged artifact '${source}'.`);
+  }
+}
+
+/**
  * Publish a verified staging artifact without following destination symlinks.
  * Parent directories are pinned and revalidated, and file writes target a
  * private O_EXCL descriptor (plus O_NOFOLLOW where available) before an atomic
@@ -508,5 +549,6 @@ export function publishDownloadArtifact(
   if (sourceKind === "file" && stagedStat.isDirectory()) {
     throw new Error(`Refusing to publish directory staged artifact '${stagedArtifact}' as a file.`);
   }
+  assertStagedTreeIsPublishable(stagedArtifact);
   publishEntry(stagedArtifact, expectedArtifact);
 }

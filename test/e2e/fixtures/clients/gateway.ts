@@ -3,10 +3,12 @@
 
 import { randomBytes } from "node:crypto";
 
+import { DEFAULT_GATEWAY_PORT, parsePort } from "../../../../src/lib/core/ports.ts";
 import { buildAvailabilityProbeEnv } from "../availability-env.ts";
 import type { NemoClawInstance } from "../phases/onboarding.ts";
 import { pollUntil } from "../polling.ts";
 import type { ShellProbeResult, ShellProbeRunOptions } from "../shell-probe.ts";
+import { RuntimeProviderPrerequisite } from "../runtime-provider.ts";
 import { assertExitZero } from "./command.ts";
 import type { HostCliClient } from "./host.ts";
 import type { SandboxClient } from "./sandbox.ts";
@@ -24,10 +26,10 @@ import type { SandboxClient } from "./sandbox.ts";
  * src/lib/actions/sandbox/connect.ts:NEMOCLAW_GATEWAY_NAME) on top of the
  * framework's allowlisted env.
  */
-function probeEnv(): NodeJS.ProcessEnv {
+function probeEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return {
-    ...buildAvailabilityProbeEnv(),
-    OPENSHELL_GATEWAY: process.env.OPENSHELL_GATEWAY ?? "nemoclaw",
+    ...buildAvailabilityProbeEnv(base),
+    OPENSHELL_GATEWAY: base.OPENSHELL_GATEWAY ?? "nemoclaw",
   };
 }
 
@@ -38,10 +40,11 @@ function probeEnv(): NodeJS.ProcessEnv {
  * `kernel.yama.ptrace_scope=1` blocks cross-tree environ reads. We mirror
  * that approach here for the same reason.
  */
-const DEFAULT_GUARD_MARKERS: ReadonlyArray<string> = [
-  "nemoclaw-sandbox-safety-net",
-  "nemoclaw-ciao-network-guard",
-];
+const DEFAULT_GUARD_MARKERS: ReadonlyArray<string> = ["nemoclaw-sandbox-safety-net"];
+const GUARD_CHAIN_PROXY_ENV_PATH = "/tmp/nemoclaw-proxy-env.sh";
+const GUARD_CHAIN_ACTIVE_SENTINEL = "NEMOCLAW_GUARD_CHAIN_ACTIVE";
+const GUARD_CHAIN_FILE_UNAVAILABLE_EXIT_CODE = 20;
+const GUARD_CHAIN_MARKER_MISSING_EXIT_CODE = 21;
 
 /** Default gateway log path inside the sandbox. */
 const GATEWAY_LOG_PATH = "/tmp/gateway.log";
@@ -55,7 +58,7 @@ const DOCKER_DRIVER_GATEWAY_PID_RELPATH = [
 const DEFAULT_GATEWAY_CONTAINER = "openshell-cluster-nemoclaw";
 
 export interface ExpectGuardChainOptions extends ShellProbeRunOptions {
-  /** Markers required in `/tmp/nemoclaw-proxy-env.sh`. Defaults to safety-net + ciao. */
+  /** Markers required in `/tmp/nemoclaw-proxy-env.sh`. Defaults to safety-net. */
   expectedMarkers?: ReadonlyArray<string>;
 }
 
@@ -69,6 +72,11 @@ export interface ExpectPidStableOptions extends ShellProbeRunOptions {
   durationSeconds: number;
   /** Polling interval in seconds. Defaults to 3. */
   pollIntervalSeconds?: number;
+}
+
+export interface ExpectGatewayRemovedOptions extends ShellProbeRunOptions {
+  /** Expected host listener port. Defaults to NEMOCLAW_GATEWAY_PORT or 8080. */
+  gatewayPort?: number;
 }
 
 export interface WaitForMissingManagedSupervisorOptions {
@@ -107,10 +115,20 @@ function isMissingManagedSupervisorProof(result: ShellProbeResult): boolean {
 export class GatewayClient {
   private readonly host: HostCliClient;
   private readonly sandbox: SandboxClient;
+  private readonly runtimeProvider: RuntimeProviderPrerequisite;
 
-  constructor(host: HostCliClient, sandbox: SandboxClient) {
+  constructor(
+    host: HostCliClient,
+    sandbox: SandboxClient,
+    runtimeProvider?: RuntimeProviderPrerequisite,
+  ) {
     this.host = host;
     this.sandbox = sandbox;
+    this.runtimeProvider =
+      runtimeProvider ??
+      new RuntimeProviderPrerequisite(host, (reason) => {
+        throw new Error(reason);
+      });
   }
 
   status(options: ShellProbeRunOptions = {}): Promise<ShellProbeResult> {
@@ -126,20 +144,22 @@ export class GatewayClient {
     return result;
   }
 
-  async resolveHostRuntime(): Promise<HostGatewayRuntime | null> {
+  async resolveHostRuntime(options: ShellProbeRunOptions = {}): Promise<HostGatewayRuntime | null> {
+    const env = probeEnv(options.env);
     const pid = await this.host.command(
       "sh",
       [
         "-lc",
-        `pid_file=\"$HOME/${DOCKER_DRIVER_GATEWAY_PID_RELPATH.join("/")}\"; ` +
-          `if [ -f \"$pid_file\" ]; then ` +
-          `pid=\"$(tr -d '[:space:]' <\"$pid_file\" 2>/dev/null || true)\"; ` +
-          `if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then printf '%s\\n' \"$pid\"; exit 0; fi; ` +
+        `pid_file="$HOME/${DOCKER_DRIVER_GATEWAY_PID_RELPATH.join("/")}"; ` +
+          `if [ -f "$pid_file" ]; then ` +
+          `pid="$(tr -d '[:space:]' <"$pid_file" 2>/dev/null || true)"; ` +
+          `if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then printf '%s\\n' "$pid"; exit 0; fi; ` +
           `fi; exit 1`,
       ],
       {
+        ...options,
         artifactName: "gateway-runtime-pid-probe",
-        env: probeEnv(),
+        env,
         timeoutMs: 15_000,
       },
     );
@@ -147,21 +167,28 @@ export class GatewayClient {
       return { kind: "pid", id: pid.stdout.trim() };
     }
 
-    const container = await this.host.command(
-      "docker",
-      ["ps", "-qf", `name=${DEFAULT_GATEWAY_CONTAINER}`],
+    const container = await this.runtimeProvider.command(
+      ["container", "ps", "--format", "{{.ID}}\t{{.Names}}"],
       {
+        ...options,
         artifactName: "gateway-runtime-container-probe",
-        env: probeEnv(),
+        env,
         timeoutMs: 15_000,
       },
     );
-    const id = container.stdout.trim().split(/\r?\n/).find(Boolean);
+    const ids = container.stdout
+      .split(/\r?\n/u)
+      .map((line) => line.trim().split(/\s+/u))
+      .filter(([, name]) => name === DEFAULT_GATEWAY_CONTAINER)
+      .map(([id]) => id)
+      .filter((id): id is string => Boolean(id));
+    if (ids.length > 1) throw new Error("OpenShell gateway runtime identity is ambiguous.");
+    const [id] = ids;
     return id ? { kind: "container", id } : null;
   }
 
   async expectHostRuntimeStopped(options: ShellProbeRunOptions = {}): Promise<void> {
-    const runtime = await this.resolveHostRuntime();
+    const runtime = await this.resolveHostRuntime(options);
     if (runtime) {
       throw new Error(
         `gateway runtime still appears to be running after stop: ${runtime.kind}:${runtime.id}`,
@@ -170,7 +197,7 @@ export class GatewayClient {
     if (options.artifactName) {
       await this.host.command("true", [], {
         artifactName: options.artifactName,
-        env: probeEnv(),
+        env: probeEnv(options.env),
         timeoutMs: 5_000,
       });
     }
@@ -192,6 +219,56 @@ export class GatewayClient {
       throw new Error(`openshell status did not report connected gateway '${gatewayName}'.`);
     }
     return result;
+  }
+
+  async expectRemoved(
+    gatewayName = "nemoclaw",
+    options: ExpectGatewayRemovedOptions = {},
+  ): Promise<void> {
+    const { gatewayPort, ...probeOptions } = options;
+    const port =
+      gatewayPort ?? parsePort("NEMOCLAW_GATEWAY_PORT", DEFAULT_GATEWAY_PORT, options.env);
+    const env = { ...probeEnv(), ...options.env, OPENSHELL_GATEWAY: gatewayName };
+    const status = await this.host.command(this.host.openshellCommandPath, ["status"], {
+      ...probeOptions,
+      artifactName: `${options.artifactName ?? "gateway-removed"}-status`,
+      env,
+      timeoutMs: options.timeoutMs ?? 30_000,
+    });
+    const statusText = `${status.stdout}\n${status.stderr}`;
+    if (
+      status.timedOut ||
+      status.signal !== null ||
+      !/disconnected|no (?:active )?gateway|connection refused|does not exist|not found/iu.test(
+        statusText,
+      )
+    ) {
+      throw new Error(`openshell status did not prove gateway '${gatewayName}' disconnected.`);
+    }
+
+    const listener = await this.host.command("lsof", ["-ti", `:${String(port)}`, "-sTCP:LISTEN"], {
+      ...probeOptions,
+      artifactName: `${options.artifactName ?? "gateway-removed"}-listener`,
+      env,
+      timeoutMs: options.timeoutMs ?? 15_000,
+    });
+    if (
+      listener.exitCode !== 1 ||
+      listener.timedOut ||
+      listener.signal !== null ||
+      listener.stdout.trim() !== "" ||
+      listener.stderr.trim() !== ""
+    ) {
+      throw new Error(
+        `gateway listener still exists or could not be disproved on port ${String(port)}.`,
+      );
+    }
+
+    await this.expectHostRuntimeStopped({
+      ...probeOptions,
+      artifactName: `${options.artifactName ?? "gateway-removed"}-runtime`,
+      env,
+    });
   }
 
   /**
@@ -302,27 +379,50 @@ export class GatewayClient {
   }
 
   /**
-   * Assert that the NODE_OPTIONS guard chain is active for the gateway by
-   * reading `/tmp/nemoclaw-proxy-env.sh` and verifying it contains the
-   * expected preload markers (`--require` paths). The proxy-env file is
-   * the single source of truth — when recovery sources it, the gateway
-   * inherits the chain.
+   * Assert that the NODE_OPTIONS guard chain is active for the gateway. The
+   * sandbox command checks `/tmp/nemoclaw-proxy-env.sh` for every expected
+   * preload marker and returns only a fixed credential-free sentinel. It does
+   * not return the proxy environment file contents to the host or store them
+   * in evidence artifacts.
    *
    * We deliberately read the file rather than `/proc/<pid>/environ`:
    * `kernel.yama.ptrace_scope=1` blocks reads of /proc/.../environ across
    * non-ancestor process trees. This matches the legacy 2478 bash test's
    * approach (`gateway_guards_active` -> `proxy_env_contents`).
    *
-   * @throws if the file is missing or any expected marker is absent.
+   * @throws if the expected marker list is empty or a marker is empty or
+   * contains a carriage return or line feed; the file is missing, unreadable,
+   * or empty; an expected marker is absent; or the sentinel response is invalid.
    */
   async expectGuardChainActive(
     instance: NemoClawInstance,
     options: ExpectGuardChainOptions = {},
   ): Promise<void> {
     const expected = options.expectedMarkers ?? DEFAULT_GUARD_MARKERS;
+    if (
+      expected.length === 0 ||
+      expected.some((marker) => marker.length === 0 || /[\r\n]/u.test(marker))
+    ) {
+      throw new Error(
+        "expectGuardChainActive: expectedMarkers must be a non-empty list of non-empty single-line markers",
+      );
+    }
+    const script =
+      'set -eu; proxy_env="$1"; sentinel="$2"; shift 2; ' +
+      '[ -r "$proxy_env" ] && [ -s "$proxy_env" ] || exit 20; ' +
+      'for marker do grep -Fq -- "$marker" "$proxy_env" 2>/dev/null || exit 21; done; ' +
+      'printf "%s\\n" "$sentinel"';
     const result = await this.sandbox.exec(
       instance.sandboxName,
-      ["sh", "-c", "cat /tmp/nemoclaw-proxy-env.sh 2>/dev/null"],
+      [
+        "sh",
+        "-c",
+        script,
+        "nemoclaw-guard-chain-proof",
+        GUARD_CHAIN_PROXY_ENV_PATH,
+        GUARD_CHAIN_ACTIVE_SENTINEL,
+        ...expected,
+      ],
       {
         artifactName: `gateway-guard-chain-${instance.sandboxName}`,
         env: probeEnv(),
@@ -330,18 +430,31 @@ export class GatewayClient {
       },
     );
 
-    if (result.exitCode !== 0 || result.stdout.trim() === "") {
-      throw new Error(
-        `expectGuardChainActive: /tmp/nemoclaw-proxy-env.sh missing or empty in ${instance.sandboxName}`,
-      );
+    if (
+      result.exitCode === 0 &&
+      result.signal === null &&
+      !result.timedOut &&
+      result.stdout === `${GUARD_CHAIN_ACTIVE_SENTINEL}\n` &&
+      result.stderr === ""
+    ) {
+      return;
     }
 
-    const missing = expected.filter((marker) => !result.stdout.includes(marker));
-    if (missing.length > 0) {
+    const quietFailure =
+      result.signal === null && !result.timedOut && result.stdout === "" && result.stderr === "";
+    if (quietFailure && result.exitCode === GUARD_CHAIN_FILE_UNAVAILABLE_EXIT_CODE) {
       throw new Error(
-        `expectGuardChainActive: /tmp/nemoclaw-proxy-env.sh missing markers ${JSON.stringify(missing)} in ${instance.sandboxName}`,
+        `expectGuardChainActive: /tmp/nemoclaw-proxy-env.sh missing, unreadable, or empty in ${instance.sandboxName}`,
       );
     }
+    if (quietFailure && result.exitCode === GUARD_CHAIN_MARKER_MISSING_EXIT_CODE) {
+      throw new Error(
+        `expectGuardChainActive: /tmp/nemoclaw-proxy-env.sh missing an expected marker in ${instance.sandboxName}`,
+      );
+    }
+    throw new Error(
+      `expectGuardChainActive: guard-chain check was invalid in ${instance.sandboxName}`,
+    );
   }
 
   /**

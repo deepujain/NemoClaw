@@ -3,16 +3,73 @@
 
 # Candidate Evidence
 
-Candidate evidence is the release-specific evidence required for the planned candidate. Use the
-exact version and candidate from `plan.json`. These are read-only checks. Run every section except
-[Final Documentation Recheck](#final-documentation-recheck) before the general E2E decision. Keep
-the first shell only until its evidence is copied into the release brief. It does not need to remain
-open while waiting for tag confirmation.
+Start with the plan-independent kickoff checks. After planning, initialize candidate evidence and
+run the applicable candidate-bound sections before the general E2E decision. These checks are
+read-only; preparation and recovery retain their existing authorization requirements.
+
+## Start Independent Checks at Kickoff
+
+Inspect documentation, images, general E2E context, and local tooling before waiting
+on any one prerequisite. Before planning, inspect the intended range and label those results
+preliminary. Do not initialize candidate evidence until `plan.json` exists.
+
+- Inspect the cumulative docs PR, remaining patch, review state, coverage, and release entry.
+  Start authorized docs preparation or review while images run. Preserve the branch ownership in
+  [docs automation](../../../../docs/AUTOMATION.md#post-merge-documentation-catch-up).
+- Before planning, inspect recent image runs with the command below. Their status is preliminary,
+  not proof of candidate eligibility. After planning, use [Image Evidence](#image-evidence).
+  Inspect retry prerequisites before proposing recovery from a pending or failed publication.
+- Read the newest full E2E context through `nemoclaw-maintainer-e2e`; do not dispatch a run automatically.
+- Run `npm run dev:doctor` when local docs preparation or review is needed.
+  Follow the [documentation review requirements](../../../../docs/CONTRIBUTING.md#obtain-independent-review).
+  If using `npm run review:local`, check its [documented prerequisites](../../../../tools/pr-review-advisor/README.md#local-run).
+  Docker readiness alone does not verify those prerequisites. Report unchecked review readiness as unverified.
+
+```bash
+gh run list --repo NVIDIA/NemoClaw --workflow base-image.yaml --branch main --event push \
+  --limit 10 --json databaseId,headSha,status,conclusion,url
+```
+
+Collect independent reads concurrently when possible. Keep prerequisite-dependent commands ordered.
+Keep each check's shell state separate. Stop a failed check; never consume its partial output.
+Preserve `run_or_stop` in candidate-bound checks. Follow the access hard stop for
+access errors. Otherwise, collect the remaining independent results before reporting readiness.
+
+Show one compact summary: item, ready/pending/blocked/unverified, evidence, and next action.
+Use pending for active work, blocked for a confirmed failed prerequisite, and unverified for missing
+or inconclusive evidence. Early results guide preparation; they do not replace candidate-bound
+evidence or maintainer decisions. Recheck affected evidence when the intended candidate changes.
+
+## Check Prerequisites Before a Retry
+
+Inspect the failed job and its upstream producer before asking for a rerun. Name the run, attempt,
+commit, workflow event, upstream result, and relevant failure diagnostics.
+Classify the failure before choosing the smallest permitted recovery.
+
+- **Canceled publisher:** establish eligible successful publication evidence before retrying dependent
+  E2E. A dependent rerun does not repair its publisher.
+- **Successful manual publisher:** check eligibility, not just success.
+  `tools/e2e/base-image-publication.mts` selects applicable `main` push publications; a manual image
+  publication does not satisfy that selection. This restriction does not prohibit manual E2E runs.
+- **Expired audit receipt:** refresh the audit producer before retrying its consumers.
+  A failed-job-only rerun can reuse the expired receipt from a successful producer.
+  Identify a supported producer-inclusive rerun before requesting approval; stop if none is available.
+
+Keep existing rerun authorization requirements. Do not add retries or waive evidence checks.
+Use existing build diagnostics to identify expired audit evidence.
+Do not infer validity from producer success or artifact retention.
+If validity is not established, report it as unverified. Existing image-build verification remains authoritative.
+After authorized recovery, read the new attempt and verify the prerequisite before retrying a dependent job.
+
+## Initialize Candidate Evidence After Planning
+
+Require `plan.json` before running this section or the candidate-bound sections below. Use its
+version and candidate. Keep the shell only until its evidence is copied into the release brief.
 
 ```bash
 set -euo pipefail
-PLAN_PATH='../nemoclaw-release-vX.Y.Z/plan.json'
-EVIDENCE_DIR="$(mktemp -d)"
+PLAN_PATH="${PLAN_PATH:-../nemoclaw-release-vX.Y.Z/plan.json}"
+EVIDENCE_DIR="${EVIDENCE_DIR:-$(mktemp -d)}"
 chmod 700 "$EVIDENCE_DIR"
 trap 'rm -rf "$EVIDENCE_DIR"' EXIT
 
@@ -38,25 +95,47 @@ PLAN_FIELDS="$EVIDENCE_DIR/plan-fields.txt"
 run_or_stop "release plan read" jq -er '
   if
     (keys | sort) == [
-      "nextTag", "originMainCommit", "originMainHeadline",
-      "previousTag", "previousTagCommit", "previousTagObject"
+      "candidateCommit", "candidateSelection", "historicalCandidateException",
+      "nextTag", "originMainCommit",
+      "originMainHeadline", "previousTag", "previousTagCommit", "previousTagObject"
     ] and
     (.nextTag | test("^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$")) and
-    (.originMainCommit | test("^[0-9a-f]{40}$"))
-  then [.nextTag, .originMainCommit] | @tsv
+    (.candidateCommit | test("^[0-9a-f]{40}$")) and
+    (.originMainCommit | test("^[0-9a-f]{40}$")) and
+    (.previousTagCommit | test("^[0-9a-f]{40}$")) and
+    (
+      (.candidateSelection == "current-main" and
+       .candidateCommit == .originMainCommit and
+       .historicalCandidateException == "None") or
+      (.candidateSelection == "historical" and
+       .candidateCommit != .originMainCommit and
+       (.historicalCandidateException | test("[^[:space:]]")))
+    )
+  then [
+    .nextTag, .candidateCommit, .previousTagCommit,
+    .candidateSelection, .historicalCandidateException
+  ] | @tsv
   else error("release plan is invalid")
   end
 ' "$PLAN_PATH" >"$PLAN_FIELDS"
-IFS=$'\t' read -r VERSION CANDIDATE_SHA <"$PLAN_FIELDS"
-DOCS_BRANCH="automation/post-merge-docs-${CANDIDATE_SHA:0:12}"
+IFS=$'\t' read -r VERSION CANDIDATE_SHA PREVIOUS_TAG_SHA \
+  CANDIDATE_SELECTION HISTORICAL_CANDIDATE_EXCEPTION <"$PLAN_FIELDS"
+DOCS_PREFIX='automation/post-merge-docs-'
 ```
 
-## Release Entry and Pi Result
+## Release Entry and Documentation Coverage
 
-Find exactly one target heading at the candidate. Save only that H2 section, ending before the next
-H2, for the release brief.
+For a current-main plan, find exactly one target heading at the candidate. Save only that H2 section,
+ending before the next H2, for the release brief. For a historical plan, record the plan's explicit
+release-entry exception instead. Do not use the historical exception for a current-main plan.
 
 ```bash
+if [[ "$CANDIDATE_SELECTION" == 'historical' ]]; then
+  ENTRY_FILE="$EVIDENCE_DIR/release-entry.md"
+  ENTRY_PATH='Historical candidate exception'
+  printf '%s\n' \
+    "Release entry exception: $HISTORICAL_CANDIDATE_EXCEPTION" >"$ENTRY_FILE"
+else
 ENTRY_MATCHES="$EVIDENCE_DIR/release-entry-matches.txt"
 VERSION_PATTERN="${VERSION//./[.]}"
 run_or_stop "release-entry search" git grep -n -E "^## ${VERSION_PATTERN}$" \
@@ -80,104 +159,194 @@ run_or_stop "release-entry detail validation" awk '
   /^-[[:space:]]/ { detailed = 1 }
   END { exit(detailed ? 0 : 1) }
 ' "$ENTRY_FILE"
+fi
 ```
 
-Read the newest exact-candidate `Docs / Post-Merge Catch-Up` run. Require its one publish job to pass:
+Read documentation coverage from Git history and GitHub PR state. Do not require another
+`Docs / Author Post-Merge Catch-Up` run after the cumulative docs PR merges.
+
+First, list every open managed docs PR. Preserve this JSON for the release brief.
 
 ```bash
-DOCS_RUNS_FILE="$EVIDENCE_DIR/docs-runs.json"
-run_or_stop "documentation run list" gh run list --repo NVIDIA/NemoClaw \
-  --workflow post-merge-docs.yaml --event push --branch main --commit "$CANDIDATE_SHA" \
-  --limit 100 --json databaseId,headSha,status,conclusion,url,createdAt >"$DOCS_RUNS_FILE"
-DOCS_RUN_ID_FILE="$EVIDENCE_DIR/docs-run-id"
-run_or_stop "documentation run selection" jq -er --arg sha "$CANDIDATE_SHA" \
-  '[.[] | select(.headSha == $sha)] | sort_by(.createdAt) | last | .databaseId' \
-  "$DOCS_RUNS_FILE" >"$DOCS_RUN_ID_FILE"
-IFS= read -r DOCS_RUN_ID <"$DOCS_RUN_ID_FILE"
-DOCS_RUN_FILE="$EVIDENCE_DIR/docs-run.json"
-run_or_stop "documentation run read" gh run view "$DOCS_RUN_ID" --repo NVIDIA/NemoClaw \
-  --json attempt,headSha,status,conclusion,url,jobs >"$DOCS_RUN_FILE"
-run_or_stop "documentation run validation" jq -e --arg sha "$CANDIDATE_SHA" '
-  .headSha == $sha and .status == "completed" and .conclusion == "success" and
-  ([.jobs[] | select(.name == "Publish documentation catch-up")] | length == 1) and
-  ([.jobs[] | select(.name == "Publish documentation catch-up")][0] |
-    .status == "completed" and .conclusion == "success")
-' "$DOCS_RUN_FILE" >/dev/null
-DOCS_RUN_FIELDS_FILE="$EVIDENCE_DIR/docs-run-fields.txt"
-run_or_stop "documentation run field read" jq -er '
-  [.attempt, .url, ([.jobs[] | select(.name == "Publish documentation catch-up")][0].url)] |
-  .[]
-' "$DOCS_RUN_FILE" >"$DOCS_RUN_FIELDS_FILE"
-{
-  IFS= read -r DOCS_RUN_ATTEMPT
-  IFS= read -r DOCS_RUN_URL
-  IFS= read -r DOCS_PUBLISH_JOB_URL
-} <"$DOCS_RUN_FIELDS_FILE"
+OPEN_DOCS_PRS="$EVIDENCE_DIR/open-docs-prs.json"
+run_or_stop "open documentation PR read" gh pr list --repo NVIDIA/NemoClaw --state open \
+  --base main --limit 1000 \
+  --json headRefName,headRefOid,headRepository,isDraft,number,title,url >"$OPEN_DOCS_PRS"
+run_or_stop "open documentation PR selection" jq -c --arg prefix "$DOCS_PREFIX" '
+  [.[] | select(
+    (.headRefName | startswith($prefix)) and
+    .headRepository.nameWithOwner == "NVIDIA/NemoClaw"
+  )]
+' "$OPEN_DOCS_PRS" >"$EVIDENCE_DIR/open-managed-docs-prs.json"
 ```
 
-Download that run's reviewed patch. A successful publish job is release evidence only when the
-review covers this candidate and the approved patch is empty.
+Next, list merged PRs and select the newest managed docs PR whose merge commit is an ancestor of
+`CANDIDATE_SHA`. Do not select a PR only by merge time. If no such PR exists, report that state and
+use `PREVIOUS_TAG_SHA` as the conservative coverage point.
 
 ```bash
-DOCS_ARTIFACT='post-merge-docs-approved'
-DOCS_ARTIFACT_DIR="$EVIDENCE_DIR/docs-approved"
-mkdir "$DOCS_ARTIFACT_DIR"
-run_or_stop "documentation artifact download" gh run download "$DOCS_RUN_ID" \
-  --repo NVIDIA/NemoClaw --name "$DOCS_ARTIFACT" --dir "$DOCS_ARTIFACT_DIR"
-DOCS_PATCH="$DOCS_ARTIFACT_DIR/docs.patch"
-DOCS_REVIEW="$DOCS_ARTIFACT_DIR/review.json"
-[[ -f "$DOCS_PATCH" && -f "$DOCS_REVIEW" ]] || stop "The documentation artifact is incomplete"
-[[ ! -s "$DOCS_PATCH" ]] || stop "The approved documentation patch is not empty"
-EMPTY_PATCH_SHA256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
-run_or_stop "documentation review validation" jq -e --arg sha "$CANDIDATE_SHA" \
-  --arg digest "$EMPTY_PATCH_SHA256" '
-  type == "object" and
-  (keys | sort) == ["mainSha", "outcome", "patchSha256", "repository", "version"] and
-  .version == 1 and .repository == "NVIDIA/NemoClaw" and .mainSha == $sha and
-  .patchSha256 == $digest and .outcome == "approved"
-' "$DOCS_REVIEW" >/dev/null
-DOCS_REVIEW_NORMALIZED="$EVIDENCE_DIR/docs-review-normalized.json"
-run_or_stop "documentation review normalization" jq -cS . "$DOCS_REVIEW" >"$DOCS_REVIEW_NORMALIZED"
-IFS= read -r DOCS_REVIEW_JSON <"$DOCS_REVIEW_NORMALIZED"
+MERGED_DOCS_PRS="$EVIDENCE_DIR/merged-docs-prs.json"
+run_or_stop "merged documentation PR read" gh pr list --repo NVIDIA/NemoClaw --state merged \
+  --base main --limit 1000 \
+  --json headRefName,headRefOid,headRepository,mergeCommit,mergedAt,number,reviewDecision,statusCheckRollup,title,url \
+  >"$MERGED_DOCS_PRS"
+run_or_stop "merged documentation PR selection" jq -c --arg prefix "$DOCS_PREFIX" '
+  [.[] | select(
+    (.headRefName | startswith($prefix)) and
+    .headRepository.nameWithOwner == "NVIDIA/NemoClaw" and
+    (.mergeCommit.oid | test("^[0-9a-f]{40}$"))
+  )] | sort_by(.mergedAt) | reverse | .[]
+' "$MERGED_DOCS_PRS" >"$EVIDENCE_DIR/managed-docs-pr-candidates.jsonl"
 ```
 
-Record these values in the release brief:
-
-- `DOCS_RUN_ID`;
-- `DOCS_RUN_ATTEMPT`;
-- `DOCS_RUN_URL`;
-- `DOCS_PUBLISH_JOB_URL`;
-- the artifact name; and
-- `DOCS_REVIEW_JSON`.
-
-The signed tag annotation then retains the exact candidate and approved-empty patch digest after the
-workflow artifact expires.
-
-Require no managed PR or branch for this candidate. A PR or branch for a later candidate does not
-invalidate this one.
+For each candidate PR in order, test its merge commit against `CANDIDATE_SHA`. Keep the first
+ancestor. Stop on an ancestry-check error. Record the selected PR as JSON and assign every field
+before a later command reads it. If there is no match, record `null`, assign `None` to the PR
+fields, and use `PREVIOUS_TAG_SHA` as the conservative coverage point.
 
 ```bash
-DOCS_PRS_FILE="$EVIDENCE_DIR/docs-prs.json"
-DOCS_BRANCH_FILE="$EVIDENCE_DIR/docs-branch.txt"
-run_or_stop "candidate documentation PR read" gh pr list --repo NVIDIA/NemoClaw --state open \
-  --head "$DOCS_BRANCH" --limit 100 --json number >"$DOCS_PRS_FILE"
-run_or_stop "candidate documentation PR validation" jq -e 'length == 0' "$DOCS_PRS_FILE" >/dev/null
-run_or_stop "candidate documentation branch read" git ls-remote --heads origin \
-  "refs/heads/$DOCS_BRANCH" >"$DOCS_BRANCH_FILE"
-[[ ! -s "$DOCS_BRANCH_FILE" ]] || stop "The candidate documentation branch still exists"
+SELECTED_DOCS_PR="$EVIDENCE_DIR/selected-docs-pr.json"
+: >"$SELECTED_DOCS_PR"
+while IFS= read -r DOCS_PR_CANDIDATE; do
+  DOCS_PR_MERGE_SHA="$(printf '%s\n' "$DOCS_PR_CANDIDATE" | jq -er '.mergeCommit.oid')"
+  if git merge-base --is-ancestor "$DOCS_PR_MERGE_SHA" "$CANDIDATE_SHA"; then
+    printf '%s\n' "$DOCS_PR_CANDIDATE" >"$SELECTED_DOCS_PR"
+    break
+  else
+    ANCESTRY_STATUS=$?
+    [[ "$ANCESTRY_STATUS" == 1 ]] || stop \
+      "documentation PR ancestry check failed with status $ANCESTRY_STATUS"
+  fi
+done <"$EVIDENCE_DIR/managed-docs-pr-candidates.jsonl"
+
+DOCS_PR_FIELDS="$EVIDENCE_DIR/selected-docs-pr-fields.tsv"
+if [[ -s "$SELECTED_DOCS_PR" ]]; then
+  run_or_stop "selected documentation PR read" jq -er '
+    [
+      (.number | tostring),
+      .url,
+      .mergeCommit.oid,
+      .headRefOid,
+      (.reviewDecision // "None")
+    ] | @tsv
+  ' "$SELECTED_DOCS_PR" >"$DOCS_PR_FIELDS"
+  IFS=$'\t' read -r DOCS_PR_NUMBER DOCS_PR_URL DOCS_PR_MERGE_SHA \
+    DOCS_PR_HEAD_SHA DOCS_PR_REVIEW_DECISION <"$DOCS_PR_FIELDS"
+else
+  printf 'null\n' >"$SELECTED_DOCS_PR"
+  DOCS_PR_NUMBER='None'
+  DOCS_PR_URL='None'
+  DOCS_PR_MERGE_SHA='None'
+  DOCS_PR_HEAD_SHA='None'
+  DOCS_PR_REVIEW_DECISION='None'
+  DOCS_COVERAGE_SHA="$PREVIOUS_TAG_SHA"
+  printf 'None\tNone\tNone\tNone\tNone\n' >"$DOCS_PR_FIELDS"
+fi
 ```
 
-This is the initial pending-state check. Do not repeat it before showing the release brief. Run the
-self-contained final recheck below only after the maintainer confirms the tag.
+Only when a PR was selected, read all of its commits and files and derive its coverage point.
+Otherwise, preserve empty API evidence and the previous-release coverage point without making a
+selected-PR API request.
 
-## Image and Launchable Evidence
+```bash
+DOCS_PR_COMMITS="$EVIDENCE_DIR/docs-pr-commits.json"
+DOCS_PR_FILES="$EVIDENCE_DIR/docs-pr-files.json"
+if [[ "$DOCS_PR_NUMBER" != 'None' ]]; then
+  run_or_stop "documentation PR commit read" gh api --paginate --slurp \
+    "repos/NVIDIA/NemoClaw/pulls/${DOCS_PR_NUMBER}/commits?per_page=100" >"$DOCS_PR_COMMITS"
+  run_or_stop "documentation PR file read" gh api --paginate --slurp \
+    "repos/NVIDIA/NemoClaw/pulls/${DOCS_PR_NUMBER}/files?per_page=100" >"$DOCS_PR_FILES"
+  run_or_stop "documentation PR final commit verification" jq -er \
+    --arg expected "$DOCS_PR_HEAD_SHA" '
+    [.[][]] as $commits |
+    if
+      ($commits | length) > 0 and
+      $commits[-1].sha == $expected
+    then $commits[-1].sha
+    else error("documentation PR final commit does not match headRefOid")
+    end
+  ' "$DOCS_PR_COMMITS" >"$EVIDENCE_DIR/docs-pr-final-sha"
+  run_or_stop "documentation PR check rollup read" jq -ce '
+    if (.statusCheckRollup | type) == "array"
+    then .statusCheckRollup
+    else error("documentation PR check rollup is missing")
+    end
+  ' "$SELECTED_DOCS_PR" >"$EVIDENCE_DIR/docs-pr-checks.json"
+  run_or_stop "documentation coverage commit selection" jq -er \
+    --arg message $'docs: catch up after main\n\nSigned-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>' '
+    [.[][] | select(
+      .commit.message == $message and
+      .commit.author.email == "41898282+github-actions[bot]@users.noreply.github.com" and
+      .commit.verification.verified == true and
+      ((.parents | length) == 1 or (.parents | length) == 2)
+    )] | last | .parents[-1].sha
+  ' "$DOCS_PR_COMMITS" >"$EVIDENCE_DIR/docs-coverage-sha"
+  IFS= read -r DOCS_COVERAGE_SHA <"$EVIDENCE_DIR/docs-coverage-sha"
+  run_or_stop "documentation coverage ancestry" git merge-base --is-ancestor \
+    "$DOCS_COVERAGE_SHA" "$CANDIDATE_SHA"
+  run_or_stop "documentation changed-path read" jq -r '.[].[] | .filename' \
+    "$DOCS_PR_FILES" >"$EVIDENCE_DIR/docs-changed-paths.txt"
+else
+  printf '[]\n' >"$DOCS_PR_COMMITS"
+  printf '[]\n' >"$DOCS_PR_FILES"
+  printf 'None\n' >"$EVIDENCE_DIR/docs-pr-final-sha"
+  printf '[]\n' >"$EVIDENCE_DIR/docs-pr-checks.json"
+  printf '%s\n' "$DOCS_COVERAGE_SHA" >"$EVIDENCE_DIR/docs-coverage-sha"
+  : >"$EVIDENCE_DIR/docs-changed-paths.txt"
+fi
+```
 
-Query the candidate's check runs once and select the newest successful check for each required job.
-Then inspect only the one or two workflow run attempts that own those checks. The
+Confirm that every changed path is under `docs/**`, `fern/docs.yml`, or `fern/assets/**`. Report
+the result instead of converting it into an automatic tag gate. The selected PR's final commit must
+match its recorded `headRefOid`; show its review decision and every completed, failed, pending, or
+skipped check.
+
+List all first-parent commits after the coverage point through the candidate:
+
+```bash
+run_or_stop "documentation coverage gap read" git log --first-parent \
+  --format='%H%x09%s' "${DOCS_COVERAGE_SHA}..${CANDIDATE_SHA}" \
+  >"$EVIDENCE_DIR/docs-coverage-gap.tsv"
+```
+
+For each commit in that file, read `repos/NVIDIA/NemoClaw/commits/<sha>/pulls` with the GitHub
+`groot-preview` media type. Show the associated merged PR number, title, and URL. The docs PR merge
+itself can appear in this range; identify any other merge as work after the final automated refresh.
+
+Record all of this evidence in the release brief:
+
+- target tag and candidate commit;
+- latest included cumulative docs PR, its final PR commit, and its merge commit, or `None`;
+- the final automated refresh coverage commit, or the previous release commit when none exists;
+- every commit and merged PR after that coverage point through the candidate;
+- whether the docs PR changed only allowed documentation paths;
+- the docs PR review decision and complete check state;
+- every open managed docs PR; and
+- the canonical release entry and path for a current-main plan; or
+- the plan-bound release-entry exception for a historical plan.
+
+Then offer exactly these three choices:
+
+1. Proceed with the candidate as shown.
+2. Create or update a docs PR for the uncovered range.
+3. Stop tagging.
+
+If the maintainer selects option 1, add this exact line to the signed release brief:
+
+```text
+- Maintainer decision: Proceed with the candidate as shown.
+```
+
+If the maintainer selects option 2 or 3, stop before the E2E decision and tag confirmation.
+If documentation work changes the intended candidate, generate a new immutable release plan.
+
+## Image Evidence
+
+Query the candidate's check runs once and select the newest successful `base-image-publication`
+check. Then inspect the workflow run attempt that owns it. The
 `base-image-publication` job runs the checked-in applicable-publication verifier, including every
 required publisher and immutable Deep Agents Code base contract. Trust the aggregate instead of
-repeating its publisher queries. `Exact staging Brev Launchable` builds the candidate image, boots
-that exact image, verifies the baked runtime, runs full E2E, and verifies workspace cleanup.
+repeating its publisher queries.
 
 ```bash
 CHECK_RUNS_FILE="$EVIDENCE_DIR/candidate-check-runs.json"
@@ -204,28 +373,20 @@ run_or_stop "image check-run selection" jq -er '
         completedAt: $check.completed_at
       }
     end;
-  {
-    base: successful_check("base-image-publication"),
-    launchable: successful_check("Exact staging Brev Launchable")
-  }
+  {base: successful_check("base-image-publication")}
 ' "$CHECK_RUNS_FILE" >"$SELECTED_CHECKS_FILE"
 SELECTED_CHECK_FIELDS_FILE="$EVIDENCE_DIR/selected-image-check-fields.txt"
 run_or_stop "image check-run field read" jq -er '
-  [.base.runId, .base.jobId, .launchable.runId, .launchable.jobId] | .[]
+  [.base.runId, .base.jobId] | .[]
 ' "$SELECTED_CHECKS_FILE" >"$SELECTED_CHECK_FIELDS_FILE"
 {
   IFS= read -r BASE_IMAGE_RUN_ID
   IFS= read -r BASE_IMAGE_JOB_ID
-  IFS= read -r LAUNCHABLE_RUN_ID
-  IFS= read -r LAUNCHABLE_JOB_ID
 } <"$SELECTED_CHECK_FIELDS_FILE"
 
 BASE_IMAGE_JOB_FILE="$EVIDENCE_DIR/base-image-job.json"
-LAUNCHABLE_JOB_FILE="$EVIDENCE_DIR/launchable-job.json"
 run_or_stop "base image job read" gh api \
   "repos/NVIDIA/NemoClaw/actions/jobs/${BASE_IMAGE_JOB_ID}" >"$BASE_IMAGE_JOB_FILE"
-run_or_stop "Launchable job read" gh api \
-  "repos/NVIDIA/NemoClaw/actions/jobs/${LAUNCHABLE_JOB_ID}" >"$LAUNCHABLE_JOB_FILE"
 run_or_stop "base image job validation" jq -e --arg sha "$CANDIDATE_SHA" \
   --argjson run "$BASE_IMAGE_RUN_ID" --argjson job "$BASE_IMAGE_JOB_ID" '
   .id == $job and .run_id == $run and
@@ -234,14 +395,6 @@ run_or_stop "base image job validation" jq -e --arg sha "$CANDIDATE_SHA" \
   .name == "base-image-publication" and
   .status == "completed" and .conclusion == "success"
 ' "$BASE_IMAGE_JOB_FILE" >/dev/null
-run_or_stop "Launchable job validation" jq -e --arg sha "$CANDIDATE_SHA" \
-  --argjson run "$LAUNCHABLE_RUN_ID" --argjson job "$LAUNCHABLE_JOB_ID" '
-  .id == $job and .run_id == $run and
-  (.run_attempt | type) == "number" and .run_attempt >= 1 and
-  .run_attempt == (.run_attempt | floor) and .head_sha == $sha and
-  .name == "Exact staging Brev Launchable" and
-  .status == "completed" and .conclusion == "success"
-' "$LAUNCHABLE_JOB_FILE" >/dev/null
 IMAGE_JOB_FIELDS_FILE="$EVIDENCE_DIR/image-job-fields.txt"
 run_or_stop "base image job field read" jq -er '[.run_attempt, .html_url] | .[]' \
   "$BASE_IMAGE_JOB_FILE" >"$IMAGE_JOB_FIELDS_FILE"
@@ -249,45 +402,20 @@ run_or_stop "base image job field read" jq -er '[.run_attempt, .html_url] | .[]'
   IFS= read -r BASE_IMAGE_ATTEMPT
   IFS= read -r BASE_IMAGE_JOB_URL
 } <"$IMAGE_JOB_FIELDS_FILE"
-run_or_stop "Launchable job field read" jq -er '[.run_attempt, .html_url] | .[]' \
-  "$LAUNCHABLE_JOB_FILE" >"$IMAGE_JOB_FIELDS_FILE"
-{
-  IFS= read -r LAUNCHABLE_ATTEMPT
-  IFS= read -r LAUNCHABLE_JOB_URL
-} <"$IMAGE_JOB_FIELDS_FILE"
-
-OWNING_RUNS_FILE="$EVIDENCE_DIR/image-owning-runs.txt"
-run_or_stop "image owning run selection" jq -nr \
-  --arg baseRun "$BASE_IMAGE_RUN_ID" --arg baseAttempt "$BASE_IMAGE_ATTEMPT" \
-  --arg launchableRun "$LAUNCHABLE_RUN_ID" --arg launchableAttempt "$LAUNCHABLE_ATTEMPT" '
-  [[$baseRun, $baseAttempt], [$launchableRun, $launchableAttempt]] | unique | .[] | @tsv
-' >"$OWNING_RUNS_FILE"
-while IFS=$'\t' read -r RUN_ID RUN_ATTEMPT; do
-  RUN_FILE="$EVIDENCE_DIR/e2e-run-${RUN_ID}-${RUN_ATTEMPT}.json"
-  run_or_stop "E2E run $RUN_ID attempt $RUN_ATTEMPT read" gh api \
-    "repos/NVIDIA/NemoClaw/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}" >"$RUN_FILE"
-done <"$OWNING_RUNS_FILE"
 BASE_IMAGE_RUN_FILE="$EVIDENCE_DIR/e2e-run-${BASE_IMAGE_RUN_ID}-${BASE_IMAGE_ATTEMPT}.json"
-LAUNCHABLE_RUN_FILE="$EVIDENCE_DIR/e2e-run-${LAUNCHABLE_RUN_ID}-${LAUNCHABLE_ATTEMPT}.json"
+run_or_stop "base image run read" gh api \
+  "repos/NVIDIA/NemoClaw/actions/runs/${BASE_IMAGE_RUN_ID}/attempts/${BASE_IMAGE_ATTEMPT}" \
+  >"$BASE_IMAGE_RUN_FILE"
 run_or_stop "base image run validation" jq -e --arg sha "$CANDIDATE_SHA" \
   --argjson attempt "$BASE_IMAGE_ATTEMPT" '
   .head_sha == $sha and .run_attempt == $attempt and
   .path == ".github/workflows/e2e.yaml" and .head_branch == "main" and
   (.event == "push" or .event == "workflow_dispatch")
 ' "$BASE_IMAGE_RUN_FILE" >/dev/null
-run_or_stop "Launchable run validation" jq -e --arg sha "$CANDIDATE_SHA" \
-  --argjson attempt "$LAUNCHABLE_ATTEMPT" '
-  .head_sha == $sha and .run_attempt == $attempt and
-  .path == ".github/workflows/e2e.yaml" and .head_branch == "main" and
-  .event == "workflow_dispatch"
-' "$LAUNCHABLE_RUN_FILE" >/dev/null
 IMAGE_RUN_FIELDS_FILE="$EVIDENCE_DIR/image-run-fields.txt"
 run_or_stop "base image run field read" jq -er '.html_url' \
   "$BASE_IMAGE_RUN_FILE" >"$IMAGE_RUN_FIELDS_FILE"
 IFS= read -r BASE_IMAGE_RUN_URL <"$IMAGE_RUN_FIELDS_FILE"
-run_or_stop "Launchable run field read" jq -er '.html_url' \
-  "$LAUNCHABLE_RUN_FILE" >"$IMAGE_RUN_FIELDS_FILE"
-IFS= read -r LAUNCHABLE_RUN_URL <"$IMAGE_RUN_FIELDS_FILE"
 ```
 
 Record these values:
@@ -295,13 +423,68 @@ Record these values:
 - `BASE_IMAGE_RUN_ID`;
 - `BASE_IMAGE_ATTEMPT`;
 - `BASE_IMAGE_RUN_URL`;
-- `BASE_IMAGE_JOB_URL`;
-- `LAUNCHABLE_RUN_ID`;
-- `LAUNCHABLE_ATTEMPT`;
-- `LAUNCHABLE_RUN_URL`; and
-- `LAUNCHABLE_JOB_URL`.
+- `BASE_IMAGE_JOB_URL`.
 
-Download only that run's private receipts and bind them to the candidate:
+## Optional Launchable E2E Evidence
+
+Skip this section unless the maintainer requests or cites a Launchable result in the E2E decision.
+When used, validate its cleanup receipts because the Brev workspace receives credentials.
+
+```bash
+SELECTED_LAUNCHABLE_CHECK_FILE="$EVIDENCE_DIR/selected-launchable-check.json"
+run_or_stop "Launchable check-run selection" jq -er '
+  ([.[].check_runs[]? |
+    select(.name == "Exact staging Brev Launchable" and
+      .status == "completed" and .conclusion == "success")] |
+    sort_by(.completed_at) | last) as $check |
+  if $check == null then
+    error("No successful candidate Launchable check run was found")
+  else
+    ($check | (.details_url // .html_url // "") |
+      capture("/actions/runs/(?<runId>[0-9]+)/job/(?<jobId>[0-9]+)(?:[?].*)?$")) as $owner |
+    {runId: ($owner.runId | tonumber), jobId: ($owner.jobId | tonumber)}
+  end
+' "$CHECK_RUNS_FILE" >"$SELECTED_LAUNCHABLE_CHECK_FILE"
+LAUNCHABLE_CHECK_FIELDS_FILE="$EVIDENCE_DIR/selected-launchable-check-fields.txt"
+run_or_stop "Launchable check-run field read" jq -er '[.runId, .jobId] | .[]' \
+  "$SELECTED_LAUNCHABLE_CHECK_FILE" >"$LAUNCHABLE_CHECK_FIELDS_FILE"
+{
+  IFS= read -r LAUNCHABLE_RUN_ID
+  IFS= read -r LAUNCHABLE_JOB_ID
+} <"$LAUNCHABLE_CHECK_FIELDS_FILE"
+
+LAUNCHABLE_JOB_FILE="$EVIDENCE_DIR/launchable-job.json"
+run_or_stop "Launchable job read" gh api \
+  "repos/NVIDIA/NemoClaw/actions/jobs/${LAUNCHABLE_JOB_ID}" >"$LAUNCHABLE_JOB_FILE"
+run_or_stop "Launchable job validation" jq -e --arg sha "$CANDIDATE_SHA" \
+  --argjson run "$LAUNCHABLE_RUN_ID" --argjson job "$LAUNCHABLE_JOB_ID" '
+  .id == $job and .run_id == $run and .head_sha == $sha and
+  .name == "Exact staging Brev Launchable" and
+  .status == "completed" and .conclusion == "success"
+' "$LAUNCHABLE_JOB_FILE" >/dev/null
+LAUNCHABLE_JOB_FIELDS_FILE="$EVIDENCE_DIR/launchable-job-fields.txt"
+run_or_stop "Launchable job field read" jq -er '[.run_attempt, .html_url] | .[]' \
+  "$LAUNCHABLE_JOB_FILE" >"$LAUNCHABLE_JOB_FIELDS_FILE"
+{
+  IFS= read -r LAUNCHABLE_ATTEMPT
+  IFS= read -r LAUNCHABLE_JOB_URL
+} <"$LAUNCHABLE_JOB_FIELDS_FILE"
+LAUNCHABLE_RUN_FILE="$EVIDENCE_DIR/e2e-run-${LAUNCHABLE_RUN_ID}-${LAUNCHABLE_ATTEMPT}.json"
+run_or_stop "Launchable run read" gh api \
+  "repos/NVIDIA/NemoClaw/actions/runs/${LAUNCHABLE_RUN_ID}/attempts/${LAUNCHABLE_ATTEMPT}" \
+  >"$LAUNCHABLE_RUN_FILE"
+run_or_stop "Launchable run validation" jq -e --arg sha "$CANDIDATE_SHA" \
+  --argjson attempt "$LAUNCHABLE_ATTEMPT" '
+  .head_sha == $sha and .run_attempt == $attempt and
+  .path == ".github/workflows/e2e.yaml" and .head_branch == "main" and
+  .event == "workflow_dispatch"
+' "$LAUNCHABLE_RUN_FILE" >/dev/null
+run_or_stop "Launchable run field read" jq -er '.html_url' \
+  "$LAUNCHABLE_RUN_FILE" >"$IMAGE_RUN_FIELDS_FILE"
+IFS= read -r LAUNCHABLE_RUN_URL <"$IMAGE_RUN_FIELDS_FILE"
+```
+
+Download that run's private receipts and bind them to the candidate:
 
 ```bash
 LAUNCHABLE_ARTIFACT_DIR="$EVIDENCE_DIR/launchable"
@@ -373,72 +556,9 @@ Record these values:
 - the full E2E result; and
 - the verified cleanup time.
 
-This exact job is the nonwaivable Launchable requirement. The rest of the general E2E suite remains
-maintainer context.
+If Launchable cleanup fails, report the workspace and follow the cleanup and credential-remediation
+boundary in `nemoclaw-maintainer-e2e`. This remains operational follow-up, not a tag gate.
 
-If Launchable evidence is missing or failed and the planned candidate still equals `origin/main`,
-load `nemoclaw-maintainer-e2e` and request Launchable mode. A new dispatch always tests current
-`origin/main`; it cannot create evidence for an older planned candidate. After `main` advances,
-either use existing exact-candidate evidence or prepare and plan a new documented candidate before
-dispatching. If the base-image aggregate is missing or failed, repair or rerun the affected
-publisher workflow and verifier. Neither result can be replaced by the general E2E decision.
-
-## Final Documentation Recheck
-
-Run this block only after the maintainer supplies the exact confirmation phrase. It reads the
-candidate from the immutable plan again and does not depend on the earlier evidence shell. If both
-checks pass, call the cutter immediately without another wait.
-
-```bash
-set -euo pipefail
-PLAN_PATH='../nemoclaw-release-vX.Y.Z/plan.json'
-FINAL_DOCS_DIR="$(mktemp -d)"
-chmod 700 "$FINAL_DOCS_DIR"
-trap 'rm -rf "$FINAL_DOCS_DIR"' EXIT
-
-run_or_stop() {
-  local label="$1"
-  local status
-  shift
-  if "$@"; then
-    return 0
-  else
-    status=$?
-    printf '%s failed with status %s\n' "$label" "$status" >&2
-    exit "$status"
-  fi
-}
-
-stop() {
-  printf '%s\n' "$1" >&2
-  exit 1
-}
-
-FINAL_CANDIDATE_FILE="$FINAL_DOCS_DIR/candidate.txt"
-run_or_stop "final release plan read" jq -er '
-  if
-    (keys | sort) == [
-      "nextTag", "originMainCommit", "originMainHeadline",
-      "previousTag", "previousTagCommit", "previousTagObject"
-    ] and
-    (.originMainCommit | test("^[0-9a-f]{40}$"))
-  then .originMainCommit
-  else error("release plan is invalid")
-  end
-' "$PLAN_PATH" >"$FINAL_CANDIDATE_FILE"
-IFS= read -r CANDIDATE_SHA <"$FINAL_CANDIDATE_FILE"
-DOCS_BRANCH="automation/post-merge-docs-${CANDIDATE_SHA:0:12}"
-
-FINAL_DOCS_PRS_FILE="$FINAL_DOCS_DIR/docs-prs.json"
-FINAL_DOCS_BRANCH_FILE="$FINAL_DOCS_DIR/docs-branch.txt"
-run_or_stop "final candidate documentation PR read" gh pr list --repo NVIDIA/NemoClaw --state open \
-  --head "$DOCS_BRANCH" --limit 100 --json number >"$FINAL_DOCS_PRS_FILE"
-run_or_stop "final candidate documentation PR validation" jq -e 'length == 0' \
-  "$FINAL_DOCS_PRS_FILE" >/dev/null
-run_or_stop "final candidate documentation branch read" git ls-remote --heads origin \
-  "refs/heads/$DOCS_BRANCH" >"$FINAL_DOCS_BRANCH_FILE"
-[[ ! -s "$FINAL_DOCS_BRANCH_FILE" ]] || stop "The candidate documentation branch still exists"
-```
-
-Treat the confirmation as consumed if a read fails or pending state appears. Resolve that state and
-request a new confirmation.
+If the base-image aggregate is missing or failed, follow [retry prerequisites](#check-prerequisites-before-a-retry)
+before repairing or rerunning the affected publisher and verifier. The general E2E decision cannot
+replace required image evidence.

@@ -4,15 +4,18 @@
 import { describe, expect, it } from "vitest";
 // Import source directly so tests cannot pass against a stale build.
 import {
+  endpointUrlHasUserinfoQueryOrFragment,
+  unsafeEndpointUrlViolation,
+} from "./endpoint-url-safety";
+import {
   canonicalEndpoint,
   compactText,
-  endpointUrlHasUserinfoQueryOrFragment,
   formatEnvAssignment,
   isLoopbackHostname,
+  isLoopbackRemoteAddress,
   normalizeProviderBaseUrl,
   parsePolicyPresetEnv,
   stripEndpointSuffix,
-  unsafeEndpointUrlViolation,
 } from "./url-utils";
 
 describe("compactText", () => {
@@ -83,12 +86,12 @@ describe("canonicalEndpoint", () => {
     expect(canonicalEndpoint("ftp://proxy.example.com/v1", "openai")).toBeNull();
   });
 
-  it.each([
-    "https://user@proxy.example.com/v1",
-    "https://user:password@proxy.example.com/v1",
-  ])("rejects URL credentials in %s", (input) => {
-    expect(canonicalEndpoint(input, "openai")).toBeNull();
-  });
+  it.each(["https://user@proxy.example.com/v1", "https://user:password@proxy.example.com/v1"])(
+    "rejects URL credentials in %s",
+    (input) => {
+      expect(canonicalEndpoint(input, "openai")).toBeNull();
+    },
+  );
 
   it("accepts the 2048-character bound and rejects longer endpoints", () => {
     const prefix = "https://example.com/";
@@ -157,7 +160,13 @@ describe("unsafeEndpointUrlViolation", () => {
     ["single quote", "https://example.test/v1'q'", "unsupported-characters"],
     ["interior space", "https://example.test/v 1", "unsupported-characters"],
     ["encoded newline", "https://example.test/v1%0ainjected", "encoded-control-characters"],
-    ["encoded carriage return uppercase", "https://example.test/v1%0Dx", "encoded-control-characters"],
+    [
+      "encoded carriage return uppercase",
+      "https://example.test/v1%0Dx",
+      "encoded-control-characters",
+    ],
+    ["encoded newline followed by malformed escape", "https://example.test/v1%0A%", "invalid-url"],
+    ["malformed percent escape", "https://example.test/v1%ZZ", "invalid-url"],
     ["encoded NUL", "https://example.test/v1%00x", "encoded-control-characters"],
     ["encoded UTF-8 C1 control", "https://example.test/v1%C2%80x", "encoded-control-characters"],
     [
@@ -203,12 +212,26 @@ describe("isLoopbackHostname", () => {
   it.each([
     ["localhost", true],
     ["127.0.0.1", true],
+    ["127.0.0.2", true],
     ["::1", true],
     ["[::1]", true],
     ["example.com", false],
     ["", false],
   ] as const)("classifies %s", (input, expected) => {
     expect(isLoopbackHostname(input)).toBe(expected);
+  });
+
+  it.each([
+    ["127.0.0.1", true],
+    ["::1", true],
+    ["::ffff:127.0.0.1", true],
+    ["10.40.0.1", false],
+    ["192.168.1.5", false],
+    ["::ffff:192.168.1.5", false],
+    [undefined, false],
+    ["", false],
+  ] as const)("classifies remote address %s", (input, expected) => {
+    expect(isLoopbackRemoteAddress(input)).toBe(expected);
   });
 });
 

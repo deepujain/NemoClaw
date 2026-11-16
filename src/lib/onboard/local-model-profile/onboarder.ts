@@ -4,8 +4,9 @@
 import { materializeHostLocalVllmSelection } from "../../inference/serving/host-local-vllm-selection";
 import type { ResolvedHostLocalInferenceSelection } from "../../inference/serving/types";
 import type { VllmProfile } from "../../inference/vllm";
-import { VLLM_EXTRA_ARGS_ENV } from "../../inference/vllm-models";
+import { VLLM_EXTRA_ARGS_ENV, vllmModelMatchesAlias } from "../../inference/vllm-models";
 import type { SetupNimSelectionResult, SetupNimSelectionState } from "../setup-nim-flow";
+import { vllmInstallRecoveryOptions } from "../provider-recovery";
 import type { LocalModelProfilePlan } from "./plan";
 
 export interface LocalModelProfileOnboarderDeps {
@@ -17,8 +18,11 @@ export interface LocalModelProfileOnboarderDeps {
       nonInteractive: boolean;
       promptFn: (question: string) => Promise<string>;
       beforeInstall?: (modelId: string) => void;
+      checkpointInstallIntent?: (modelId: string) => void;
     },
   ): Promise<{ ok: boolean }>;
+  getVllmInstallResumeModel?(): string | null;
+  checkpointVllmInstallModel?(modelId: string): void;
   handleVllmSelection(
     state: SetupNimSelectionState,
     options?: { managedInstall?: boolean; sparkHost?: boolean },
@@ -57,10 +61,9 @@ export function createLocalModelProfileOnboarder(deps: LocalModelProfileOnboarde
     }
     if (
       String(env.NEMOCLAW_VLLM_MODEL ?? "").trim() ||
-      String(env[VLLM_EXTRA_ARGS_ENV] ?? "").trim() ||
-      String(env.NEMOCLAW_VLLM_PORT ?? "").trim()
+      String(env[VLLM_EXTRA_ARGS_ENV] ?? "").trim()
     ) {
-      deps.error("  The local model profile does not accept vLLM model, port, or serve overrides.");
+      deps.error("  The local model profile does not accept vLLM model or serve overrides.");
       return "retry-selection";
     }
     let materialized: ReturnType<typeof materializeHostLocalVllmSelection>;
@@ -83,17 +86,39 @@ export function createLocalModelProfileOnboarder(deps: LocalModelProfileOnboarde
       );
       return "retry-selection";
     }
+    const recovery = vllmInstallRecoveryOptions(deps);
+    const resumedModel = recovery.modelIntent?.trim();
+    if (resumedModel && !vllmModelMatchesAlias(materialized.model, resumedModel)) {
+      deps.error(
+        `  The resumed vLLM model conflicts with the ${materialized.model.envValue} local model profile.`,
+      );
+      return "retry-selection";
+    }
+    const seedVllmInstallRoute = (modelId: string): void => {
+      state.provider = "vllm-local";
+      state.model = modelId;
+      state.endpointUrl = null;
+      state.credentialEnv = null;
+      state.preferredInferenceApi = "openai-completions";
+      state.assertRouteCompatible?.();
+    };
+    const checkpointInstallIntent = recovery.checkpointInstallIntent;
     const result = await deps.installVllm(materialized.profile, {
       hasImage: host.hasVllmImage,
       nonInteractive: true,
       promptFn: deps.prompt,
+      ...(checkpointInstallIntent
+        ? {
+            checkpointInstallIntent: (modelId: string) => {
+              seedVllmInstallRoute(modelId);
+              state.revalidateSandboxIdentity?.("record managed vLLM install intent");
+              checkpointInstallIntent(modelId);
+            },
+          }
+        : {}),
       beforeInstall: (modelId) => {
-        state.provider = "vllm-local";
-        state.model = modelId;
-        state.endpointUrl = null;
-        state.credentialEnv = null;
-        state.preferredInferenceApi = "openai-completions";
-        state.assertRouteCompatible?.();
+        seedVllmInstallRoute(modelId);
+        state.revalidateSandboxIdentity?.("install managed vLLM runtime");
       },
     });
     if (!result.ok) return "retry-selection";

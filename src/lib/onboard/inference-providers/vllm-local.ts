@@ -4,7 +4,12 @@
 // vLLM local inference provider setup flow.
 // Extracted verbatim from onboard.setupInference (#767).
 
+import { isLocalProviderProbeOutputHealthy } from "../../inference/serving/model-inventory";
 import type { SetupInferenceResult, VllmDeps } from "./types";
+import {
+  ManagedVllmInspectionError,
+  UnsafeLegacyVllmBindingsError,
+} from "../../inference/serving/vllm-host-local-lifecycle";
 
 export async function setupVllmLocalInference(
   args: { model: string; provider: string },
@@ -24,14 +29,29 @@ export async function setupVllmLocalInference(
     error,
   } = deps;
 
+  let managedBinding: ReturnType<typeof getManagedVllmProviderBinding>;
+  try {
+    managedBinding = getManagedVllmProviderBinding();
+  } catch (bindingError) {
+    error(
+      bindingError instanceof UnsafeLegacyVllmBindingsError ||
+        bindingError instanceof ManagedVllmInspectionError
+        ? `  ${bindingError.message}`
+        : "  Managed vLLM authentication state is unsafe or unreadable.",
+    );
+    return exitProcess(1);
+  }
+
   const validation = validateLocalProvider(provider);
   if (!validation.ok) {
     const hostCheck = getLocalProviderHealthCheck(provider);
-    // Use run() and check exit status rather than coercing runCapture() output
-    // to boolean — curl -sf can leave output even on failure in edge cases.
-    const hostResponding = hostCheck
-      ? run(hostCheck, { ignoreError: true, suppressOutput: true }).status === 0
-      : false;
+    const hostResult = hostCheck
+      ? run(hostCheck, { ignoreError: true, suppressOutput: true })
+      : null;
+    const hostResponding =
+      hostCheck !== null &&
+      hostResult?.status === 0 &&
+      isLocalProviderProbeOutputHealthy(hostCheck.at(-1) ?? "", String(hostResult.stdout ?? ""));
 
     if (hostResponding) {
       console.warn(`  ⚠ ${validation.message}`);
@@ -50,13 +70,6 @@ export async function setupVllmLocalInference(
       return exitProcess(1);
     }
   }
-  let managedBinding: ReturnType<typeof getManagedVllmProviderBinding>;
-  try {
-    managedBinding = getManagedVllmProviderBinding();
-  } catch {
-    error("  Managed vLLM authentication state is unsafe or unreadable.");
-    return exitProcess(1);
-  }
   const baseUrl = managedBinding?.baseUrl ?? getLocalProviderBaseUrl(provider);
   const providerToken = managedBinding?.apiKey ?? "dummy";
   // Use a dedicated internal credential env so the gateway does not pick
@@ -64,7 +77,7 @@ export async function setupVllmLocalInference(
   // the bearer for legacy single-host installs; managed dual-Station vLLM
   // uses the private persisted key. The dedicated env name prevents
   // accidental hijacking by a host OPENAI_API_KEY. See GH #2519.
-  const providerResult = upsertProvider(
+  const providerResult = await upsertProvider(
     "vllm-local",
     "openai",
     VLLM_LOCAL_CREDENTIAL_ENV,

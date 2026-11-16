@@ -6,9 +6,18 @@ import net from "node:net";
 import path from "node:path";
 
 import { buildSubprocessEnv } from "../subprocess-env";
-import { isDgxStationGb300Product } from "./dgx-station-identity";
+import {
+  classifyNvidiaFirmwareProducts,
+  DGX_STATION_PYTHON_IDENTITY_PROBE,
+  NVIDIA_FIRMWARE_VALUE_MAX_BYTES,
+} from "./dgx-station-identity";
 import { buildVllmSshTransportEnv } from "./vllm-docker-env";
-import { NEMOTRON_ULTRA_DUAL_STATION_IMAGE, VLLM_MODELS } from "./vllm-models";
+import {
+  DUAL_STATION_VLLM_GPU_MEMORY_UTILIZATION,
+  STATION_PAIR_OPTIONAL_ORCHESTRATION,
+  vllmModelForOrchestration,
+  vllmStationPairForOrchestration,
+} from "./vllm-models";
 import {
   type DualStationSshBinding,
   dualStationPinnedSshArgs,
@@ -18,7 +27,7 @@ import {
 
 export const NEMOCLAW_DGX_STATION_PEER_ENV = "NEMOCLAW_DGX_STATION_PEER";
 
-const HOST_PROBE_SCHEMA_VERSION = 1;
+const HOST_PROBE_SCHEMA_VERSION = 2;
 const CONNECTIVITY_PROBE_SCHEMA_VERSION = 1;
 const COMMAND_TIMEOUT_MS = 20_000;
 const MAX_PROBE_OUTPUT_BYTES = 1024 * 1024;
@@ -40,25 +49,43 @@ const CANONICAL_SSH_HOST_PATTERN =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
 const CANONICAL_SSH_USERNAME_PATTERN = /^[A-Za-z_][A-Za-z0-9._-]*$/;
 
-const ultraModel = VLLM_MODELS.find((model) => model.envValue === "nemotron-3-ultra-550b-a55b");
+const ultraModel = vllmModelForOrchestration(
+  STATION_PAIR_OPTIONAL_ORCHESTRATION,
+  "station",
+  "arm64",
+);
 if (!ultraModel?.revision) {
-  throw new Error("Nemotron Ultra must have an immutable Hugging Face revision");
+  throw new Error("The Station-pair model must have an immutable Hugging Face revision");
+}
+const stationPair = vllmStationPairForOrchestration(
+  ultraModel,
+  STATION_PAIR_OPTIONAL_ORCHESTRATION,
+  "station",
+  "arm64",
+);
+if (!stationPair) {
+  throw new Error("The Station-pair orchestration must have a typed runtime configuration");
 }
 
 export const DUAL_STATION_VLLM_RUNTIME = Object.freeze({
-  image: NEMOTRON_ULTRA_DUAL_STATION_IMAGE.arm64.ref,
+  image: stationPair.image,
+  imageDownloadSizeBytes: stationPair.imageDownloadSizeBytes,
   modelId: ultraModel.id,
   modelRevision: ultraModel.revision,
-  servedModelId: "nemotron-ultra",
-  tensorParallelSize: 1 as const,
-  pipelineParallelSize: 2 as const,
-  nodeCount: 2 as const,
+  servedModelId: stationPair.servedName,
+  tensorParallelSize: stationPair.tensorParallelSize,
+  pipelineParallelSize: stationPair.pipelineParallelSize,
+  nodeCount: stationPair.nodeCount,
+  loadTimeoutSeconds: stationPair.loadTimeoutSeconds,
+  gpuMemoryUtilization: DUAL_STATION_VLLM_GPU_MEMORY_UTILIZATION,
 });
 
 export interface StationGpuProbe {
   index: number;
   name: string;
   uuid: string;
+  totalMemoryMiB: number;
+  freeMemoryMiB: number;
 }
 
 export interface StationIpv4AddressProbe {
@@ -98,9 +125,13 @@ export interface StationModelSnapshotProbe {
 }
 
 export interface StationHostProbe {
-  schemaVersion: 1;
+  schemaVersion: 2;
   hostname: string;
   productName: string;
+  productFamily: string;
+  boardName: string;
+  deviceTreeModel: string;
+  stationGb300PciGpu: boolean;
   architecture: string;
   home: string;
   uid: number;
@@ -260,6 +291,7 @@ import subprocess
 MODEL_ID = ${JSON.stringify(DUAL_STATION_VLLM_RUNTIME.modelId)}
 MODEL_REVISION = ${JSON.stringify(DUAL_STATION_VLLM_RUNTIME.modelRevision)}
 MODEL_CACHE_NAME = "models--" + MODEL_ID.replace("/", "--")
+${DGX_STATION_PYTHON_IDENTITY_PROBE}
 
 def read_text(path):
     try:
@@ -282,37 +314,32 @@ def run(argv, timeout=5):
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return 127, ""
 
-def product_name():
-    for candidate in (
-        "/sys/class/dmi/id/product_name",
-        "/sys/devices/virtual/dmi/id/product_name",
-        "/sys/firmware/devicetree/base/model",
-    ):
-        value = read_text(candidate)
-        if value:
-            return value
-    return ""
-
 def gpu_inventory():
     rc, output = run([
         "nvidia-smi",
-        "--query-gpu=index,name,uuid",
+        "--query-gpu=index,name,uuid,memory.total,memory.free",
         "--format=csv,noheader,nounits",
     ])
     if rc != 0:
         return []
     result = []
     for row in csv.reader(output.splitlines()):
-        if len(row) != 3:
+        if len(row) != 5:
             continue
         try:
             index = int(row[0].strip())
+            total_memory_mib = int(row[3].strip())
+            free_memory_mib = int(row[4].strip())
         except ValueError:
+            continue
+        if total_memory_mib <= 0 or free_memory_mib < 0 or free_memory_mib > total_memory_mib:
             continue
         result.append({
             "index": index,
             "name": row[1].strip(),
             "uuid": row[2].strip(),
+            "totalMemoryMiB": total_memory_mib,
+            "freeMemoryMiB": free_memory_mib,
         })
     return result
 
@@ -541,7 +568,7 @@ def snapshot_state():
 payload = {
     "schemaVersion": ${String(HOST_PROBE_SCHEMA_VERSION)},
     "hostname": socket.gethostname(),
-    "productName": product_name(),
+    **station_identity_payload(),
     "architecture": platform.machine(),
     "home": str(Path.home()),
     "uid": os.getuid(),
@@ -818,6 +845,17 @@ function requireString(value: unknown, label: string, maxLength = 1024): string 
   return value;
 }
 
+function requireFirmwareString(value: unknown, label: string): string {
+  if (
+    typeof value !== "string" ||
+    Buffer.byteLength(value, "utf8") > NVIDIA_FIRMWARE_VALUE_MAX_BYTES ||
+    /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    throw new Error(`${label} must be bounded printable text`);
+  }
+  return value;
+}
+
 function requireBoolean(value: unknown, label: string): boolean {
   if (typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
   return value;
@@ -868,10 +906,27 @@ function parseGpu(value: unknown, label: string): StationGpuProbe {
   const name = requireString(record.name, `${label}.name`, 256);
   const uuid = requireString(record.uuid, `${label}.uuid`, 128);
   if (!/^GPU-[A-Za-z0-9-]+$/.test(uuid)) throw new Error(`${label}.uuid is invalid`);
+  const totalMemoryMiB = requireInteger(
+    record.totalMemoryMiB,
+    `${label}.totalMemoryMiB`,
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  const freeMemoryMiB = requireInteger(
+    record.freeMemoryMiB,
+    `${label}.freeMemoryMiB`,
+    0,
+    Number.MAX_SAFE_INTEGER,
+  );
+  if (freeMemoryMiB > totalMemoryMiB) {
+    throw new Error(`${label}.freeMemoryMiB exceeds total memory`);
+  }
   return {
     index: requireInteger(record.index, `${label}.index`, 0, 1024),
     name,
     uuid,
+    totalMemoryMiB,
+    freeMemoryMiB,
   };
 }
 
@@ -968,9 +1023,13 @@ export function parseStationHostProbe(stdout: string): StationHostProbe {
   }
   const docker = requireRecord(record.docker, "host probe.docker");
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     hostname: requireString(record.hostname, "host probe.hostname", 256),
-    productName: requireString(record.productName, "host probe.productName", 512),
+    productName: requireFirmwareString(record.productName, "host probe.productName"),
+    productFamily: requireFirmwareString(record.productFamily, "host probe.productFamily"),
+    boardName: requireFirmwareString(record.boardName, "host probe.boardName"),
+    deviceTreeModel: requireFirmwareString(record.deviceTreeModel, "host probe.deviceTreeModel"),
+    stationGb300PciGpu: requireBoolean(record.stationGb300PciGpu, "host probe.stationGb300PciGpu"),
     architecture: requireString(record.architecture, "host probe.architecture", 64),
     home,
     uid: requireInteger(record.uid, "host probe.uid", 1, 2_147_483_647),
@@ -1284,14 +1343,30 @@ function buildStaticPlan(
   local: StationHostProbe,
   peer: StationHostProbe,
 ): StaticPlan | PlanFailure {
+  const localFirmware = classifyNvidiaFirmwareProducts([
+    local.productName,
+    local.productFamily,
+    local.boardName,
+    local.deviceTreeModel,
+  ]);
+  const peerFirmware = classifyNvidiaFirmwareProducts([
+    peer.productName,
+    peer.productFamily,
+    peer.boardName,
+    peer.deviceTreeModel,
+  ]);
   if (
-    !isDgxStationGb300Product(local.productName) ||
+    !localFirmware.stationFirmwareProduct ||
+    localFirmware.platformIdentityConflict ||
+    !local.stationGb300PciGpu ||
     !/^(?:aarch64|arm64)$/i.test(local.architecture)
   ) {
     return unavailable("local-not-station", "local host is not a verified arm64 DGX Station");
   }
   if (
-    !isDgxStationGb300Product(peer.productName) ||
+    !peerFirmware.stationFirmwareProduct ||
+    peerFirmware.platformIdentityConflict ||
+    !peer.stationGb300PciGpu ||
     !/^(?:aarch64|arm64)$/i.test(peer.architecture)
   ) {
     return unavailable("peer-not-station", "configured peer is not a verified arm64 DGX Station");
@@ -1387,28 +1462,26 @@ function buildStaticPlan(
     );
   }
 
-  const rails = matches.map(
-    (match, index): DualStationPlanRail => ({
-      index,
-      subnet: match.subnet,
-      local: {
-        rdmaDevice: match.localRail.rdmaDevice,
-        netdev: match.localRail.netdev,
-        macAddress: match.localRail.macAddress,
-        uverbsDevice: match.localRail.uverbsDevice,
-        pciAddress: match.localRail.pciAddress,
-        address: match.localAddress.address,
-      },
-      peer: {
-        rdmaDevice: match.peerRail.rdmaDevice,
-        netdev: match.peerRail.netdev,
-        macAddress: match.peerRail.macAddress,
-        uverbsDevice: match.peerRail.uverbsDevice,
-        pciAddress: match.peerRail.pciAddress,
-        address: match.peerAddress.address,
-      },
-    }),
-  );
+  const rails = matches.map((match, index): DualStationPlanRail => ({
+    index,
+    subnet: match.subnet,
+    local: {
+      rdmaDevice: match.localRail.rdmaDevice,
+      netdev: match.localRail.netdev,
+      macAddress: match.localRail.macAddress,
+      uverbsDevice: match.localRail.uverbsDevice,
+      pciAddress: match.localRail.pciAddress,
+      address: match.localAddress.address,
+    },
+    peer: {
+      rdmaDevice: match.peerRail.rdmaDevice,
+      netdev: match.peerRail.netdev,
+      macAddress: match.peerRail.macAddress,
+      uverbsDevice: match.peerRail.uverbsDevice,
+      pciAddress: match.peerRail.pciAddress,
+      address: match.peerAddress.address,
+    },
+  }));
 
   return {
     plan: {
@@ -1461,15 +1534,15 @@ function connectivityMatches(
     const check = byKey.get(`${request.netdev}|${request.sourceAddress}|${request.peerAddress}`);
     return Boolean(
       check &&
-        check.routeDevice === request.netdev &&
-        check.routeSource === request.sourceAddress &&
-        check.routeGateway === null &&
-        check.routeScope.toLowerCase() === "link" &&
-        check.peerMac === request.expectedPeerMac &&
-        /^(?:REACHABLE|STALE|DELAY|PROBE|PERMANENT|NOARP)(?:,(?:REACHABLE|STALE|DELAY|PROBE|PERMANENT|NOARP))*$/i.test(
-          check.peerNeighborState,
-        ) &&
-        check.jumboPing,
+      check.routeDevice === request.netdev &&
+      check.routeSource === request.sourceAddress &&
+      check.routeGateway === null &&
+      check.routeScope.toLowerCase() === "link" &&
+      check.peerMac === request.expectedPeerMac &&
+      /^(?:REACHABLE|STALE|DELAY|PROBE|PERMANENT|NOARP)(?:,(?:REACHABLE|STALE|DELAY|PROBE|PERMANENT|NOARP))*$/i.test(
+        check.peerNeighborState,
+      ) &&
+      check.jumboPing,
     );
   });
 }

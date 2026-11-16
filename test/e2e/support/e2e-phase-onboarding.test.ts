@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 
+import { ONBOARD_FINAL_HANDOFF_COMMAND_TIMEOUT_MS } from "../../../tools/e2e/onboard-timeout-contract.mts";
 import { ArtifactSink } from "../fixtures/artifacts.ts";
 import { type CommandRunner, HostCliClient } from "../fixtures/clients/index.ts";
 import { DCODE_BASE_IMAGE, DCODE_BASE_IMAGE_ENV } from "../fixtures/dcode-base-image.ts";
@@ -122,9 +123,10 @@ function ready(overrides: Partial<EnvironmentReady> = {}): EnvironmentReady {
     runtime: "docker-running",
     onboarding: "cloud-openclaw",
     cliPath: "nemoclaw",
-    docker: {
+    runtimeProvider: {
       id: "docker-running",
       expectation: "required",
+      providerId: "docker",
       available: true,
       result: shellResult(0),
     },
@@ -172,6 +174,20 @@ describe("onboarding phase fixture", () => {
       },
     ]);
     expect(runner.calls[0]?.options?.env?.[DCODE_BASE_IMAGE_ENV]).toBeUndefined();
+  });
+
+  it("passes a caller-selected final-handoff timeout to the public command (#9622)", async () => {
+    const runner = new FakeRunner();
+    runner.enqueue(shellResult(0, "onboarded\n"));
+    const secrets = new FakeSecrets({ NVIDIA_INFERENCE_API_KEY: "secret-token" });
+    const onboard = new OnboardingPhaseFixture(new HostCliClient(runner), secrets);
+
+    await onboard.from(ready(), {
+      sandboxName: "e2e-final-handoff",
+      timeoutMs: ONBOARD_FINAL_HANDOFF_COMMAND_TIMEOUT_MS,
+    });
+
+    expect(runner.calls[0]?.options?.timeoutMs).toBe(40 * 60_000);
   });
 
   it("runs the Personal cloud OpenClaw target without search-provider credentials", async () => {
@@ -236,6 +252,66 @@ describe("onboarding phase fixture", () => {
       },
     });
   });
+
+  it("keeps local-source Deep Agents Code onboarding free of a published base override", async () => {
+    const runner = new FakeRunner();
+    runner.enqueue(shellResult(0, "onboarded\n"));
+    const secrets = new FakeSecrets({ NVIDIA_INFERENCE_API_KEY: "secret-token" });
+    const onboard = new OnboardingPhaseFixture(new HostCliClient(runner), secrets);
+
+    const instance = await withProcessEnvironment(
+      {
+        E2E_WORKLOAD_SOURCE: "local-dockerfile",
+        [DCODE_BASE_IMAGE_ENV]: undefined,
+      },
+      () =>
+        onboard.from(ready({ onboarding: "cloud-langchain-deepagents-code" }), {
+          sandboxName: "e2e-dcode-local",
+        }),
+    );
+
+    expect(instance).toMatchObject({
+      agent: "langchain-deepagents-code",
+      sandboxName: "e2e-dcode-local",
+    });
+    expect(runner.calls[0]?.options?.env).toEqual(
+      expect.objectContaining({ NEMOCLAW_AGENT: "langchain-deepagents-code" }),
+    );
+    expect(runner.calls[0]?.options?.env).not.toHaveProperty(DCODE_BASE_IMAGE_ENV);
+  });
+
+  it.each([
+    ["published cohort", undefined, undefined],
+    ["candidate catalog", '{"langchain-deepagents-code":{}}', undefined],
+    ["explicit override", "", DCODE_BASE_IMAGE_REF],
+  ])(
+    "omits the Deep Agents base override for managed-image onboarding with %s (#11305)",
+    async (_source, catalog, dcodeBaseImageReference) => {
+      const runner = new FakeRunner();
+      runner.enqueue(shellResult(0, "onboarded\n"));
+      const secrets = new FakeSecrets({ NVIDIA_INFERENCE_API_KEY: "secret-token" });
+      const onboard = new OnboardingPhaseFixture(new HostCliClient(runner), secrets);
+
+      const instance = await withProcessEnvironment(
+        {
+          E2E_WORKLOAD_SOURCE: "managed-image",
+          NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG_JSON: catalog,
+          [DCODE_BASE_IMAGE_ENV]: undefined,
+        },
+        () =>
+          onboard.from(ready({ onboarding: "cloud-langchain-deepagents-code" }), {
+            sandboxName: "e2e-dcode-candidate",
+            dcodeBaseImageReference,
+          }),
+      );
+
+      expect(instance).toMatchObject({
+        agent: "langchain-deepagents-code",
+        sandboxName: "e2e-dcode-candidate",
+      });
+      expect(runner.calls[0]?.options?.env).not.toHaveProperty(DCODE_BASE_IMAGE_ENV);
+    },
+  );
 
   it("uses the contract-selected Deep Agents Code base image reference instead of the ambient publication index", async () => {
     const runner = new FakeRunner();
@@ -354,10 +430,15 @@ describe("onboarding phase fixture", () => {
     await expect(
       onboard.from(
         ready({
-          docker: { id: "docker-running", expectation: "required", available: false },
+          runtimeProvider: {
+            id: "docker-running",
+            expectation: "required",
+            providerId: "docker",
+            available: false,
+          },
         }),
       ),
-    ).rejects.toThrow(/requires an available Docker runtime/);
+    ).rejects.toThrow(/requires an available managed runtime provider/);
   });
 
   it("rejects invalid sandbox names before cloud OpenClaw side effects", async () => {
@@ -415,7 +496,12 @@ describe("onboarding phase fixture", () => {
       ready({
         runtime: "docker-missing",
         onboarding: "cloud-openclaw-no-docker",
-        docker: { id: "docker-missing", expectation: "missing", available: true },
+        runtimeProvider: {
+          id: "docker-missing",
+          expectation: "missing",
+          providerId: "docker",
+          available: true,
+        },
       }),
       { sandboxName: "e2e-no-docker" },
     );
@@ -456,7 +542,17 @@ describe("onboarding phase fixture", () => {
     );
     const secrets = new FakeSecrets({ NVIDIA_INFERENCE_API_KEY: "secret-token" });
     const cleanup = new FakeCleanup();
-    const onboard = new OnboardingPhaseFixture(new HostCliClient(runner), secrets, cleanup);
+    const probe = vi.fn();
+    const onboard = new OnboardingPhaseFixture(
+      new HostCliClient(runner),
+      secrets,
+      cleanup,
+      undefined,
+      {
+        sandbox: { openshell: probe, exec: probe },
+        runtime: { resolveSandboxResourceHandle: probe, command: probe },
+      },
+    );
 
     const instance = await onboard.from(
       ready({ onboarding: "cloud-openclaw-policy-custom-missing-presets" }),
@@ -488,42 +584,54 @@ describe("onboarding phase fixture", () => {
     });
     expect(cleanup.calls).toHaveLength(1);
     expect(cleanup.calls[0]?.name).toBe("destroy NemoClaw sandbox e2e-policy-missing");
+    expect(probe).not.toHaveBeenCalled();
   });
 
-  it("rejects unrelated failures for the missing custom policy presets negative path", async () => {
-    const runner = new FakeRunner();
-    runner.enqueue(shellResult(1, "provider rejected credential"));
-    const onboard = new OnboardingPhaseFixture(
-      new HostCliClient(runner),
-      new FakeSecrets({ NVIDIA_INFERENCE_API_KEY: "secret" }),
-    );
+  it.each([
+    ["sandbox not Ready", /failed without the policy preset signature/],
+    [
+      "NEMOCLAW_POLICY_PRESETS is required when NEMOCLAW_POLICY_MODE=custom.\nTypeError: unexpected",
+      /failed with a JavaScript stack trace/,
+    ],
+  ] as const)(
+    "captures bounded diagnostics without replacing the failure: %s",
+    async (output, error) => {
+      const runner = new FakeRunner();
+      runner.enqueue(shellResult(1, output));
+      const probe = vi.fn().mockRejectedValue(new Error("diagnostic unavailable"));
+      const resolveSandboxResourceHandle = vi.fn().mockResolvedValue("a".repeat(64));
+      const onboard = new OnboardingPhaseFixture(
+        new HostCliClient(runner),
+        new FakeSecrets({ NVIDIA_INFERENCE_API_KEY: 'secret"token' }),
+        undefined,
+        undefined,
+        {
+          sandbox: { openshell: probe, exec: probe },
+          runtime: { resolveSandboxResourceHandle, command: probe },
+        },
+      );
 
-    await expect(
-      onboard.from(ready({ onboarding: "cloud-openclaw-policy-custom-missing-presets" }), {
-        sandboxName: "e2e-policy-missing",
-      }),
-    ).rejects.toThrow(/failed without the policy preset signature/);
-  });
-
-  it("rejects the expected policy preset failure when it includes a stack trace", async () => {
-    const runner = new FakeRunner();
-    runner.enqueue(
-      shellResult(
-        1,
-        "NEMOCLAW_POLICY_PRESETS is required when NEMOCLAW_POLICY_MODE=custom.\nTypeError: unexpected\n    at Object.onboard (/app/onboard.js:1:1)",
-      ),
-    );
-    const onboard = new OnboardingPhaseFixture(
-      new HostCliClient(runner),
-      new FakeSecrets({ NVIDIA_INFERENCE_API_KEY: "secret" }),
-    );
-
-    await expect(
-      onboard.from(ready({ onboarding: "cloud-openclaw-policy-custom-missing-presets" }), {
-        sandboxName: "e2e-policy-missing",
-      }),
-    ).rejects.toThrow(/failed with a JavaScript stack trace/);
-  });
+      await expect(
+        onboard.from(ready({ onboarding: "cloud-openclaw-policy-custom-missing-presets" }), {
+          sandboxName: "e2e-policy-missing",
+        }),
+      ).rejects.toThrow(error);
+      const { NPM_CONFIG_PREFIX, ...onboardEnv } = runner.calls[0]!.options!.env!;
+      expect(NPM_CONFIG_PREFIX).toBe(path.join(onboardEnv.HOME!, ".npm-global"));
+      expect(resolveSandboxResourceHandle).toHaveBeenCalledWith(
+        "e2e-policy-missing",
+        expect.objectContaining({
+          env: onboardEnv,
+          redactionValues: ['secret"token', 'secret\\"token'],
+          timeoutMs: 15_000,
+          killGraceMs: 1_000,
+          captureLimitBytes: 1024 * 1024,
+        }),
+      );
+      expect(probe).toHaveBeenCalledTimes(7);
+      expect(runner.calls).toHaveLength(1);
+    },
+  );
 
   it("publishes redacted legacy preflight evidence for the no-Docker negative path", async () => {
     const previousContextDir = process.env.E2E_CONTEXT_DIR;
@@ -541,7 +649,12 @@ describe("onboarding phase fixture", () => {
         ready({
           runtime: "docker-missing",
           onboarding: "cloud-openclaw-no-docker",
-          docker: { id: "docker-missing", expectation: "missing", available: true },
+          runtimeProvider: {
+            id: "docker-missing",
+            expectation: "missing",
+            providerId: "docker",
+            available: true,
+          },
         }),
         { sandboxName: "e2e-no-docker" },
       );
@@ -572,7 +685,12 @@ describe("onboarding phase fixture", () => {
       ready({
         runtime: "docker-missing",
         onboarding: "cloud-openclaw-no-docker",
-        docker: { id: "docker-missing", expectation: "missing", available: false },
+        runtimeProvider: {
+          id: "docker-missing",
+          expectation: "missing",
+          providerId: "docker",
+          available: false,
+        },
       }),
       { sandboxName: "e2e-no-docker" },
     );
@@ -613,7 +731,12 @@ describe("onboarding phase fixture", () => {
         ready({
           runtime: "docker-missing",
           onboarding: "cloud-openclaw-no-docker",
-          docker: { id: "docker-missing", expectation: "missing", available: false },
+          runtimeProvider: {
+            id: "docker-missing",
+            expectation: "missing",
+            providerId: "docker",
+            available: false,
+          },
         }),
         { sandboxName: "e2e-no-docker" },
       );
@@ -650,7 +773,12 @@ describe("onboarding phase fixture", () => {
         ready({
           runtime: "docker-missing",
           onboarding: "cloud-openclaw-no-docker",
-          docker: { id: "docker-missing", expectation: "missing", available: false },
+          runtimeProvider: {
+            id: "docker-missing",
+            expectation: "missing",
+            providerId: "docker",
+            available: false,
+          },
         }),
         { sandboxName: "e2e-no-docker-ok" },
       ),
@@ -683,7 +811,12 @@ describe("onboarding phase fixture", () => {
         ready({
           runtime: "docker-missing",
           onboarding: "cloud-openclaw-no-docker",
-          docker: { id: "docker-missing", expectation: "missing", available: false },
+          runtimeProvider: {
+            id: "docker-missing",
+            expectation: "missing",
+            providerId: "docker",
+            available: false,
+          },
         }),
         { sandboxName: "e2e-no-docker" },
       ),
@@ -742,16 +875,21 @@ describe("onboarding phase fixture", () => {
       await expect(
         onboard.from(
           ready({
-            docker: { id: "docker-running", expectation: "required", available: false },
+            runtimeProvider: {
+              id: "docker-running",
+              expectation: "required",
+              providerId: "docker",
+              available: false,
+            },
           }),
         ),
-      ).rejects.toThrow(/requires an available Docker runtime/);
+      ).rejects.toThrow(/requires an available managed runtime provider/);
 
       expect(readJson(path.join(tmp, "onboarding.result.json"))).toMatchObject({
         phase: "onboarding",
         status: "failed",
         onboarding: "cloud-openclaw",
-        error: "cloud-openclaw onboarding requires an available Docker runtime.",
+        error: "cloud-openclaw onboarding requires an available managed runtime provider.",
       });
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });

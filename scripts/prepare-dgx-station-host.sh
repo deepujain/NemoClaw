@@ -12,6 +12,7 @@ readonly MIN_FREE_KIB=$((20 * 1024 * 1024))
 readonly GB300_PCI_VENDOR="0x10de"
 readonly -a GB300_PCI_DEVICES=("0x31c2" "0x31c3")
 readonly GB300_PCI_CLASS_PREFIX="0x03"
+readonly STATION_IDENTITY_VALUE_MAX_BYTES=256
 STATION_HOST_PROFILE="generic-ubuntu"
 FORCE_STATION_INSTALL=0
 # The qualified generic image currently ships this OEM telemetry bootcmd. Its
@@ -112,21 +113,21 @@ readonly -a BASEOS_PACKAGE_SPECS=(
   "sssd-common=2.9.4-1.1ubuntu6.4"
 )
 
-readonly BASEOS_CLOUD_CFG_SHA256="038ba435093de59f4a21021caf6c921d63344e9aae3b88795ee5b2659f43f437"
-readonly BASEOS_CLOUD_INIT_UNIT_SHA256="e13dd95a7bfac6407ea1ce45ed6683c0f4e84c791840d305c937d38ae77d9456"
-readonly BASEOS_FLUENT_BIT_UNIT_SHA256="1854339f563e518894c156d081912595d2d6e175a1ed6692e74e88224b6bad5f"
-readonly BASEOS_FLUENT_BIT_CFG_NORMALIZED_SHA256="ffec8b1bcc628877b9a230c6b26313b5ee6b25c20398580832133dbb15349551"
-readonly BASEOS_FLUENT_BIT_PARSERS_SHA256="760e6a347874a6cbdc10c6cd21d82d1ee5388c8573ddfaab05ef37904749dbe1"
-readonly BASEOS_FLUENT_BIT_PLUGINS_SHA256="9d5aad2c1be151b4d35de53a460f9783f98ac3cc815ebc638b0e8489f4ecd577"
-readonly BASEOS_FWUPD_UNIT_SHA256="835e7c291761c247d3cd5c64652b768c6a7fdc7cc72fea1bf70fc92e4cb3cfd5"
-readonly BASEOS_FWUPD_CFG_SHA256="a25bd457c86be85a286cd175d94e30fa152eb119c95b2a7db8a495886cdd7654"
-readonly BASEOS_FWUPD_LVFS_TESTING_SHA256="f50a44def594f256a8192c1d048e08aa94f0287de804262f680b73fa62d97787"
-readonly BASEOS_FWUPD_LVFS_SHA256="c4e62d855e41dbf777972b4249da5b2b968fc723e8c7d0d55f932ba47764e98c"
-readonly BASEOS_FWUPD_VENDOR_SHA256="0f5a62990f2ddb1681349c01373b3208131e5254a0e734e6090c249c5af9a73f"
-readonly BASEOS_SSSD_AUTOFS_UNIT_SHA256="d1be2c2c33e1591ac2fa0bf656bf8dc3d52083a7e9569902e777aea827baeb1f"
-readonly BASEOS_SSSD_NSS_UNIT_SHA256="bd432f92436f5c1c142c5824fce66aded6b8be80db4fdfbbed60f222c3a97d9e"
-readonly BASEOS_SSSD_PAM_UNIT_SHA256="6760940940471d5bb1b09652b1632db1251b90c3a028efcf11a1b731bb0ab43c"
-readonly BASEOS_SSSD_PAM_PRIV_UNIT_SHA256="851fc28d7ab5ac38cd56fcad1f4125cfeb46e8ee62bbf6cbc6376c592faeb51a"
+readonly FACTORY_CLOUD_CFG_SHA256="038ba435093de59f4a21021caf6c921d63344e9aae3b88795ee5b2659f43f437"
+readonly FACTORY_CLOUD_INIT_UNIT_SHA256="e13dd95a7bfac6407ea1ce45ed6683c0f4e84c791840d305c937d38ae77d9456"
+readonly FACTORY_FLUENT_BIT_UNIT_SHA256="1854339f563e518894c156d081912595d2d6e175a1ed6692e74e88224b6bad5f"
+readonly FACTORY_FLUENT_BIT_CFG_NORMALIZED_SHA256="ffec8b1bcc628877b9a230c6b26313b5ee6b25c20398580832133dbb15349551"
+readonly FACTORY_FLUENT_BIT_PARSERS_SHA256="760e6a347874a6cbdc10c6cd21d82d1ee5388c8573ddfaab05ef37904749dbe1"
+readonly FACTORY_FLUENT_BIT_PLUGINS_SHA256="9d5aad2c1be151b4d35de53a460f9783f98ac3cc815ebc638b0e8489f4ecd577"
+readonly FACTORY_FWUPD_UNIT_SHA256="835e7c291761c247d3cd5c64652b768c6a7fdc7cc72fea1bf70fc92e4cb3cfd5"
+readonly FACTORY_FWUPD_CFG_SHA256="a25bd457c86be85a286cd175d94e30fa152eb119c95b2a7db8a495886cdd7654"
+readonly FACTORY_FWUPD_LVFS_TESTING_SHA256="f50a44def594f256a8192c1d048e08aa94f0287de804262f680b73fa62d97787"
+readonly FACTORY_FWUPD_LVFS_SHA256="c4e62d855e41dbf777972b4249da5b2b968fc723e8c7d0d55f932ba47764e98c"
+readonly FACTORY_FWUPD_VENDOR_SHA256="0f5a62990f2ddb1681349c01373b3208131e5254a0e734e6090c249c5af9a73f"
+readonly FACTORY_SSSD_AUTOFS_UNIT_SHA256="d1be2c2c33e1591ac2fa0bf656bf8dc3d52083a7e9569902e777aea827baeb1f"
+readonly FACTORY_SSSD_NSS_UNIT_SHA256="bd432f92436f5c1c142c5824fce66aded6b8be80db4fdfbbed60f222c3a97d9e"
+readonly FACTORY_SSSD_PAM_UNIT_SHA256="6760940940471d5bb1b09652b1632db1251b90c3a028efcf11a1b731bb0ab43c"
+readonly FACTORY_SSSD_PAM_PRIV_UNIT_SHA256="851fc28d7ab5ac38cd56fcad1f4125cfeb46e8ee62bbf6cbc6376c592faeb51a"
 
 dgx_station_release_path() {
   printf '%s' /etc/dgx-release
@@ -138,6 +139,18 @@ station_os_release_path() {
 
 station_product_name_path() {
   printf '%s' /sys/class/dmi/id/product_name
+}
+
+station_product_family_path() {
+  printf '%s' /sys/class/dmi/id/product_family
+}
+
+station_board_name_path() {
+  printf '%s' /sys/class/dmi/id/board_name
+}
+
+station_device_tree_model_path() {
+  printf '%s' /sys/firmware/devicetree/base/model
 }
 
 station_pci_devices_path() {
@@ -226,7 +239,7 @@ dgx_station_no_ota_stock_version_is_supported() {
 }
 
 dgx_station_release_profile() {
-  local path=$1 ota_pretty="" ota_key pretty version build_date platform
+  local path=$1 ota_pretty="" ota_key version build_date platform
   dgx_station_release_schema_is_valid "$path" || return 1
   platform="$(dgx_station_release_value "$path" DGX_PLATFORM)" || return 1
   [[ "$platform" == "DGX Server for GALAXY-GB300" ]] || return 1
@@ -234,19 +247,13 @@ dgx_station_release_profile() {
   # DGX OS keeps its upgrade history in the DGX_OTA_* fields, so a host that has
   # an OTA history is classified by the most recent OTA version it applied.
   #
-  # A host provisioned from a full DGX OS image also carries the identity field
-  # DGX_OTA_PRETTY_NAME="DGX OS"; when that field is present it must read exactly
-  # "DGX OS". It is absent on a host that was first installed from an older base
-  # image (for example 7.4.1-GB300ws) and later OTA-upgraded, because an OTA
-  # upgrade never adds that field. In that case, fall back to the hardware
-  # identity and require DGX_PRETTY_NAME="NVIDIA DGX GB300WS" so that other
-  # release lineages that also emit DGX_OTA_* fields stay fail-closed.
+  # A host provisioned from a full DGX OS image also carries the lineage field
+  # DGX_OTA_PRETTY_NAME="DGX OS". When present, it must match. OTA upgrades can
+  # omit that field, so the hardware, platform, and latest OTA version own the
+  # fallback. DGX_PRETTY_NAME remains diagnostic release text.
   if dgx_station_release_value "$path" DGX_OTA_VERSION >/dev/null 2>&1; then
     if ota_pretty="$(dgx_station_release_value "$path" DGX_OTA_PRETTY_NAME 2>/dev/null)"; then
       [[ "$ota_pretty" == "DGX OS" ]] || return 1
-    else
-      pretty="$(dgx_station_release_value "$path" DGX_PRETTY_NAME)" || return 1
-      [[ "$pretty" == "NVIDIA DGX GB300WS" ]] || return 1
     fi
     version="$(dgx_station_release_value "$path" DGX_OTA_VERSION)" || return 1
     case "$version" in
@@ -256,34 +263,59 @@ dgx_station_release_profile() {
     return 0
   fi
 
-  # Stock DGX OS 7.6 uses stable workstation lineage fields without DGX_OTA_*
-  # metadata. Qualify that release family and leave its build date diagnostic;
-  # the factory-runtime path still proves GB300, driver, ECC, Docker, CDI, and
-  # container GPU capability before onboarding. Other no-OTA factory images
-  # remain exact profiles because they carry separately qualified stacks.
+  # Stock DGX OS 7.6 omits DGX_OTA_* metadata. Hardware, platform, version, and
+  # the factory-runtime checks own qualification. DGX_PRETTY_NAME remains
+  # diagnostic text. Other no-OTA factory images remain exact build profiles
+  # because they carry separately qualified stacks.
   for ota_key in DGX_OTA_PRETTY_NAME DGX_OTA_VERSION DGX_OTA_DATE; do
     dgx_station_release_value "$path" "$ota_key" >/dev/null 2>&1 && return 1
   done
-  pretty="$(dgx_station_release_value "$path" DGX_PRETTY_NAME)" || return 1
   version="$(dgx_station_release_value "$path" DGX_SWBUILD_VERSION)" || return 1
   build_date="$(dgx_station_release_value "$path" DGX_SWBUILD_DATE)" || return 1
 
-  if [[ "$pretty" == "NVIDIA DGX GB300WS" ]] \
-    && dgx_station_no_ota_stock_version_is_supported "$version"; then
+  if dgx_station_no_ota_stock_version_is_supported "$version"; then
     printf '%s' supported-dgx-os
     return 0
   fi
 
-  case "${pretty}|${version}|${build_date}" in
-    "NVIDIA DGX Server|7.5.0-GB300ws-GB200ws|2026-04-02-08-20-16")
+  case "${version}|${build_date}" in
+    "7.5.0-GB300ws-GB200ws|2026-04-02-08-20-16")
       printf '%s' supported-colossus-baseos
       ;;
-    "NVIDIA DGX GB300WS|7.5.0|2026-05-13-18-42-38" | \
-      "NVIDIA DGX GB300WS|7.5.0|2026-06-16-11-48-10")
+    "7.5.0|2026-05-13-18-42-38" | \
+      "7.5.0|2026-06-16-11-48-10")
       printf '%s' supported-ai-developer-tools
       ;;
     *) return 1 ;;
   esac
+}
+
+dgx_station_release_contents_are_complete_station_profile() {
+  local path=$1 ota_key ota_pretty="" platform
+  dgx_station_release_schema_is_valid "$path" || return 1
+  platform="$(dgx_station_release_value "$path" DGX_PLATFORM)" || return 1
+  [[ "$platform" == "DGX Server for GALAXY-GB300" ]] || return 1
+
+  if dgx_station_release_value "$path" DGX_OTA_VERSION >/dev/null 2>&1; then
+    if ota_pretty="$(dgx_station_release_value "$path" DGX_OTA_PRETTY_NAME 2>/dev/null)"; then
+      [[ "$ota_pretty" == "DGX OS" ]] || return 1
+    fi
+    dgx_station_release_value "$path" DGX_OTA_DATE >/dev/null
+    return
+  fi
+
+  for ota_key in DGX_OTA_PRETTY_NAME DGX_OTA_VERSION DGX_OTA_DATE; do
+    dgx_station_release_value "$path" "$ota_key" >/dev/null 2>&1 && return 1
+  done
+  dgx_station_release_value "$path" DGX_SWBUILD_VERSION >/dev/null \
+    && dgx_station_release_value "$path" DGX_SWBUILD_DATE >/dev/null
+}
+
+dgx_station_release_is_complete_unrecognized_profile() {
+  local path=$1
+  dgx_station_release_file_is_safe "$path" \
+    && dgx_station_release_contents_are_complete_station_profile "$path" \
+    && ! dgx_station_release_contents_are_supported "$path"
 }
 
 dgx_station_release_contents_are_supported() {
@@ -386,7 +418,7 @@ parse_args() {
   FORCE_STATION_INSTALL=0
   for arg in "$@"; do
     case "$arg" in
-      --check | --apply | --verify | --bind-controller | --classify-dgx-release)
+      --check | --apply | --verify | --bind-controller | --classify-dgx-release | --classify-station-hardware)
         [[ -z "$MODE" ]] || return 1
         MODE="$arg"
         ;;
@@ -396,13 +428,106 @@ parse_args() {
   done
   [[ -n "$MODE" ]] || return 1
   [[ "$MODE" != "--classify-dgx-release" || "$FORCE_STATION_INSTALL" == "0" ]] \
+    && [[ "$MODE" != "--classify-station-hardware" || "$FORCE_STATION_INSTALL" == "0" ]] \
     && [[ "$MODE" != "--bind-controller" || "$FORCE_STATION_INSTALL" == "0" ]]
 }
 
-is_station_gb300_product() {
+nvidia_firmware_product_class() {
   local product=${1:-}
-  [[ "$product" =~ (^|[^[:alnum:]])[Ss][Tt][Aa][Tt][Ii][Oo][Nn]([^[:alnum:]]|$) &&
-    "$product" =~ (^|[^[:alnum:]])[Gg][Bb]300([^[:alnum:]]|$) ]]
+  if [[ "$product" =~ [Dd][Gg][Xx]([_[:space:]-]+)[Ss][Pp][Aa][Rr][Kk] ]]; then
+    printf '%s' spark
+  elif [[ "$product" =~ (^|[^[:alnum:]])[Ss][Tt][Aa][Tt][Ii][Oo][Nn]([_[:space:]-]+)([Dd][Gg][Xx]([_[:space:]-]+))?[Gg][Bb]300($|[^[:alnum:]]) ||
+    "$product" =~ (^|[^[:alnum:]])[Gg][Bb]300([_[:space:]-]+)([Dd][Gg][Xx]([_[:space:]-]+))?[Ss][Tt][Aa][Tt][Ii][Oo][Nn]($|[^[:alnum:]]) ]]; then
+    printf '%s' station-gb300
+  elif [[ "$product" =~ (^|[^[:alnum:]])[Pp]3830($|[^[:alnum:]]) || "$product" =~ [Dd][Gg][Xx]([_[:space:]-]+)[Ss][Tt][Aa][Tt][Ii][Oo][Nn] ]]; then
+    printf '%s' station-other
+  elif [[ "$product" =~ [Jj][Ee][Tt][Ss][Oo][Nn]|[Tt][Ee][Gg][Rr][Aa]|[Tt][Hh][Oo][Rr]|[Oo][Rr][Ii][Nn]|[Xx][Aa][Vv][Ii][Ee][Rr] ]]; then
+    printf '%s' jetson
+  else
+    return 1
+  fi
+}
+
+is_station_gb300_product() {
+  [[ "$(nvidia_firmware_product_class "${1:-}" 2>/dev/null || true)" == "station-gb300" ]]
+}
+
+station_firmware_value_is_printable() {
+  local printable value=${1:-}
+  printable="$(printf '%s' "$value" | LC_ALL=C tr -d '\000-\037\177')"
+  [[ "$printable" == "$value" ]]
+}
+
+station_bounded_line_value() {
+  local byte_count control_count last_byte newline_count path=$1
+  byte_count="$(head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 2)) "$path" 2>/dev/null | wc -c | tr -d '[:space:]')"
+  [[ "$byte_count" =~ ^[0-9]+$ ]] && ((byte_count <= STATION_IDENTITY_VALUE_MAX_BYTES + 1)) || return 1
+  control_count="$(head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 1)) "$path" 2>/dev/null | LC_ALL=C tr -cd '\000-\037\177' | wc -c | tr -d '[:space:]')"
+  [[ "$control_count" =~ ^[0-9]+$ ]] || return 1
+  if ((control_count > 0)); then
+    newline_count="$(head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 1)) "$path" 2>/dev/null | LC_ALL=C tr -cd '\012' | wc -c | tr -d '[:space:]')"
+    [[ "$newline_count" == "1" && "$control_count" == "1" ]] || return 1
+    last_byte="$(tail -c 1 "$path" 2>/dev/null | od -An -tu1 | tr -d '[:space:]')"
+    [[ "$last_byte" == "10" ]] || return 1
+  fi
+  head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 1)) "$path" 2>/dev/null | tr -d '\n'
+}
+
+station_device_tree_model_value() {
+  local byte_count control_count last_byte nul_count path=$1
+  byte_count="$(head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 2)) "$path" 2>/dev/null | wc -c | tr -d '[:space:]')"
+  [[ "$byte_count" =~ ^[0-9]+$ ]] && ((byte_count <= STATION_IDENTITY_VALUE_MAX_BYTES + 1)) || return 1
+  control_count="$(head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 1)) "$path" 2>/dev/null | LC_ALL=C tr -cd '\000-\037\177' | wc -c | tr -d '[:space:]')"
+  [[ "$control_count" =~ ^[0-9]+$ ]] || return 1
+  nul_count="$(head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 1)) "$path" 2>/dev/null | LC_ALL=C tr -cd '\000' | wc -c | tr -d '[:space:]')"
+  [[ "$nul_count" =~ ^[0-9]+$ ]] || return 1
+  ((byte_count <= STATION_IDENTITY_VALUE_MAX_BYTES || nul_count == 1)) || return 1
+  if ((control_count > 0)); then
+    ((control_count == 1 && nul_count == 1)) || return 1
+    last_byte="$(tail -c 1 "$path" 2>/dev/null | od -An -tu1 | tr -d '[:space:]')"
+    [[ "$last_byte" == "0" ]] || return 1
+  fi
+  head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 1)) "$path" 2>/dev/null | tr -d '\000'
+}
+
+station_firmware_identity() {
+  local LC_ALL=C class="" output=${1:?firmware identity output is required} path recognized="" station_product="" value
+  for path in "$(station_product_name_path)" "$(station_product_family_path)" "$(station_board_name_path)" "$(station_device_tree_model_path)"; do
+    [[ -r "$path" ]] || continue
+    if [[ "$path" == "$(station_device_tree_model_path)" ]]; then
+      value="$(station_device_tree_model_value "$path")" || continue
+    else
+      value="$(station_bounded_line_value "$path")" || continue
+    fi
+    [[ ${#value} -le STATION_IDENTITY_VALUE_MAX_BYTES ]] || continue
+    station_firmware_value_is_printable "$value" || continue
+    class="$(nvidia_firmware_product_class "$value" 2>/dev/null || true)"
+    [[ -n "$class" ]] || continue
+    if [[ -n "$recognized" && "$recognized" != "$class" ]]; then
+      if [[ "$output" == "state" ]]; then
+        printf '%s' conflicting
+        return 0
+      fi
+      return 2
+    fi
+    recognized=$class
+    [[ "$class" != "station-gb300" || -n "$station_product" ]] || station_product=$value
+  done
+  if [[ "$output" == "state" ]]; then
+    printf '%s' "${recognized:-not-station}"
+    return 0
+  fi
+  [[ "$output" == "product" ]] || return 1
+  [[ "$recognized" == "station-gb300" && -n "$station_product" ]] || return 1
+  printf '%s' "$station_product"
+}
+
+station_firmware_product() {
+  station_firmware_identity product
+}
+
+station_firmware_identity_state() {
+  station_firmware_identity state
 }
 
 normalize_nvidia_pci_bus_id() {
@@ -442,20 +567,38 @@ station_pci_device_is_gb300() {
     -r "$pci_path/vendor" &&
     -r "$pci_path/device" &&
     -r "$pci_path/class" ]] || return 1
-  IFS= read -r vendor <"$pci_path/vendor" || return 1
-  IFS= read -r device <"$pci_path/device" || return 1
-  IFS= read -r class <"$pci_path/class" || return 1
+  vendor="$(station_bounded_line_value "$pci_path/vendor")" || return 1
+  device="$(station_bounded_line_value "$pci_path/device")" || return 1
+  class="$(station_bounded_line_value "$pci_path/class")" || return 1
   [[ "$vendor" == "$GB300_PCI_VENDOR" ]] || return 1
   gb300_pci_device_is_known "$device" || return 1
-  [[ "$class" == "${GB300_PCI_CLASS_PREFIX}"* ]]
+  [[ "$class" =~ ^${GB300_PCI_CLASS_PREFIX}[0-9a-fA-F]{4}$ ]]
 }
 
 station_has_exact_gb300_pci_gpu() {
   local pci_root=${1:-/sys/bus/pci/devices} pci_path
+  local -a pci_paths=()
   for pci_path in "$pci_root"/*; do
+    [[ -d "$pci_path" ]] || continue
+    pci_paths+=("$pci_path")
+  done
+  ((${#pci_paths[@]} > 0 && ${#pci_paths[@]} <= 256)) || return 1
+  for pci_path in "${pci_paths[@]}"; do
     station_pci_device_is_gb300 "${pci_path##*/}" "$pci_root" && return 0
   done
   return 1
+}
+
+station_hardware_identity_state() {
+  local firmware_state
+  firmware_state="$(station_firmware_identity_state)"
+  if [[ "$firmware_state" != "station-gb300" ]]; then
+    printf '%s' "$firmware_state"
+  elif station_has_exact_gb300_pci_gpu "$(station_pci_devices_path)"; then
+    printf '%s' station-gb300
+  else
+    printf '%s' station-gb300-pci-missing
+  fi
 }
 
 is_preparation_critical_unit() {
@@ -480,15 +623,17 @@ root_owned_file_is_not_writable_by_group_or_other() {
   (((8#$mode & 0022) == 0))
 }
 
-cloud_init_failure_is_qualified() {
-  local actual_sha
-  ((NETWORK_VALIDATED == 1)) || return 1
+cloud_init_telemetry_failure_is_qualified() {
   root_owned_file_is_not_writable_by_group_or_other "$FACTORY_CLOUD_INIT_TELEMETRY" \
     || return 1
   root_owned_file_is_not_writable_by_group_or_other "$FACTORY_CLOUD_INIT_RESULT" || return 1
-  actual_sha="$(sha256sum "$FACTORY_CLOUD_INIT_TELEMETRY" 2>/dev/null | awk '{print $1}')"
-  [[ "$actual_sha" == "$FACTORY_CLOUD_INIT_TELEMETRY_SHA256" ]] || return 1
+  file_sha256_matches "$FACTORY_CLOUD_INIT_TELEMETRY" "$FACTORY_CLOUD_INIT_TELEMETRY_SHA256" \
+    || return 1
   grep -Fq "\"('bootcmd', ProcessExecutionError(" "$FACTORY_CLOUD_INIT_RESULT"
+}
+
+cloud_init_failure_is_qualified() {
+  ((NETWORK_VALIDATED == 1)) && cloud_init_telemetry_failure_is_qualified
 }
 
 network_wait_failure_is_qualified() {
@@ -515,7 +660,7 @@ file_sha256_matches() {
   [[ "$actual" == "$expected" ]]
 }
 
-baseos_fluent_bit_config_matches() {
+factory_fluent_bit_config_matches() {
   local path=$1 expected=$2 actual
   root_owned_file_is_not_writable_by_group_or_other "$path" || return 1
   actual="$({
@@ -536,7 +681,7 @@ systemd_property_matches() {
   [[ "$actual" == "$expected" ]]
 }
 
-baseos_failed_unit_matches() {
+factory_failed_unit_matches() {
   local unit=$1 fragment=$2 unit_hash=$3 unit_state=$4 exec_status=${5:-}
   systemd_property_matches "$unit" LoadState loaded \
     && systemd_property_matches "$unit" ActiveState failed \
@@ -549,47 +694,45 @@ baseos_failed_unit_matches() {
   [[ -z "$exec_status" ]] || systemd_property_matches "$unit" ExecMainStatus "$exec_status"
 }
 
-baseos_cloud_init_failure_is_qualified() {
-  local result=/run/cloud-init/result.json
+factory_cloud_init_failure_is_qualified() {
   ((NETWORK_VALIDATED == 1)) \
-    && baseos_failed_unit_matches cloud-init.service \
-      /usr/lib/systemd/system/cloud-init.service "$BASEOS_CLOUD_INIT_UNIT_SHA256" enabled 1 \
-    && file_sha256_matches /etc/cloud/cloud.cfg "$BASEOS_CLOUD_CFG_SHA256" \
-    && root_owned_file_is_not_writable_by_group_or_other "$result" \
-    && grep -Fq '"datasource": "DataSourceConfigDrive ' "$result" \
-    && grep -Fq "\"('bootcmd', ProcessExecutionError(" "$result"
+    && factory_failed_unit_matches cloud-init.service \
+      /usr/lib/systemd/system/cloud-init.service "$FACTORY_CLOUD_INIT_UNIT_SHA256" enabled 1 \
+    && file_sha256_matches /etc/cloud/cloud.cfg "$FACTORY_CLOUD_CFG_SHA256" \
+    && grep -Fq '"datasource": "DataSourceConfigDrive ' "$FACTORY_CLOUD_INIT_RESULT" \
+    && cloud_init_telemetry_failure_is_qualified
 }
 
-baseos_fluent_bit_failure_is_qualified() {
-  baseos_failed_unit_matches fluent-bit.service \
-    /usr/lib/systemd/system/fluent-bit.service "$BASEOS_FLUENT_BIT_UNIT_SHA256" enabled 1 \
-    && baseos_fluent_bit_config_matches \
-      /etc/fluent-bit/fluent-bit.conf "$BASEOS_FLUENT_BIT_CFG_NORMALIZED_SHA256" \
-    && file_sha256_matches /etc/fluent-bit/parsers.conf "$BASEOS_FLUENT_BIT_PARSERS_SHA256" \
-    && file_sha256_matches /etc/fluent-bit/plugins.conf "$BASEOS_FLUENT_BIT_PLUGINS_SHA256"
+factory_fluent_bit_failure_is_qualified() {
+  factory_failed_unit_matches fluent-bit.service \
+    /usr/lib/systemd/system/fluent-bit.service "$FACTORY_FLUENT_BIT_UNIT_SHA256" enabled 1 \
+    && factory_fluent_bit_config_matches \
+      /etc/fluent-bit/fluent-bit.conf "$FACTORY_FLUENT_BIT_CFG_NORMALIZED_SHA256" \
+    && file_sha256_matches /etc/fluent-bit/parsers.conf "$FACTORY_FLUENT_BIT_PARSERS_SHA256" \
+    && file_sha256_matches /etc/fluent-bit/plugins.conf "$FACTORY_FLUENT_BIT_PLUGINS_SHA256"
 }
 
-baseos_fwupd_failure_is_qualified() {
+factory_fwupd_failure_is_qualified() {
   ((NETWORK_VALIDATED == 1)) \
-    && baseos_failed_unit_matches fwupd-refresh.service \
-      /usr/lib/systemd/system/fwupd-refresh.service "$BASEOS_FWUPD_UNIT_SHA256" static 1 \
-    && file_sha256_matches /etc/fwupd/fwupd.conf "$BASEOS_FWUPD_CFG_SHA256" \
-    && file_sha256_matches /etc/fwupd/remotes.d/lvfs-testing.conf "$BASEOS_FWUPD_LVFS_TESTING_SHA256" \
-    && file_sha256_matches /etc/fwupd/remotes.d/lvfs.conf "$BASEOS_FWUPD_LVFS_SHA256" \
-    && file_sha256_matches /etc/fwupd/remotes.d/vendor-directory.conf "$BASEOS_FWUPD_VENDOR_SHA256"
+    && factory_failed_unit_matches fwupd-refresh.service \
+      /usr/lib/systemd/system/fwupd-refresh.service "$FACTORY_FWUPD_UNIT_SHA256" static 1 \
+    && file_sha256_matches /etc/fwupd/fwupd.conf "$FACTORY_FWUPD_CFG_SHA256" \
+    && file_sha256_matches /etc/fwupd/remotes.d/lvfs-testing.conf "$FACTORY_FWUPD_LVFS_TESTING_SHA256" \
+    && file_sha256_matches /etc/fwupd/remotes.d/lvfs.conf "$FACTORY_FWUPD_LVFS_SHA256" \
+    && file_sha256_matches /etc/fwupd/remotes.d/vendor-directory.conf "$FACTORY_FWUPD_VENDOR_SHA256"
 }
 
-baseos_sssd_socket_failure_is_qualified() {
+factory_sssd_socket_failure_is_qualified() {
   local unit=$1 hash
   [[ ! -e /etc/sssd/sssd.conf && ! -L /etc/sssd/sssd.conf ]] || return 1
   case "$unit" in
-    sssd-autofs.socket) hash="$BASEOS_SSSD_AUTOFS_UNIT_SHA256" ;;
-    sssd-nss.socket) hash="$BASEOS_SSSD_NSS_UNIT_SHA256" ;;
-    sssd-pam.socket) hash="$BASEOS_SSSD_PAM_UNIT_SHA256" ;;
-    sssd-pam-priv.socket) hash="$BASEOS_SSSD_PAM_PRIV_UNIT_SHA256" ;;
+    sssd-autofs.socket) hash="$FACTORY_SSSD_AUTOFS_UNIT_SHA256" ;;
+    sssd-nss.socket) hash="$FACTORY_SSSD_NSS_UNIT_SHA256" ;;
+    sssd-pam.socket) hash="$FACTORY_SSSD_PAM_UNIT_SHA256" ;;
+    sssd-pam-priv.socket) hash="$FACTORY_SSSD_PAM_PRIV_UNIT_SHA256" ;;
     *) return 1 ;;
   esac
-  baseos_failed_unit_matches "$unit" "/usr/lib/systemd/system/${unit}" "$hash" enabled
+  factory_failed_unit_matches "$unit" "/usr/lib/systemd/system/${unit}" "$hash" enabled
 }
 
 is_qualified_factory_failed_unit() {
@@ -607,14 +750,16 @@ is_qualified_factory_failed_unit() {
         *) return 1 ;;
       esac
       ;;
-    colossus-baseos)
-      all_baseos_packages_exact || return 1
+    stock-dgx-os | colossus-baseos)
+      if [[ "$STATION_HOST_PROFILE" == "colossus-baseos" ]]; then
+        all_baseos_packages_exact || return 1
+      fi
       case "${1:-}" in
-        cloud-init.service) baseos_cloud_init_failure_is_qualified ;;
-        fluent-bit.service) baseos_fluent_bit_failure_is_qualified ;;
-        fwupd-refresh.service) baseos_fwupd_failure_is_qualified ;;
+        cloud-init.service) factory_cloud_init_failure_is_qualified ;;
+        fluent-bit.service) factory_fluent_bit_failure_is_qualified ;;
+        fwupd-refresh.service) factory_fwupd_failure_is_qualified ;;
         sssd-autofs.socket | sssd-nss.socket | sssd-pam.socket | sssd-pam-priv.socket)
-          baseos_sssd_socket_failure_is_qualified "$1"
+          factory_sssd_socket_failure_is_qualified "$1"
           ;;
         *) return 1 ;;
       esac
@@ -829,7 +974,7 @@ file_mode() {
 }
 
 check_platform() {
-  local arch os_release_path product product_name_path release_path release_state
+  local arch firmware_status=0 os_release_path product release_path release_state
   arch="$(uname -m)"
   [[ "$arch" == "aarch64" || "$arch" == "arm64" ]] || fatal "Expected ARM64, found ${arch}"
 
@@ -839,10 +984,17 @@ check_platform() {
   source "$os_release_path"
   [[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "24.04" ]] \
     || fatal "Expected Ubuntu 24.04, found ${PRETTY_NAME:-unknown}"
-  product_name_path="$(station_product_name_path)"
-  [[ -r "$product_name_path" ]] || fatal "DGX Station product identity is unavailable"
-  product="$(<"$product_name_path")"
-  is_station_gb300_product "$product" || fatal "Expected DGX Station GB300 DMI, found ${product}"
+  if product="$(station_firmware_product)"; then
+    :
+  else
+    firmware_status=$?
+    if ((firmware_status == 2)); then
+      fatal "DGX Station firmware identity conflicts across product, family, board, or device-tree fields"
+    fi
+    fatal "DGX Station GB300 firmware identity is unavailable"
+  fi
+  station_has_exact_gb300_pci_gpu "$(station_pci_devices_path)" \
+    || fatal "Expected an NVIDIA GB300 PCI GPU (${GB300_PCI_VENDOR#0x}:$(gb300_pci_device_display))"
   release_path="$(dgx_station_release_path)"
   release_state="$(dgx_station_release_state "$release_path")"
   if ((FORCE_STATION_INSTALL == 1)); then
@@ -850,12 +1002,14 @@ check_platform() {
       generic-ubuntu | supported-dgx-os | supported-colossus-baseos | supported-ai-developer-tools)
         fatal "--force-station-install is only for unrecognized DGX Station release metadata. This host is already supported (${release_state}); omit --force-station-install."
         ;;
+      unsupported-dgx-os)
+        dgx_station_release_is_complete_unrecognized_profile "$release_path" \
+          || fatal "--force-station-install requires a trusted, complete DGX Station release marker with an unrecognized profile tuple"
+        ;;
     esac
   fi
   case "$release_state" in
     generic-ubuntu)
-      station_has_exact_gb300_pci_gpu "$(station_pci_devices_path)" \
-        || fatal "Expected an NVIDIA GB300 PCI GPU (${GB300_PCI_VENDOR#0x}:$(gb300_pci_device_display)) before generic Ubuntu preparation"
       STATION_HOST_PROFILE="generic-ubuntu"
       ;;
     supported-dgx-os) STATION_HOST_PROFILE="stock-dgx-os" ;;
@@ -863,8 +1017,6 @@ check_platform() {
     supported-ai-developer-tools) STATION_HOST_PROFILE="ai-developer-tools" ;;
     *)
       if ((FORCE_STATION_INSTALL == 1)); then
-        station_has_exact_gb300_pci_gpu "$(station_pci_devices_path)" \
-          || fatal "Expected an NVIDIA GB300 PCI GPU (${GB300_PCI_VENDOR#0x}:$(gb300_pci_device_display)) before forced factory-runtime validation"
         STATION_HOST_PROFILE="forced-factory-runtime"
         warn "DGX release metadata allowlist bypassed by explicit --force-station-install intent; all hardware and factory-runtime health checks remain required"
       else
@@ -872,6 +1024,7 @@ check_platform() {
       fi
       ;;
   esac
+  info "station_hardware=confirmed firmware_product=${product}"
   info "platform=${product} profile=${STATION_HOST_PROFILE} release=${release_state} os=${PRETTY_NAME} arch=${arch} kernel=$(uname -r)"
 }
 
@@ -1325,23 +1478,42 @@ check_vllm_container_conflicts() {
     || existing_vllm_conflict "vLLM inference workload is active: ${vllm_containers}. NemoClaw did not stop or modify it."
 }
 
-check_agent_and_inference_conflicts() {
-  local processes agent_matches inference_matches listeners
-  processes="$(ps -eo pid=,ppid=,comm=,args=)"
-  agent_matches="$(awk -v self="$$" -v parent="$PPID" '
+agent_process_conflicts() {
+  local processes=$1 effective_uid=$2 sudo_uid=$3 self=$4 parent=$5
+  local scope_by_uid=1 scoped_uid
+  if [[ "$effective_uid" == "0" && -z "$sudo_uid" ]]; then
+    scope_by_uid=0
+    scoped_uid=0
+  else
+    scoped_uid="$(preparation_controller_uid_for "$effective_uid" "$sudo_uid")"
+  fi
+  awk -v scope_by_uid="$scope_by_uid" -v scoped_uid="$scoped_uid" -v self="$self" -v parent="$parent" '
     {
-      pid=$1
-      ppid=$2
-      comm=tolower($3)
-      $1=$2=$3=""
+      owner_uid=$1
+      pid=$2
+      ppid=$3
+      comm=tolower($4)
+      $1=$2=$3=$4=""
       args=tolower($0)
-      if (pid == self || pid == parent) next
+      if ((scope_by_uid && owner_uid != scoped_uid) || pid == self || pid == parent) next
       if (comm ~ /^(nemoclaw|openshell)$/ ||
           args ~ /(^|[[:space:]\/])(nemoclaw|openshell)([[:space:]:]|\.js([[:space:]]|$)|$)/) {
         print "pid=" pid " process=" comm
       }
     }
-  ' <<<"$processes")"
+  ' <<<"$processes"
+}
+
+check_agent_and_inference_conflicts() {
+  local processes agent_matches inference_matches listeners vllm_port
+  vllm_port="$(printf '%s' "${NEMOCLAW_VLLM_PORT:-8000}" | awk '{gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}')"
+  if [[ ! "$vllm_port" =~ ^[1-9][0-9]{3,4}$ ]] \
+    || ((10#$vllm_port < 1024 || 10#$vllm_port > 65535)); then
+    fatal "NEMOCLAW_VLLM_PORT must be an integer from 1024 to 65535."
+  fi
+  vllm_port="$((10#$vllm_port))"
+  processes="$(ps -eo euid=,pid=,ppid=,comm=,args=)"
+  agent_matches="$(agent_process_conflicts "$processes" "$EUID" "${SUDO_UID:-}" "$$" "$PPID")"
   [[ -z "$agent_matches" ]] \
     || fatal "Agent workload is active: ${agent_matches}. Stop the listed agent process before Station Express. Then rerun the installer."
 
@@ -1349,14 +1521,15 @@ check_agent_and_inference_conflicts() {
     check_vllm_container_conflicts
   fi
 
-  inference_matches="$(awk -v self="$$" -v parent="$PPID" '
+  inference_matches="$(awk -v current_uid="$EUID" -v self="$$" -v parent="$PPID" '
     {
-      pid=$1
-      ppid=$2
-      comm=tolower($3)
-      executable=tolower($4)
+      owner_uid=$1
+      pid=$2
+      ppid=$3
+      comm=tolower($4)
+      executable=tolower($5)
       sub(/^.*\//, "", executable)
-      $1=$2=$3=""
+      $1=$2=$3=$4=""
       args=tolower($0)
       if (pid == self || pid == parent) next
       python_module=(comm ~ /^python([0-9]+([.][0-9]+)*)?$/ &&
@@ -1364,18 +1537,22 @@ check_agent_and_inference_conflicts() {
       docker_init=(comm == "docker-init" &&
                    args ~ /(^|[[:space:]])--[[:space:]]+([^[:space:]]*\/)?vllm([[:space:]]|$)/)
       if (comm == "vllm" || executable == "vllm" || python_module || docker_init) {
-        print "pid=" pid " process=" comm " stop_command=\047kill -- " pid "\047"
+        if (owner_uid == current_uid) {
+          print "pid=" pid " process=" comm " stop_command=\047kill -- " pid "\047"
+        } else {
+          print "pid=" pid " process=" comm " owner_uid=" owner_uid " action=ask_owner_or_host_administrator_to_stop"
+        }
       }
     }
   ' <<<"$processes")"
   [[ -z "$inference_matches" ]] \
     || existing_vllm_conflict "vLLM inference workload is active: ${inference_matches}. NemoClaw did not stop or modify it."
 
-  listeners="$(ss -H -ltn 2>/dev/null | awk '$4 ~ /:8000$/ {print}')"
+  listeners="$(ss -H -ltn 2>/dev/null | awk -v port="$vllm_port" '$4 ~ (":" port "$") {print}')"
   [[ -z "$listeners" ]] \
-    || fatal "Port 8000 is already listening: ${listeners}. Stop the service that owns port 8000 before Station Express. Then rerun the installer."
+    || fatal "Port ${vllm_port} is already listening: ${listeners}. Stop the service that owns port ${vllm_port} before Station Express. Then rerun the installer."
 
-  info "agent_inference_workloads=none port_8000=free"
+  info "agent_inference_workloads=none vllm_port=${vllm_port} free"
 }
 
 check_initial_workload_quiescence() {
@@ -2753,6 +2930,10 @@ main() {
   fi
   if [[ "$MODE" == "--classify-dgx-release" ]]; then
     dgx_station_release_state
+    return 0
+  fi
+  if [[ "$MODE" == "--classify-station-hardware" ]]; then
+    station_hardware_identity_state
     return 0
   fi
   if [[ "$MODE" == "--apply" ]]; then

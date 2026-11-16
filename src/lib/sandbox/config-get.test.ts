@@ -162,6 +162,18 @@ describe("configGet output redaction and gateway omission (#config-get)", () => 
     expect(JSON.parse(out)).toBe("nvidia/nemotron-3");
   });
 
+  it("returns OpenClaw configuration writes to the native CLI (#11764)", async () => {
+    delete require.cache[configModulePath];
+    const { configSet } = require(configModulePath) as {
+      configSet: (name: string, opts: { key: string; value: string }) => Promise<void>;
+    };
+    const secret = "value-that-must-not-be-echoed";
+
+    await expect(
+      configSet("alpha", { key: "agents.defaults.timeoutSeconds", value: secret }),
+    ).rejects.toThrow(/OpenClaw owns its configuration.*openclaw config set/isu);
+  });
+
   it("refuses to expose the gateway section via --key gateway (#config-get)", () => {
     const configGet = loadConfigGet();
     // gateway is deleted before dotpath extraction, so the key is not found and
@@ -169,7 +181,7 @@ describe("configGet output redaction and gateway omission (#config-get)", () => 
     expect(() => configGet("alpha", { key: "gateway.token" })).toThrow(/not found/i);
   });
 
-  it("does not echo credential-bearing source text from malformed JSON", () => {
+  it("does not echo credential-bearing source text from malformed JSON5", () => {
     const secret = "nvapi-jsonabcdefghijklmnopqrstuvwxyz0123456789";
     const sourceLine = `{"provider":{"apiKey":"${secret}"}} trailing-text`;
     stubSandboxRawRead(sourceLine);
@@ -224,7 +236,6 @@ describe("configGet parsing for manifest-declared formats (#6548)", () => {
         dir: "/sandbox/.deepagents",
         configFile: "config.toml",
         format: "toml",
-        shieldsFiles: [],
       },
     });
     // The sandbox `cat` returns the raw TOML text.
@@ -322,7 +333,6 @@ describe("configGet parsing for manifest-declared formats (#6548)", () => {
         dir: "/sandbox/.hermes",
         configFile: "config.yaml",
         format: "yaml",
-        shieldsFiles: [".env"],
       },
     });
     const secret = "nvapi-yamlabcdefghijklmnopqrstuvwxyz0123456789";
@@ -336,14 +346,51 @@ describe("configGet parsing for manifest-declared formats (#6548)", () => {
     expect(error.message).not.toContain(sourceLine);
   });
 
-  it("refuses config set before attempting to rewrite an image-baked TOML file", async () => {
+  it("rejects Deep Agents config writes and explains new-name selection recovery", async () => {
+    delete require.cache[configModulePath];
+    const { configSet } = require(configModulePath) as {
+      configSet: (name: string, opts: { key: string; value: string }) => Promise<void>;
+    };
+    const capture = vi.fn();
+    client.captureOpenshellCommand = capture;
+    const error = await configSet("dcode-sb", {
+      key: "models.default",
+      value: "openai:nvidia/new-model",
+    }).catch((error: Error) => error);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("config set is not available");
+    expect((error as Error).message).toContain("saved native preferences");
+    expect((error as Error).message).toContain("record the current default");
+    expect((error as Error).message).toContain(
+      "onboard --agent dcode --name <new-sandbox-name> --fresh",
+    );
+    expect((error as Error).message).toContain("After any onboarding attempt");
+    expect((error as Error).message).toContain("use <previous-default-sandbox-name>");
+    expect((error as Error).message).toContain("After successful onboarding");
+    expect((error as Error).message).toContain("<new-sandbox-name> status");
+    expect((error as Error).message).toContain("<new-sandbox-name> inference get");
+    expect((error as Error).message).toContain("use <new-sandbox-name>");
+    expect((error as Error).message).not.toContain("--name 'dcode-sb'");
+    expect(capture).not.toHaveBeenCalled();
+  });
+
+  it("does not extend host config set to another JSON agent", async () => {
+    registry.getSandbox = () => ({ agent: "future-agent" });
+    agentDefs.loadAgent = () => ({
+      configPaths: {
+        dir: "/sandbox/.future-agent",
+        configFile: "config.json",
+        format: "json",
+      },
+    });
     delete require.cache[configModulePath];
     const { configSet } = require(configModulePath) as {
       configSet: (name: string, opts: { key: string; value: string }) => Promise<void>;
     };
 
     await expect(
-      configSet("dcode-sb", { key: "models.default", value: "openai:nvidia/new-model" }),
-    ).rejects.toThrow(/config set is not available.*baked into the sandbox image.*re-onboard/i);
+      configSet("future-sb", { key: "models.default", value: "model-a" }),
+    ).rejects.toThrow(/config set is available only for Hermes.*future-agent/isu);
   });
 });

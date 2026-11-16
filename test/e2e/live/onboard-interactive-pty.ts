@@ -25,12 +25,15 @@ import { spawnObservedChild } from "../fixtures/observed-child-process.ts";
 
 export interface InteractiveCommandRule {
   readonly trigger: string;
-  readonly response: string;
+  readonly response: string | readonly string[];
+  readonly responseIntervalMs?: number;
+  readonly settleMs?: number;
 }
 
 export interface InteractiveCommandResult {
   readonly exitCode: number;
   readonly output: string;
+  readonly visibleOutput: string;
   readonly firedTriggers: readonly string[];
   readonly timedOut: boolean;
 }
@@ -42,6 +45,7 @@ export interface DriveInteractiveCommandOptions {
   readonly env: NodeJS.ProcessEnv;
   readonly progress: ChildProcessProgress;
   readonly rules: readonly InteractiveCommandRule[];
+  readonly signal?: AbortSignal;
   readonly timeoutMs: number;
 }
 
@@ -92,6 +96,39 @@ output = bytearray()
 os.set_blocking(fd, False)
 deadline = time.monotonic() + timeout_s
 fired = [False] * len(rules)
+last_output_at = time.monotonic()
+
+def strip_terminal_sequences(text):
+    visible = []
+    index = 0
+    while index < len(text):
+        if ord(text[index]) != 27:
+            visible.append(text[index])
+            index += 1
+            continue
+        index += 1
+        if index >= len(text):
+            break
+        if text[index] == "[":
+            index += 1
+            while index < len(text) and not ("@" <= text[index] <= "~"):
+                index += 1
+            index += 1
+            continue
+        if text[index] == "]":
+            index += 1
+            while index < len(text):
+                if ord(text[index]) == 7:
+                    index += 1
+                    break
+                if ord(text[index]) == 27 and index + 1 < len(text) and ord(text[index + 1]) == 92:
+                    index += 2
+                    break
+                index += 1
+            continue
+        index += 1
+    return "".join(visible)
+
 exit_code = None
 while time.monotonic() < deadline:
     ready, _, _ = select.select([fd], [], [], 0.2)
@@ -109,14 +146,21 @@ while time.monotonic() < deadline:
             exit_code = os.waitstatus_to_exitcode(status)
             break
         output.extend(chunk)
+        last_output_at = time.monotonic()
         sys.stdout.buffer.write(chunk)
         sys.stdout.flush()
     text = output.decode("utf-8", errors="ignore")
+    visible_text = strip_terminal_sequences(text)
     for i, rule in enumerate(rules):
         if fired[i]:
             continue
-        if rule["trigger"] in text:
-            os.write(fd, rule["response"].encode())
+        settle_s = rule.get("settleMs", 0) / 1000
+        if (rule["trigger"] in text or rule["trigger"] in visible_text) and time.monotonic() - last_output_at >= settle_s:
+            responses = rule["response"] if isinstance(rule["response"], list) else [rule["response"]]
+            interval_s = rule.get("responseIntervalMs", 50) / 1000
+            for response_index, response in enumerate(responses):
+                os.write(fd, response.encode())
+                time.sleep(interval_s * (response_index + 1 < len(responses)))
             sys.stderr.write("FIRED\\t" + rule["trigger"] + "\\n")
             fired[i] = True
     waited = os.waitpid(pid, os.WNOHANG)
@@ -134,6 +178,47 @@ if exit_code is None:
 sys.exit(exit_code)
 `;
 
+export function stripInteractiveTerminalSequences(value: string): string {
+  let visible = "";
+  let index = 0;
+  while (index < value.length) {
+    if (value.charCodeAt(index) !== 27) {
+      visible += value[index];
+      index += 1;
+      continue;
+    }
+    index += 1;
+    if (index >= value.length) break;
+    if (value[index] === "[") {
+      index += 1;
+      while (index < value.length && !(value[index]! >= "@" && value[index]! <= "~")) index += 1;
+      index += 1;
+      continue;
+    }
+    if (value[index] === "]") {
+      index += 1;
+      while (index < value.length) {
+        if (value.charCodeAt(index) === 7) {
+          index += 1;
+          break;
+        }
+        if (
+          value.charCodeAt(index) === 27 &&
+          index + 1 < value.length &&
+          value.charCodeAt(index + 1) === 92
+        ) {
+          index += 2;
+          break;
+        }
+        index += 1;
+      }
+      continue;
+    }
+    index += 1;
+  }
+  return visible;
+}
+
 function resolvePython(): string {
   return process.env.NEMOCLAW_E2E_PYTHON3_BIN || "python3";
 }
@@ -143,7 +228,12 @@ export function driveInteractiveCommand(
 ): Promise<InteractiveCommandResult> {
   const payload = JSON.stringify({
     cmd: options.cmd,
-    rules: options.rules.map((rule) => ({ trigger: rule.trigger, response: rule.response })),
+    rules: options.rules.map((rule) => ({
+      trigger: rule.trigger,
+      response: rule.response,
+      responseIntervalMs: rule.responseIntervalMs,
+      settleMs: rule.settleMs,
+    })),
     // Comfortably longer than the Node-side hard timeout below so the
     // driver's own bookkeeping never races the enforced bound.
     timeoutSeconds: Math.ceil(options.timeoutMs / 1000) + 30,
@@ -172,9 +262,11 @@ export function driveInteractiveCommand(
     let settled = false;
     let ptyChildPid: number | null = null;
     let forceKillTimer: ReturnType<typeof setTimeout> | null = null;
+    let terminationRequested = false;
 
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const terminate = (): void => {
+      if (terminationRequested) return;
+      terminationRequested = true;
       // pty.fork() puts the onboard command in its own session. Kill that
       // exact process group, then let the driver reap it through its SIGTERM
       // handler. The delayed driver-group SIGKILL is only a hard fallback.
@@ -197,7 +289,12 @@ export function driveInteractiveCommand(
           child.kill("SIGKILL");
         }
       }, 1_000);
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      terminate();
     }, options.timeoutMs);
+    const onAbort = (): void => terminate();
 
     // Additional listeners alongside spawnObservedChild's own content-free
     // observer; this module needs the real transcript to match rule
@@ -223,6 +320,7 @@ export function driveInteractiveCommand(
       settled = true;
       clearTimeout(timer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      options.signal?.removeEventListener("abort", onAbort);
       reject(error);
     });
     child.once("close", (code) => {
@@ -230,14 +328,18 @@ export function driveInteractiveCommand(
       settled = true;
       clearTimeout(timer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      options.signal?.removeEventListener("abort", onAbort);
       const fired = stderrRest.match(/^FIRED\t(.*)$/);
       if (fired) firedTriggers.push(fired[1]);
       resolve({
         exitCode: timedOut ? 124 : (code ?? 1),
         output,
+        visibleOutput: stripInteractiveTerminalSequences(output),
         firedTriggers,
         timedOut,
       });
     });
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
   });
 }

@@ -65,7 +65,7 @@ describe("DCode rebuild orchestrator", () => {
     expect(ensureAgentBaseImage).toHaveBeenCalledWith("hermes", bail, baseImageOptions);
   });
 
-  it("keeps warm-cache options out of the sealed DCode image path (#6195)", async () => {
+  it("forwards recorded base-image resolution metadata to Deep Agents Code preflight (#9386)", async () => {
     const ensureAgentBaseImage = vi.fn(() => true);
     const bail = vi.fn((message: string): never => {
       throw new Error(message);
@@ -110,6 +110,10 @@ describe("DCode rebuild orchestrator", () => {
         dcodeAutoApprovalMode: "thread-opt-in",
         skipLiveRoute: false,
         gatewayPort: 19_080,
+        baseImageOptions: {
+          resolutionHint,
+          forceBaseImageRefresh: true,
+        },
       }),
     );
     expect(ensureAgentBaseImage).not.toHaveBeenCalled();
@@ -156,6 +160,8 @@ describe("DCode rebuild orchestrator", () => {
         "thread-opt-in",
         false,
         19_080,
+        undefined,
+        bail,
       ),
     ).resolves.toBe(true);
 
@@ -173,5 +179,25 @@ describe("DCode rebuild orchestrator", () => {
     await expect(
       orchestrator.checkAtDeleteEdge(resumeConfig, "progressive", "thread-opt-in", false, 19_080),
     ).resolves.toEqual({ ok: false, message: "managed authority changed", code: 74 });
+
+    const deferredBail = vi.fn((message: string): never => {
+      throw new Error(`deferred: ${message}`);
+    });
+    vi.mocked(revalidateManagedDcodeWorkloadAtMutationEdge).mockImplementationOnce(
+      async ({ bail: validationBail }) => validationBail("late authority changed"),
+    );
+    await expect(
+      orchestrator.revalidateBeforeDelete(
+        resumeConfig,
+        "progressive",
+        "thread-opt-in",
+        false,
+        19_080,
+        undefined,
+        deferredBail,
+      ),
+    ).rejects.toThrow("deferred: late authority changed");
+    expect(deferredBail).toHaveBeenCalledWith("late authority changed");
+    expect(bail).not.toHaveBeenCalled();
   });
 });

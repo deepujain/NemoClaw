@@ -1,21 +1,64 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import {
+  SwitchyardProviderBindingError,
+  validateSwitchyardBindingState,
+} from "../../../hermes-switchyard-routing";
+import { verifySwitchyardProviderBindings } from "../../../onboard/switchyard/bindings";
+import {
+  decodeManagedStartupProfile,
+  ManagedStartupProfileError,
+} from "../../../onboard/managed-startup/profile";
+import type { OpenShellProviderAdapter } from "../../../adapters/openshell/provider-adapter";
+
+import { normalizeNativeLocalProviderAttachment } from "../../../inference/native-local/contract";
+import {
+  verifyNativeLocalStatusAttachment,
+  verifyNativeNvidiaStatusAttachment,
+  verifyNativeHostedStatusAttachment,
+} from "../inference-route-health";
+
 import { captureOpenshell } from "../../../adapters/openshell/runtime";
-import { OPENSHELL_PROBE_TIMEOUT_MS } from "../../../adapters/openshell/timeouts";
+import { createCliOpenShellProviderAdapter } from "../../../adapters/openshell/provider-adapter-cli";
+import type { OpenShellSandboxBufferedCommandExecutor } from "../../../adapters/openshell/sandbox-command";
+import {
+  OPENSHELL_INFERENCE_ROUTE_PROBE_TIMEOUT_MS,
+  OPENSHELL_PROBE_TIMEOUT_MS,
+} from "../../../adapters/openshell/timeouts";
 import type { AgentDefinition } from "../../../agent/defs";
 import { isTerminalAgent, listAgents, loadAgent } from "../../../agent/defs";
 import * as agentRuntime from "../../../agent/runtime";
+import { isOpenRouterRuntimeAdapterModelsRoute404 } from "../../../inference/openrouter";
 import { runAgentSmokeCommands } from "../../../agent/terminal-smoke";
-import { requireCuaLifecycleReadiness } from "../../../cua/lifecycle-readiness";
+import { checkTerminalAgentVersion } from "../../../agent/terminal-version-drift";
+import {
+  observeSandboxOnGateway,
+  type SandboxRecreateObserver,
+} from "../../../onboard/sandbox-recreate-probe";
 import type { SandboxEntry } from "../../../state/registry";
 import {
-  buildSandboxInferenceRouteProbeArgs,
+  normalizeNativeNvidiaProviderAttachment,
+  type NativeNvidiaProviderAttachment,
+} from "../../../inference/native-nvidia";
+import type { NativeProviderAttachment } from "../../../inference/native-provider/contract";
+import { recordedNativeProviderAttachment } from "../../../inference/native-provider/recorded-selection";
+import { createSynchronousCliOpenShellInferenceRouteObserver } from "../../../adapters/openshell/inference-route-cli";
+import type { OpenShellInferenceRouteObserver } from "../../../adapters/openshell/inference-route";
+import {
+  buildSandboxInferenceRouteProbeRequest,
   type InferenceRouteProbeAgent,
   parseSandboxInferenceRouteProbeResult,
 } from "../connect-inference-route-probe";
 import { areSandboxLaunchForwardsHealthy } from "../forward-recovery";
-import { isSandboxGatewayRunningForStatus } from "../process-recovery";
+import {
+  isTransientInferenceInvocationFailure,
+  runSandboxInferenceInvocationProbe,
+} from "../inference-route-health";
+import {
+  isSandboxGatewayHttpReachableForStatus,
+  isSandboxGatewayRunningForStatus,
+} from "../process-recovery";
 
 export type LaunchReadinessObservationCategory =
   | "missing"
@@ -29,25 +72,127 @@ export type LaunchReadinessObservationCategory =
 
 export type LaunchReadinessCaptureResult = ReturnType<typeof captureOpenshell>;
 
+export type LaunchReadinessFailedCheck = "inference request";
+
+export type LaunchReadinessObservationStage =
+  | "sandbox-identity"
+  | "policy-get"
+  | "inference-get"
+  | "gateway-health"
+  | "forward-health"
+  | "inference-route";
+
 export interface LaunchReadinessHealthDeps {
+  switchyardProviderAdapter?: OpenShellProviderAdapter;
   listAgents?: typeof listAgents;
   loadAgent?: typeof loadAgent;
-  capture?: (args: string[]) => LaunchReadinessCaptureResult;
+  capture?: LaunchReadinessBoundCapture;
+  inferenceRouteObserver?: OpenShellInferenceRouteObserver;
+  commandExecutor?: OpenShellSandboxBufferedCommandExecutor;
   gatewayHealth?: (sandboxName: string, gatewayName: string) => Promise<boolean | null>;
-  forwardsHealthy?: (sandboxName: string, gatewayName: string) => boolean | null;
-  smoke?: typeof runAgentSmokeCommands;
+  forwardsHealthy?: (
+    sandboxName: string,
+    gatewayName: string,
+  ) => boolean | null | Promise<boolean | null>;
+  smoke?: (sandboxName: string, agent: AgentDefinition) => ReturnType<typeof runAgentSmokeCommands>;
   inferenceProbe?: (
     sandboxName: string,
     agent: InferenceRouteProbeAgent,
     gatewayName: string,
-  ) => ReturnType<typeof parseSandboxInferenceRouteProbeResult>;
-  cuaReadiness?: typeof requireCuaLifecycleReadiness;
+  ) => Promise<ReturnType<typeof parseSandboxInferenceRouteProbeResult>>;
+  inferenceInvocationProbe?: typeof runSandboxInferenceInvocationProbe;
+  verifyNativeLocalAttachment?: typeof verifyNativeLocalStatusAttachment;
+  verifyNativeNvidiaAttachment?: (input: {
+    sandboxName: string;
+    gatewayName: string;
+    expected: NativeNvidiaProviderAttachment;
+  }) => Promise<void>;
+  verifyNativeHostedAttachment?: (input: {
+    sandboxName: string;
+    gatewayName: string;
+    expected: NativeProviderAttachment;
+  }) => Promise<void>;
+  recordObservationTiming?: (stage: LaunchReadinessObservationStage, elapsedMs: number) => void;
+  recordObservationFailure?: (stage: LaunchReadinessObservationStage) => void;
+}
+
+export type LaunchReadinessBoundCapture = (
+  args: string[],
+  options?: NonNullable<Parameters<typeof captureOpenshell>[1]>,
+) => LaunchReadinessCaptureResult;
+
+/** Bind the route observer to the same capture owner as the other readiness reads. */
+export function createLaunchReadinessInferenceRouteObserver(
+  capture: LaunchReadinessBoundCapture,
+): OpenShellInferenceRouteObserver {
+  return createSynchronousCliOpenShellInferenceRouteObserver(capture);
+}
+
+/** Route every OpenShell-backed readiness observation through one bound capture owner. */
+export function createBoundLaunchReadinessDeps(
+  capture: LaunchReadinessBoundCapture,
+  commandExecutor: OpenShellSandboxBufferedCommandExecutor,
+): LaunchReadinessHealthDeps & { observeSandbox: SandboxRecreateObserver } {
+  return {
+    capture: (args, options) =>
+      capture(args, {
+        ...options,
+        ignoreError: options?.ignoreError ?? true,
+        timeout: options?.timeout ?? OPENSHELL_PROBE_TIMEOUT_MS,
+      }),
+    inferenceRouteObserver: createLaunchReadinessInferenceRouteObserver(capture),
+    switchyardProviderAdapter: createCliOpenShellProviderAdapter({
+      run: (args, options) => capture(args, options),
+      defaultTimeoutMs: OPENSHELL_PROBE_TIMEOUT_MS,
+    }),
+    observeSandbox: (target) => observeSandboxOnGateway(target, capture),
+    gatewayHealth: (sandboxName, gatewayName) =>
+      isSandboxGatewayHttpReachableForStatus(sandboxName, gatewayName, {
+        commandExecutor,
+      }),
+    forwardsHealthy: (sandboxName, gatewayName) =>
+      areSandboxLaunchForwardsHealthy(sandboxName, gatewayName),
+    inferenceProbe: (sandboxName, agent, gatewayName) =>
+      probeInferenceRoute(sandboxName, agent, gatewayName, commandExecutor),
+    commandExecutor,
+  };
 }
 
 export class LaunchReadinessObservationError extends Error {
-  constructor(readonly category: LaunchReadinessObservationCategory) {
+  constructor(
+    readonly category: LaunchReadinessObservationCategory,
+    readonly failedCheck?: LaunchReadinessFailedCheck,
+  ) {
     super(category);
   }
+}
+
+// Log only protocol fields, never endpoint URLs, response bodies, or command output.
+function failInferenceInvocation(
+  result: Extract<Awaited<ReturnType<typeof runSandboxInferenceInvocationProbe>>, { ok: false }>,
+): never {
+  const httpStatus =
+    result.httpStatus !== null &&
+    Number.isInteger(result.httpStatus) &&
+    result.httpStatus >= 100 &&
+    result.httpStatus < 600
+      ? result.httpStatus
+      : "unknown";
+  const curlExit =
+    /^sandbox inference invocation probe exited with status ([0-9]{1,3})$/.exec(
+      result.detail,
+    )?.[1] ?? "unknown";
+  const response =
+    result.detail === "sandbox inference invocation probe returned an invalid response body"
+      ? "invalid"
+      : result.detail === "sandbox inference invocation probe could not run" ||
+          result.detail === "sandbox inference invocation probe was unavailable"
+        ? "unavailable"
+        : "unverified";
+  console.error(
+    `  Inference request failed: HTTP ${httpStatus}; curl_exit=${curlExit}; timed_out=${String(result.timedOut === true)}; response=${response}.`,
+  );
+  throw new LaunchReadinessObservationError("health", "inference request");
 }
 
 /** The required observation could not produce authoritative evidence. */
@@ -57,9 +202,32 @@ export class LaunchReadinessEvidenceError extends Error {
   }
 }
 
+function recordObservationTiming(
+  deps: LaunchReadinessHealthDeps,
+  stage: LaunchReadinessObservationStage,
+  startedAt: number,
+): void {
+  try {
+    deps.recordObservationTiming?.(stage, Math.max(0, performance.now() - startedAt));
+  } catch {
+    // Timing evidence must never change readiness behavior.
+  }
+}
+
+export function recordLaunchReadinessObservationFailure(
+  deps: LaunchReadinessHealthDeps,
+  stage: LaunchReadinessObservationStage,
+): void {
+  try {
+    deps.recordObservationFailure?.(stage);
+  } catch {
+    // Diagnostic evidence must never change readiness behavior.
+  }
+}
+
 export function captureLaunchReadiness(
   args: string[],
-  options: { includeStreams?: boolean; maxBuffer?: number } = {},
+  options: NonNullable<Parameters<typeof captureOpenshell>[1]> = {},
 ): LaunchReadinessCaptureResult {
   return captureOpenshell(args, {
     ignoreError: true,
@@ -78,9 +246,7 @@ export function resolveLaunchInteractiveCommand(
   agent: AgentDefinition,
   agentName: string,
 ): string | null {
-  return agentName === "nemocua"
-    ? agentRuntime.getTerminalCommand(agent, "interactive")
-    : agentRuntime.getInteractiveAgentCommand(agent, agentName);
+  return agentRuntime.getInteractiveAgentCommand(agent, agentName);
 }
 
 export function resolveTrustedLaunchAgent(
@@ -98,22 +264,177 @@ export function resolveTrustedLaunchAgent(
   }
   const interactive = resolveLaunchInteractiveCommand(agent, agentName);
   if (!interactive) throw new LaunchReadinessObservationError("session");
-  if (agentName === "nemocua" && interactive !== "nemocua interactive") {
-    throw new LaunchReadinessObservationError("session");
-  }
   return agent;
 }
 
-function probeInferenceRoute(
+export function getNativeProviderAttachment(entry: SandboxEntry): NativeProviderAttachment | null {
+  return recordedNativeProviderAttachment(entry) ?? null;
+}
+
+export function hasRecordedNativeNvidiaAttachment(entry: SandboxEntry): boolean {
+  return (
+    normalizeNativeNvidiaProviderAttachment(entry.nativeNvidiaProviderAttachment) !== undefined
+  );
+}
+
+export async function requireNativeInferenceHealth(input: {
+  sandboxName: string;
+  gatewayName: string;
+  agentName?: string;
+  entry: SandboxEntry;
+  deps: LaunchReadinessHealthDeps;
+  allowTransientNvidiaInvocation?: boolean;
+}): Promise<boolean> {
+  let profileSwitchyard = null;
+  if (
+    (input.agentName ?? input.entry.agent) === "hermes" &&
+    input.entry.workload?.kind === "managed-image"
+  ) {
+    let config: ReturnType<typeof decodeManagedStartupProfile>["agentConfig"];
+    try {
+      config = decodeManagedStartupProfile(input.entry.workload.encodedProfile).agentConfig;
+    } catch (error) {
+      if (
+        error instanceof ManagedStartupProfileError ||
+        error instanceof SwitchyardProviderBindingError
+      )
+        throw new LaunchReadinessObservationError("config");
+      throw error;
+    }
+    if (config.agent === "hermes" && config.switchyardRouting)
+      profileSwitchyard = {
+        routing: config.switchyardRouting,
+        bindings: config.switchyardBindings,
+      };
+  }
+  if (input.entry.hermesSwitchyard || profileSwitchyard) {
+    let state: ReturnType<typeof validateSwitchyardBindingState>;
+    try {
+      state = validateSwitchyardBindingState(input.entry.hermesSwitchyard);
+    } catch (error) {
+      if (error instanceof SwitchyardProviderBindingError)
+        throw new LaunchReadinessObservationError("config");
+      throw error;
+    }
+    if (
+      (input.agentName ?? input.entry.agent) !== "hermes" ||
+      input.entry.gatewayName !== input.gatewayName ||
+      input.entry.provider !== state.routing.capable.provider ||
+      input.entry.model !== state.routing.capable.model ||
+      !profileSwitchyard ||
+      JSON.stringify(profileSwitchyard) !== JSON.stringify(state)
+    )
+      throw new LaunchReadinessEvidenceError();
+    await verifySwitchyardProviderBindings({
+      routing: state.routing,
+      expected: state.bindings,
+      sandboxName: input.sandboxName,
+      target: { kind: "named", gatewayName: input.gatewayName },
+      adapter:
+        input.deps.switchyardProviderAdapter ??
+        createCliOpenShellProviderAdapter({ defaultTimeoutMs: OPENSHELL_PROBE_TIMEOUT_MS }),
+      providerNames: Object.fromEntries(
+        state.bindings.providers.map((p) => [p.logicalProvider, p.providerName]),
+      ),
+    });
+    return true;
+  }
+  if (input.entry.nativeLocalProviderAttachment !== undefined) {
+    const expected = normalizeNativeLocalProviderAttachment(
+      input.entry.nativeLocalProviderAttachment,
+    );
+    if (
+      !expected ||
+      !input.entry.model ||
+      ((input.agentName ?? input.entry.agent) === "hermes" &&
+        (expected.agent !== "hermes" || input.entry.provider !== expected.provider))
+    )
+      throw new LaunchReadinessEvidenceError();
+    await (input.deps.verifyNativeLocalAttachment ?? verifyNativeLocalStatusAttachment)({
+      sandboxName: input.sandboxName,
+      gatewayName: input.gatewayName,
+      expected,
+    });
+    const result = await (
+      input.deps.inferenceInvocationProbe ?? runSandboxInferenceInvocationProbe
+    )({
+      sandboxName: input.sandboxName,
+      gatewayName: input.gatewayName,
+      agentName: input.agentName,
+      provider: expected.provider,
+      model: input.entry.model,
+      preferredInferenceApi: "openai-completions",
+      nativeLocalProviderAttachment: expected,
+    });
+    if (!result.ok) failInferenceInvocation(result);
+    return true;
+  }
+  const expected = getNativeProviderAttachment(input.entry);
+  if (!expected) return false;
+  const provider = normalizedString(input.entry.provider);
+  const model = normalizedString(input.entry.model);
+  if (!provider || !model) throw new LaunchReadinessEvidenceError();
+  const nvidia = normalizeNativeNvidiaProviderAttachment(expected);
+  if (nvidia)
+    await (input.deps.verifyNativeNvidiaAttachment ?? verifyNativeNvidiaStatusAttachment)({
+      sandboxName: input.sandboxName,
+      gatewayName: input.gatewayName,
+      expected: nvidia,
+    });
+  else
+    await (input.deps.verifyNativeHostedAttachment ?? verifyNativeHostedStatusAttachment)({
+      sandboxName: input.sandboxName,
+      gatewayName: input.gatewayName,
+      expected,
+    });
+  const invocation = await (
+    input.deps.inferenceInvocationProbe ?? runSandboxInferenceInvocationProbe
+  )({
+    sandboxName: input.sandboxName,
+    gatewayName: input.gatewayName,
+    agentName: input.agentName,
+    provider,
+    model,
+    preferredInferenceApi: normalizedString(input.entry.preferredInferenceApi),
+    nativeProvider: true,
+    ...(expected.endpointUrl ? { nativeEndpointUrl: expected.endpointUrl } : {}),
+  });
+  if (!invocation.ok) {
+    if (
+      nvidia &&
+      input.allowTransientNvidiaInvocation === true &&
+      isTransientInferenceInvocationFailure(invocation)
+    ) {
+      console.error(`  Warning: NVIDIA inference is degraded (${invocation.detail}).`);
+      return true;
+    }
+    failInferenceInvocation(invocation);
+  }
+  return true;
+}
+
+async function probeInferenceRoute(
   sandboxName: string,
   agent: InferenceRouteProbeAgent,
   gatewayName: string,
-): ReturnType<typeof parseSandboxInferenceRouteProbeResult> {
-  return parseSandboxInferenceRouteProbeResult(
-    captureLaunchReadiness(buildSandboxInferenceRouteProbeArgs(sandboxName, agent, gatewayName), {
-      includeStreams: true,
-    }),
+  commandExecutor: OpenShellSandboxBufferedCommandExecutor,
+): Promise<ReturnType<typeof parseSandboxInferenceRouteProbeResult>> {
+  const completed = await commandExecutor.runBuffered(
+    buildSandboxInferenceRouteProbeRequest(
+      sandboxName,
+      agent,
+      gatewayName,
+      OPENSHELL_INFERENCE_ROUTE_PROBE_TIMEOUT_MS,
+    ),
   );
+  return parseSandboxInferenceRouteProbeResult({
+    status: completed.outcome.kind === "completed" ? completed.outcome.exitCode : null,
+    output: completed.stdout,
+    stderr:
+      completed.outcome.kind === "completed"
+        ? completed.stderr
+        : completed.stderr || completed.outcome.error.message,
+  });
 }
 
 export async function requireLaunchSemanticHealth(
@@ -125,48 +446,159 @@ export async function requireLaunchSemanticHealth(
   inferenceConfigured: boolean,
   deps: LaunchReadinessHealthDeps,
 ): Promise<void> {
-  if (agentName === "nemocua") {
-    try {
-      (deps.cuaReadiness ?? requireCuaLifecycleReadiness)(entry);
-    } catch {
-      throw new LaunchReadinessObservationError("health");
-    }
-  } else if (isTerminalAgent(agent)) {
-    const smoke = (deps.smoke ?? runAgentSmokeCommands)(
-      sandboxName,
-      agent,
-      (args, _options) =>
-        (deps.capture ?? ((captureArgs) => captureLaunchReadiness(captureArgs)))(args),
-      gatewayName,
-    );
+  if (agentName === "langchain-deepagents-code" && !inferenceConfigured) {
+    recordLaunchReadinessObservationFailure(deps, "inference-route");
+    throw new LaunchReadinessEvidenceError();
+  }
+  if (isTerminalAgent(agent)) {
+    const smoke = deps.smoke
+      ? await deps.smoke(sandboxName, agent)
+      : deps.commandExecutor
+        ? await runAgentSmokeCommands(sandboxName, agent, deps.commandExecutor, gatewayName)
+        : null;
+    if (!smoke) throw new LaunchReadinessEvidenceError();
     if (!smoke.ok) {
       const trustedExit = smoke.output?.match(/(?:^|\n)NEMOCLAW_AGENT_SMOKE_EXIT:(\d+)(?:\n|$)/);
       if (!trustedExit) throw new LaunchReadinessEvidenceError();
       throw new LaunchReadinessObservationError("health");
     }
+    if (agent.expectedVersion) {
+      if (!deps.commandExecutor) throw new LaunchReadinessEvidenceError();
+      const version = await checkTerminalAgentVersion(
+        sandboxName,
+        agent,
+        deps.commandExecutor,
+        gatewayName,
+      );
+      if (version.status === "unverified") throw new LaunchReadinessEvidenceError();
+      if (version.status === "stale") throw new LaunchReadinessObservationError("health");
+    }
   } else {
-    const running = await (deps.gatewayHealth ?? isSandboxGatewayRunningForStatus)(
-      sandboxName,
-      gatewayName,
-    );
-    if (running === null) throw new LaunchReadinessEvidenceError();
-    if (!running) throw new LaunchReadinessObservationError("health");
-    const forwards = (deps.forwardsHealthy ?? areSandboxLaunchForwardsHealthy)(
-      sandboxName,
-      gatewayName,
-    );
-    if (forwards === null) throw new LaunchReadinessEvidenceError();
+    const gatewayStartedAt = performance.now();
+    let running: boolean | null;
+    try {
+      running = await (deps.gatewayHealth ?? isSandboxGatewayRunningForStatus)(
+        sandboxName,
+        gatewayName,
+      );
+    } catch (error) {
+      recordLaunchReadinessObservationFailure(deps, "gateway-health");
+      throw error;
+    } finally {
+      recordObservationTiming(deps, "gateway-health", gatewayStartedAt);
+    }
+    if (running === null) {
+      recordLaunchReadinessObservationFailure(deps, "gateway-health");
+      throw new LaunchReadinessEvidenceError();
+    }
+    if (!running) {
+      recordLaunchReadinessObservationFailure(deps, "gateway-health");
+      throw new LaunchReadinessObservationError("health");
+    }
+    const forwardStartedAt = performance.now();
+    let forwards: boolean | null;
+    try {
+      forwards = await (deps.forwardsHealthy ?? areSandboxLaunchForwardsHealthy)(
+        sandboxName,
+        gatewayName,
+      );
+    } catch (error) {
+      recordLaunchReadinessObservationFailure(deps, "forward-health");
+      throw error;
+    } finally {
+      recordObservationTiming(deps, "forward-health", forwardStartedAt);
+    }
+    if (forwards === null) {
+      recordLaunchReadinessObservationFailure(deps, "forward-health");
+      throw new LaunchReadinessEvidenceError();
+    }
     if (!forwards) {
+      recordLaunchReadinessObservationFailure(deps, "forward-health");
       throw new LaunchReadinessObservationError("health");
     }
   }
   if (inferenceConfigured) {
-    const inference = (deps.inferenceProbe ?? probeInferenceRoute)(sandboxName, agent, gatewayName);
-    const usable = inference.healthy && inference.httpStatus >= 200 && inference.httpStatus < 300;
-    if (usable) return;
+    const inferenceStartedAt = performance.now();
+    if (
+      getNativeProviderAttachment(entry) ||
+      entry.nativeLocalProviderAttachment !== undefined ||
+      entry.hermesSwitchyard !== undefined ||
+      (agentName === "hermes" && entry.workload?.kind === "managed-image")
+    ) {
+      let fallbackToGeneric = false;
+      try {
+        const native = await requireNativeInferenceHealth({
+          sandboxName,
+          gatewayName,
+          agentName,
+          entry,
+          deps,
+        });
+        if (native) return;
+        fallbackToGeneric = true;
+      } catch (error) {
+        recordLaunchReadinessObservationFailure(deps, "inference-route");
+        throw error;
+      } finally {
+        if (!fallbackToGeneric)
+          recordObservationTiming(deps, "inference-route", inferenceStartedAt);
+      }
+    }
+    let inference: ReturnType<typeof parseSandboxInferenceRouteProbeResult>;
+    try {
+      const inferenceProbe =
+        deps.inferenceProbe ??
+        ((name: string, targetAgent: InferenceRouteProbeAgent, targetGateway: string) => {
+          if (!deps.commandExecutor) throw new LaunchReadinessEvidenceError();
+          return probeInferenceRoute(name, targetAgent, targetGateway, deps.commandExecutor);
+        });
+      inference = await inferenceProbe(sandboxName, agent, gatewayName);
+    } catch (error) {
+      recordLaunchReadinessObservationFailure(deps, "inference-route");
+      throw error;
+    } finally {
+      recordObservationTiming(deps, "inference-route", inferenceStartedAt);
+    }
+    const strictRouteHealth =
+      inference.healthy && inference.httpStatus >= 200 && inference.httpStatus < 300;
+    if (strictRouteHealth && agentName !== "langchain-deepagents-code") return;
+    const supportedOpenRouterModelsRouteUnsupported =
+      inference.healthy &&
+      isOpenRouterRuntimeAdapterModelsRoute404(entry.provider, inference.httpStatus);
+    if (strictRouteHealth || supportedOpenRouterModelsRouteUnsupported) {
+      const provider = normalizedString(entry.provider);
+      const model = normalizedString(entry.model);
+      if (!provider || !model) {
+        recordLaunchReadinessObservationFailure(deps, "inference-route");
+        throw new LaunchReadinessEvidenceError();
+      }
+      let invocation: Awaited<ReturnType<typeof runSandboxInferenceInvocationProbe>>;
+      try {
+        invocation = await (deps.inferenceInvocationProbe ?? runSandboxInferenceInvocationProbe)({
+          sandboxName,
+          gatewayName,
+          agentName,
+          provider,
+          model,
+          preferredInferenceApi: normalizedString(entry.preferredInferenceApi),
+        });
+      } catch (error) {
+        recordLaunchReadinessObservationFailure(deps, "inference-route");
+        throw error;
+      }
+      if (invocation.ok) return;
+      recordLaunchReadinessObservationFailure(deps, "inference-route");
+      failInferenceInvocation(invocation);
+    }
     if (inference.broken || (inference.httpStatus >= 100 && inference.httpStatus < 600)) {
+      recordLaunchReadinessObservationFailure(deps, "inference-route");
+      const curlExit = /^BROKEN 000 curl_exit=([0-9]{1,3})$/.exec(inference.detail)?.[1];
+      console.error(
+        `  Inference route readiness failed: HTTP ${String(inference.httpStatus)}; probe_broken=${String(inference.broken)}${curlExit ? `; curl_exit=${curlExit}` : ""}.`,
+      );
       throw new LaunchReadinessObservationError("health");
     }
+    recordLaunchReadinessObservationFailure(deps, "inference-route");
     throw new LaunchReadinessEvidenceError();
   }
 }

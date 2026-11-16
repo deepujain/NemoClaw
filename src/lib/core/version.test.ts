@@ -2,11 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { getBuildIdentity, getVersion, validateBuildIdentity } from "./version";
+import {
+  getBuildIdentity,
+  getVersion,
+  resolveSourceBuildIdentity,
+  validateBuildIdentity,
+} from "./version";
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 
@@ -62,8 +67,9 @@ describe("lib/version", () => {
     writeFileSync(join(testDir, "package.json"), JSON.stringify({ version: "1.2.3" }));
   });
 
-  it("falls back to package.json version when no git and no .version", () => {
-    expect(getVersion({ rootDir: testDir })).toBe("1.2.3");
+  it("reports 0.0.0 from the root manifest without Git metadata or a version stamp (#14026)", () => {
+    copyFileSync(join(repoRoot, "package.json"), join(testDir, "package.json"));
+    expect(getVersion({ rootDir: testDir })).toBe("0.0.0");
   });
 
   it("prefers .version file over package.json", () => {
@@ -114,6 +120,18 @@ describe("lib/version", () => {
     expect(getBuildIdentity({ rootDir: testDir })).toEqual(identity);
   });
 
+  it("preserves an exact compiled identity when rebuilding the same source revision", () => {
+    const identity = {
+      nemoclawVersion: "0.0.113-195-ga52f16721",
+      sourceRevision: `a52f16721${"5".repeat(31)}`,
+    };
+    mkdirSync(join(testDir, "dist"));
+    writeFileSync(join(testDir, "dist", "build-identity.json"), JSON.stringify(identity));
+    writeFileSync(join(testDir, ".source-revision"), identity.sourceRevision);
+
+    expect(resolveSourceBuildIdentity({ rootDir: testDir })).toEqual(identity);
+  });
+
   it("rejects a described version whose revision does not match (#7777)", () => {
     expect(() =>
       validateBuildIdentity({
@@ -123,18 +141,17 @@ describe("lib/version", () => {
     ).toThrow("NemoClaw build identity version and source revision do not match.");
   });
 
-  it.each([
-    `nvapi-${"a".repeat(24)}`,
-    "[REDACTED]",
-    "1.2",
-  ])("rejects the invalid public version %s (#7777)", (nemoclawVersion) => {
-    expect(() =>
-      validateBuildIdentity({
-        nemoclawVersion,
-        sourceRevision: "9".repeat(40),
-      }),
-    ).toThrow("NemoClaw build identity has an invalid version.");
-  });
+  it.each([`nvapi-${"a".repeat(24)}`, "[REDACTED]", "1.2"])(
+    "rejects the invalid public version %s (#7777)",
+    (nemoclawVersion) => {
+      expect(() =>
+        validateBuildIdentity({
+          nemoclawVersion,
+          sourceRevision: "9".repeat(40),
+        }),
+      ).toThrow("NemoClaw build identity has an invalid version.");
+    },
+  );
 
   it("ignores inherited Git hook environment for explicit roots", () => {
     const gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], {

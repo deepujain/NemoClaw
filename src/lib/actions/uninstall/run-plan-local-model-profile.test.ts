@@ -12,6 +12,7 @@ import {
 } from "../../../../test/support/uninstall-managed-gateway-test-support";
 
 import {
+  loadManagedLlamaCppOwner,
   managedLlamaCppStatePaths,
   reserveManagedLlamaCppOwner,
 } from "../../inference/llama-cpp/managed-state";
@@ -20,6 +21,7 @@ import {
   ensureDockerDriverGatewayJwtBundle,
   gatewayIdForStateDir,
 } from "../../onboard/docker-driver-gateway-config";
+import { writeCompleteDockerDriverGatewayLocalTlsBundle } from "../../onboard/__test-helpers__/docker-driver-gateway-local-tls";
 import {
   type RunResult,
   runUninstallPlan as runUninstallPlanBase,
@@ -49,8 +51,8 @@ const ORPHANED_VLLM_INSPECT_ARGS = [
 
 const RESERVED_INFERENCE_NAMES_ARGS = ["ps", "-a", "--format", "{{.Names}}"];
 
-function runUninstallPlan(options: UninstallRunOptions, deps: UninstallRunDeps) {
-  return runUninstallPlanBase(options, {
+async function runUninstallPlan(options: UninstallRunOptions, deps: UninstallRunDeps) {
+  return await runUninstallPlanBase(options, {
     resolveGatewayTeardownAuthority: ({ gatewayName, gatewayPort }) => ({
       gatewayName,
       gatewayPort,
@@ -102,14 +104,9 @@ function publishManagedLlamaOwner(
 }
 
 function writeScopedGatewayState(home: string): void {
-  const stateDir = path.join(
-    home,
-    ".local",
-    "state",
-    "nemoclaw",
-    "openshell-docker-gateway",
-  );
+  const stateDir = path.join(home, ".local", "state", "nemoclaw", "openshell-docker-gateway");
   const jwtBundle = ensureDockerDriverGatewayJwtBundle(stateDir);
+  writeCompleteDockerDriverGatewayLocalTlsBundle(stateDir);
   fs.writeFileSync(
     path.join(stateDir, "openshell-gateway.toml"),
     buildDockerDriverGatewayConfigToml(
@@ -129,13 +126,116 @@ function writeScopedGatewayState(home: string): void {
 }
 
 describe("uninstall local model profile cleanup", () => {
-  it("removes an orphaned host-local vLLM container only when its managed label is present (#8981)", () => {
+  it.each([
+    { outcome: "removed", removes: true, inventoryStatus: 0, exitCode: 0 },
+    { outcome: "still present", removes: false, inventoryStatus: 0, exitCode: 1 },
+    { outcome: "inventory unavailable", removes: true, inventoryStatus: 1, exitCode: 1 },
+  ])(
+    "verifies bearerless vLLM on its default daemon: $outcome",
+    async ({ removes, inventoryStatus, exitCode }) => {
+      const containerId = "d".repeat(64);
+      const otherId = "e".repeat(64);
+      const local = new Map([["nemoclaw-vllm", containerId]]);
+      const ambient = new Map([
+        ["nemoclaw-vllm", otherId],
+        ["operator-server", "foreign"],
+      ]);
+      const env = {
+        HOME: "/tmp/nemoclaw-uninstall-vllm-daemons",
+        DOCKER_CONTEXT: "other-local",
+        DOCKER_HOST: "unix:///other/docker.sock",
+        DOCKER_CONFIG: "/other/config",
+        DOCKER_TLS_VERIFY: "1",
+        DOCKER_CERT_PATH: "/other/certs",
+        DOCKER_API_VERSION: "1.44",
+      };
+      const errors: string[] = [];
+      const runDocker = vi.fn<NonNullable<UninstallRunDeps["runDocker"]>>((args, options) => {
+        const isDefault = options?.env?.DOCKER_CONTEXT === "default";
+        const inventory = isDefault ? local : ambient;
+        const handlers = new Map([
+          [
+            JSON.stringify(ORPHANED_VLLM_INSPECT_ARGS),
+            () => ok(`${inventory.get("nemoclaw-vllm")} ${String(isDefault)}\n`),
+          ],
+          [
+            JSON.stringify(["rm", "-f", containerId]),
+            () => {
+              removes && inventory.delete("nemoclaw-vllm");
+              return ok();
+            },
+          ],
+          [
+            JSON.stringify(RESERVED_INFERENCE_NAMES_ARGS),
+            () => ({
+              status: isDefault ? inventoryStatus : 0,
+              stdout: [...inventory.keys()].join("\n"),
+              stderr: "",
+            }),
+          ],
+        ]);
+        return handlers.get(JSON.stringify(args))?.() ?? ok();
+      });
+      const result = await runUninstallPlan(
+        { assumeYes: true, deleteModels: false, keepOpenShell: true },
+        {
+          commandExists: (command) => command === "openshell" || command === "docker",
+          env,
+          existsSync: () => false,
+          error: (message) => errors.push(message),
+          isTty: false,
+          log: () => {},
+          run: vi.fn(okWithKnownGatewayList),
+          runDocker,
+        },
+      );
+      expect(result.exitCode).toBe(exitCode);
+      expect(local.has("nemoclaw-vllm")).toBe(!removes);
+      expect([...ambient]).toEqual([
+        ["nemoclaw-vllm", otherId],
+        ["operator-server", "foreign"],
+      ]);
+      expect(runDocker).toHaveBeenCalledWith(
+        ["rm", "-f", containerId],
+        expect.objectContaining({ env: expect.objectContaining({ DOCKER_CONTEXT: "default" }) }),
+      );
+      const localCalls = runDocker.mock.calls.filter(
+        ([, options]) => options?.env?.DOCKER_CONTEXT === "default",
+      );
+      expect(localCalls.map(([args]) => args)).toEqual([
+        ORPHANED_VLLM_INSPECT_ARGS,
+        ["rm", "-f", containerId],
+        RESERVED_INFERENCE_NAMES_ARGS,
+      ]);
+      expect(
+        localCalls.map(([, options]) =>
+          Object.keys(options?.env ?? {}).filter((name) => name.startsWith("DOCKER_")),
+        ),
+      ).toEqual([["DOCKER_CONTEXT"], ["DOCKER_CONTEXT"], ["DOCKER_CONTEXT"]]);
+      expect(
+        runDocker.mock.calls.filter(
+          ([args, options]) =>
+            JSON.stringify(args) === JSON.stringify(RESERVED_INFERENCE_NAMES_ARGS) &&
+            options?.env?.DOCKER_HOST === env.DOCKER_HOST,
+        ),
+      ).toHaveLength(exitCode === 0 ? 1 : 0);
+      expect(
+        errors.some((message) =>
+          /remains after ownership-aware cleanup|could not inventory reserved managed inference/u.test(
+            message,
+          ),
+        ),
+      ).toBe(exitCode !== 0);
+    },
+  );
+
+  it("removes an orphaned host-local vLLM container only when its managed label is present (#8981)", async () => {
     const containerId = "a".repeat(64);
     const runDocker = dockerResults(
       new Map([[JSON.stringify(ORPHANED_VLLM_INSPECT_ARGS), ok(`${containerId} true\n`)]]),
     );
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: false, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "docker",
@@ -155,7 +255,7 @@ describe("uninstall local model profile cleanup", () => {
     );
   });
 
-  it("preserves an orphaned host-local vLLM container without the managed label (#8981)", () => {
+  it("preserves an orphaned host-local vLLM container without the managed label (#8981)", async () => {
     const errors: string[] = [];
     const runDocker = dockerResults(
       new Map([
@@ -164,7 +264,7 @@ describe("uninstall local model profile cleanup", () => {
       ]),
     );
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: false, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "docker",
@@ -183,7 +283,7 @@ describe("uninstall local model profile cleanup", () => {
     expect(errors.join("\n")).toContain("remains after ownership-aware cleanup");
   });
 
-  it("preserves an orphaned host-local vLLM container after malformed inspection output (#8981)", () => {
+  it("preserves an orphaned host-local vLLM container after malformed inspection output (#8981)", async () => {
     const errors: string[] = [];
     const runDocker = dockerResults(
       new Map([
@@ -192,7 +292,7 @@ describe("uninstall local model profile cleanup", () => {
       ]),
     );
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: false, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "docker",
@@ -211,7 +311,7 @@ describe("uninstall local model profile cleanup", () => {
     expect(errors.join("\n")).toContain("remains after ownership-aware cleanup");
   });
 
-  it("stops uninstall when orphaned host-local vLLM removal fails (#8981)", () => {
+  it("stops uninstall when orphaned host-local vLLM removal fails (#8981)", async () => {
     const errors: string[] = [];
     const containerId = "c".repeat(64);
     const runDocker = dockerResults(
@@ -221,7 +321,7 @@ describe("uninstall local model profile cleanup", () => {
       ]),
     );
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: false, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "docker",
@@ -244,7 +344,7 @@ describe("uninstall local model profile cleanup", () => {
     expect(runDocker.mock.calls.some(([args]) => args[0] === "ps")).toBe(false);
   });
 
-  it("fails before generic Docker cleanup when a reserved inference name remains", () => {
+  it("fails before generic Docker cleanup when a reserved inference name remains", async () => {
     const errors: string[] = [];
     const psResults = new Map([
       [
@@ -277,7 +377,7 @@ describe("uninstall local model profile cleanup", () => {
       return result!;
     });
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: false, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "docker",
@@ -299,9 +399,9 @@ describe("uninstall local model profile cleanup", () => {
     expect(errors.join("\n")).toContain("remains after ownership-aware cleanup");
   });
 
-  it("fails closed when Docker cannot inventory reserved inference names", () => {
+  it("fails closed when Docker cannot inventory reserved inference names", async () => {
     const errors: string[] = [];
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: false, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "docker",
@@ -321,9 +421,9 @@ describe("uninstall local model profile cleanup", () => {
     expect(errors.join("\n")).toContain("could not inventory reserved managed inference");
   });
 
-  it("states that model deletion removes every Ollama model and non-credential Hugging Face cache data", () => {
+  it("states that model deletion removes every Ollama model and non-credential Hugging Face cache data", async () => {
     const logs: string[] = [];
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: false, deleteModels: true, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell",
@@ -344,13 +444,13 @@ describe("uninstall local model profile cleanup", () => {
     expect(logs).toContain("Aborted.");
   });
 
-  it("requests shared Hugging Face cache-data cleanup during Model stores", () => {
+  it("requests shared Hugging Face cache-data cleanup during Model stores", async () => {
     const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-llama-cache-"));
     const cacheDir = path.join(tmpHome, ".cache", "huggingface");
     const log = vi.fn();
     const runHuggingFaceCacheDataCleanup = vi.fn(() => ok());
     try {
-      const result = runUninstallPlan(
+      const result = await runUninstallPlan(
         { assumeYes: true, deleteModels: true, keepOpenShell: true },
         {
           commandExists: (command) => command === "openshell",
@@ -379,7 +479,7 @@ describe("uninstall local model profile cleanup", () => {
     }
   });
 
-  it("deletes every model returned by Ollama inventory", () => {
+  it("deletes every model returned by Ollama inventory", async () => {
     const run = runWithOllamaInventory(
       ok(
         [
@@ -390,7 +490,7 @@ describe("uninstall local model profile cleanup", () => {
       ),
     );
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: true, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "ollama",
@@ -423,10 +523,10 @@ describe("uninstall local model profile cleanup", () => {
     ).toEqual([60_000, 60_000]);
   });
 
-  it("ignores a remote Ollama environment override during model cleanup", () => {
+  it("ignores a remote Ollama environment override during model cleanup", async () => {
     const run = runWithOllamaInventory(ok("NAME ID SIZE MODIFIED\nlocal-model 111 1 GB now\n"));
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: true, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "ollama",
@@ -442,19 +542,21 @@ describe("uninstall local model profile cleanup", () => {
     );
 
     expect(result.exitCode).toBe(0);
-    run.mock.calls.filter(([command]) => command === "ollama").forEach(([command, , options]) => {
-      expect(command).toBe("ollama");
-      expect(options?.env?.OLLAMA_HOST).toBe("127.0.0.1:11434");
-    });
+    run.mock.calls
+      .filter(([command]) => command === "ollama")
+      .forEach(([command, , options]) => {
+        expect(command).toBe("ollama");
+        expect(options?.env?.OLLAMA_HOST).toBe("127.0.0.1:11434");
+      });
   });
 
-  it("fails without deleting any Ollama model when inventory is malformed", () => {
+  it("fails without deleting any Ollama model when inventory is malformed", async () => {
     const errors: string[] = [];
     const run = runWithOllamaInventory(
       ok("NAME ID SIZE MODIFIED\n--unsafe 111111111111 1 GB now\n"),
     );
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: true, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "ollama",
@@ -474,14 +576,14 @@ describe("uninstall local model profile cleanup", () => {
     expect(errors.join("\n")).toContain("No Ollama models were removed");
   });
 
-  it("fails without deleting any Ollama model when inventory execution fails", () => {
+  it("fails without deleting any Ollama model when inventory execution fails", async () => {
     const run = runWithOllamaInventory({
       status: 1,
       stdout: "",
       stderr: "daemon unavailable",
     });
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: true, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "ollama",
@@ -499,13 +601,13 @@ describe("uninstall local model profile cleanup", () => {
     );
   });
 
-  it("attempts every inventoried Ollama removal and fails when one removal fails", () => {
+  it("attempts every inventoried Ollama removal and fails when one removal fails", async () => {
     const run = runWithOllamaInventory(
       ok("NAME ID SIZE MODIFIED\nfirst 111 1 GB now\nsecond 222 1 GB now\n"),
       ["first"],
     );
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: true, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "ollama",
@@ -525,10 +627,10 @@ describe("uninstall local model profile cleanup", () => {
     ).toEqual(["first", "second"]);
   });
 
-  it("does not inventory or remove Ollama models without delete-models", () => {
+  it("does not inventory or remove Ollama models without delete-models", async () => {
     const run = vi.fn(okWithKnownGatewayList);
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: false, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "ollama",
@@ -544,7 +646,7 @@ describe("uninstall local model profile cleanup", () => {
     expect(run.mock.calls.some(([command]) => command === "ollama")).toBe(false);
   });
 
-  it("cleans selected gateway-owned llama.cpp state before scoped uninstall removes state", () => {
+  it("cleans selected gateway-owned llama.cpp state before scoped uninstall removes state", async () => {
     const tmpHome = fs.realpathSync(
       fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-llama-scoped-")),
     );
@@ -558,7 +660,7 @@ describe("uninstall local model profile cleanup", () => {
       return ok(`state:${stateDir}`);
     });
     try {
-      const result = runUninstallPlan(
+      const result = await runUninstallPlan(
         { assumeYes: true, deleteModels: true, keepOpenShell: true },
         withProvenManagedGatewayProcess({
           commandExists: (command) => command === "openshell",
@@ -585,7 +687,7 @@ describe("uninstall local model profile cleanup", () => {
     }
   });
 
-  it("cleans orphaned gateway-scoped llama.cpp authority before a full uninstall", () => {
+  it("cleans orphaned gateway-scoped llama.cpp authority before a full uninstall", async () => {
     const tmpHome = fs.realpathSync(
       fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-llama-all-")),
     );
@@ -598,7 +700,7 @@ describe("uninstall local model profile cleanup", () => {
       return ok(`state:${stateDir}`);
     });
     try {
-      const result = runUninstallPlan(
+      const result = await runUninstallPlan(
         { assumeYes: true, deleteModels: false, keepOpenShell: true },
         {
           commandExists: (command) => command === "openshell",
@@ -620,16 +722,33 @@ describe("uninstall local model profile cleanup", () => {
     }
   });
 
-  it("preserves selected gateway authority when scoped cleanup leaves ownership state", () => {
+  it("continues unrelated uninstall after managed llama.cpp cleanup fails (#9575)", async () => {
     const tmpHome = fs.realpathSync(
       fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-llama-fail-")),
     );
     const stateDir = publishManagedLlamaOwner(tmpHome, 8080, "selected-sandbox");
+    const siblingStateDir = publishManagedLlamaOwner(tmpHome, 9000, "sibling-sandbox");
+    const selectedPaths = managedLlamaCppStatePaths(tmpHome, 8080);
+    const siblingPaths = managedLlamaCppStatePaths(tmpHome, 9000);
+    const selectedOwnerBefore = loadManagedLlamaCppOwner(selectedPaths);
+    const siblingOwnerBefore = loadManagedLlamaCppOwner(siblingPaths);
     writeScopedGatewayState(tmpHome);
+    const unrelatedState = path.join(tmpHome, ".nemoclaw", "unrelated-state.json");
+    const cacheDir = path.join(tmpHome, ".cache", "huggingface");
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(unrelatedState, "{}\n", { mode: 0o600 });
     const errors: string[] = [];
+    const logs: string[] = [];
+    const runLocalModelRuntimeCleanup = vi.fn(() => ok());
+    const runHuggingFaceCacheDataCleanup = vi.fn(() => ok());
+    const runManagedLlamaCppRuntimeCleanup = vi.fn(() => ({
+      status: 1,
+      stdout: "",
+      stderr: "qualified endpoint changed",
+    }));
     try {
-      const result = runUninstallPlan(
-        { assumeYes: true, deleteModels: false, keepOpenShell: true },
+      const result = await runUninstallPlan(
+        { assumeYes: true, deleteModels: true, keepOpenShell: true },
         withProvenManagedGatewayProcess({
           commandExists: (command) => command === "openshell",
           env: { HOME: tmpHome } as NodeJS.ProcessEnv,
@@ -637,28 +756,42 @@ describe("uninstall local model profile cleanup", () => {
           existsSync: fs.existsSync,
           isPortFree: () => true,
           isTty: false,
-          log: () => {},
-          run: vi.fn((command: string, args: string[]) =>
-            command === "openshell" && args[0] === "gateway" && args[1] === "list"
-              ? ok(JSON.stringify([{ name: "nemoclaw" }, { name: "nemoclaw-9000" }]))
-              : ok(),
-          ),
-          runManagedLlamaCppRuntimeCleanup: vi.fn(() => ok()),
+          log: (message) => logs.push(message),
+          run: vi.fn(okWithKnownGatewayList),
+          runHuggingFaceCacheDataCleanup,
+          runLocalModelRuntimeCleanup,
+          runManagedLlamaCppRuntimeCleanup,
         }),
       );
 
       expect(result.exitCode).toBe(1);
+      expect(runManagedLlamaCppRuntimeCleanup).toHaveBeenCalledExactlyOnceWith(
+        "selected-sandbox",
+        8080,
+      );
       expect(fs.existsSync(stateDir)).toBe(true);
-      expect(errors.join("\n")).toContain("returned without retiring its ownership state");
+      expect(fs.existsSync(path.join(stateDir, "owner.json"))).toBe(true);
+      expect(fs.existsSync(path.join(siblingStateDir, "owner.json"))).toBe(true);
+      expect(loadManagedLlamaCppOwner(selectedPaths)).toEqual(selectedOwnerBefore);
+      expect(loadManagedLlamaCppOwner(siblingPaths)).toEqual(siblingOwnerBefore);
+      expect(fs.existsSync(unrelatedState)).toBe(false);
+      expect(fs.existsSync(cacheDir)).toBe(true);
+      expect(runHuggingFaceCacheDataCleanup).not.toHaveBeenCalled();
+      expect(runLocalModelRuntimeCleanup).not.toHaveBeenCalled();
+      expect(logs).toContain(
+        "Managed llama.cpp cleanup did not complete. NemoClaw kept model stores for retry.",
+      );
+      expect(logs.some((message) => message.endsWith("State and binaries"))).toBe(true);
+      expect(errors.join("\n")).toContain("continue unrelated uninstall steps");
     } finally {
       fs.rmSync(tmpHome, { recursive: true, force: true });
     }
   });
 
-  it("stops before generic Docker cleanup when host-local cleanup fails", () => {
+  it("stops before generic Docker cleanup when host-local cleanup fails", async () => {
     const errors: string[] = [];
     const runDocker = vi.fn((_args: string[]) => ok());
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: true, keepOpenShell: true },
       {
         commandExists: (command) => command === "openshell" || command === "docker",
@@ -675,6 +808,63 @@ describe("uninstall local model profile cleanup", () => {
 
     expect(result.exitCode).toBe(1);
     expect(errors.join("\n")).toContain("Host-local model runtime cleanup did not complete");
+    expect(runDocker.mock.calls.some(([args]) => args[0] === "rm")).toBe(false);
+  });
+
+  it("removes an orphaned bearerless vLLM container before managed llama.cpp cleanup when no vLLM state remains", async () => {
+    const containerId = "d".repeat(64);
+    const runDocker = dockerResults(
+      new Map([[JSON.stringify(ORPHANED_VLLM_INSPECT_ARGS), ok(`${containerId} true\n`)]]),
+    );
+    const runLocalModelRuntimeCleanup = vi.fn(() => ok());
+
+    const result = await runUninstallPlan(
+      { assumeYes: true, deleteModels: false, keepOpenShell: true },
+      {
+        commandExists: (command) => command === "openshell" || command === "docker",
+        env: { HOME: "/tmp/nemoclaw-uninstall-llama-and-bearerless-vllm" } as NodeJS.ProcessEnv,
+        existsSync: (target) => String(target).endsWith("/.nemoclaw/managed-llama-cpp"),
+        isTty: false,
+        log: () => {},
+        run: vi.fn(okWithKnownGatewayList),
+        runDocker,
+        runLocalModelRuntimeCleanup,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(runDocker).toHaveBeenCalledWith(
+      ["rm", "-f", containerId],
+      expect.objectContaining({ timeout: 10_000 }),
+    );
+    expect(runLocalModelRuntimeCleanup).toHaveBeenCalledOnce();
+    expect(runDocker.mock.invocationCallOrder[0]).toBeLessThan(
+      runLocalModelRuntimeCleanup.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("routes a host-local vLLM runtime receipt through validated cleanup instead of label-only removal", async () => {
+    const runDocker = dockerResults(
+      new Map([[JSON.stringify(ORPHANED_VLLM_INSPECT_ARGS), ok(`${"e".repeat(64)} true\n`)]]),
+    );
+    const runLocalModelRuntimeCleanup = vi.fn(() => ok());
+
+    const result = await runUninstallPlan(
+      { assumeYes: true, deleteModels: false, keepOpenShell: true },
+      {
+        commandExists: (command) => command === "openshell" || command === "docker",
+        env: { HOME: "/tmp/nemoclaw-uninstall-vllm-receipt-only" } as NodeJS.ProcessEnv,
+        existsSync: (target) => String(target).endsWith("/.nemoclaw/host-local-vllm-runtime.json"),
+        isTty: false,
+        log: () => {},
+        run: vi.fn(okWithKnownGatewayList),
+        runDocker,
+        runLocalModelRuntimeCleanup,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(runLocalModelRuntimeCleanup).toHaveBeenCalledOnce();
     expect(runDocker.mock.calls.some(([args]) => args[0] === "rm")).toBe(false);
   });
 });

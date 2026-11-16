@@ -6,14 +6,11 @@ kind: ServerImageBuild
 
 metadata:
   id: llama-cpp-server.v1
-  annotations:
-    nemoclaw.nvidia.com/request-guard-state: dormant
-
 spec:
   repository: ghcr.io/nvidia/nemoclaw/llama-cpp-server
 
   publication:
-    enabled: false
+    enabled: true
     trigger: workflow_dispatch
     allowedRef: refs/heads/main
     repository: ghcr.io/nvidia/nemoclaw/llama-cpp-server
@@ -43,7 +40,6 @@ spec:
     qualification:
       required: true
       execution: enabled
-      requestGuard: required
       profile: dgx-spark-gb10-single
       recipeRef: llama-cpp.nemotron-3-nano-30b-a3b.spark-single.v1
       platform: linux/arm64
@@ -72,6 +68,7 @@ spec:
         - context-window
         - authentication
         - malformed-request
+        - request-body-limit
         - cancellation
         - client-timeout
         - log-redaction
@@ -89,8 +86,8 @@ spec:
 
   source:
     repository: https://github.com/ggml-org/llama.cpp
-    revision: 22dc605c4ead20e36f447cc67b55ef87e523bd55
-    archiveSha256: sha256:975f70723e053785e894f4e1d9cf770f2f1a7bc762fd3af174ff5635014108b6
+    revision: 8e7f22b67ef4667b4ddd50230771287f328cfb3f
+    archiveSha256: sha256:45a24299e7a24410624489d19924d492bc71a120fa17d9b7cb32f6d5c4f1aed0
 
   cuda:
     developmentBase: docker.io/nvidia/cuda@sha256:ef2203909e80b8b976cfc672f7e2ae2b00bc0e25c404ee86d89e10a3802f1c52
@@ -102,7 +99,7 @@ spec:
       cudaArchitectures: 89-real;100-real;120-real
     - platform: linux/arm64
       runner: ubuntu-24.04-arm
-      cudaArchitectures: 121a-real
+      cudaArchitectures: 103-real;120-real;121a-real
 
   build:
     target: llama-server
@@ -113,14 +110,13 @@ spec:
       cudaHostCxx: g++-14
     packages:
       build-essential: 12.10ubuntu1
-      ca-certificates: 20260601~24.04.1
+      ca-certificates: 20260816ubuntu0.24.04.1
       cmake: 3.28.3-1build7
-      curl: 8.5.0-2ubuntu10.11
+      curl: 8.5.0-2ubuntu10.16
       g++-14: 14.2.0-4ubuntu2~24.04.1
       gcc-14: 14.2.0-4ubuntu2~24.04.1
-      golang-go: 2:1.22~2build1
-      libcurl4-openssl-dev: 8.5.0-2ubuntu10.11
-      libssl-dev: 3.0.13-0ubuntu3.12
+      libcurl4-openssl-dev: 8.5.0-2ubuntu10.16
+      libssl-dev: 3.0.13-0ubuntu3.16
     cmake:
       ggmlBackendDl: true
       ggmlCpuAllVariants: true
@@ -145,9 +141,8 @@ spec:
     entrypoint: /usr/local/bin/llama-server
     requiredPaths:
       - /opt/llama.cpp/lib/libggml-cuda.so
+      - /usr/bin/curl
       - /usr/local/bin/llama-server
-      - /usr/local/bin/nemoclaw-llama-cpp-request-guard
-      - /usr/local/share/licenses/go/copyright
       - /usr/local/share/licenses/llama.cpp/AUTHORS
       - /usr/local/share/licenses/llama.cpp/LICENSE
     forbiddenPaths:
@@ -161,8 +156,10 @@ spec:
       - /usr/bin/rbash
       - /usr/bin/sh
     packages:
-      ca-certificates: 20260601~24.04.1
-      libcurl4t64: 8.5.0-2ubuntu10.11
+      ca-certificates: 20260816ubuntu0.24.04.1
+      curl: 8.5.0-2ubuntu10.16
+      libcurl4t64: 8.5.0-2ubuntu10.16
       libgomp1: 14.2.0-4ubuntu2~24.04.1
+      libssl3t64: 3.0.13-0ubuntu3.16
     writablePaths:
       - /tmp

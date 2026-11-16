@@ -1,448 +1,380 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-
+import { execTimeout, testTimeout } from "../../helpers/timeouts.ts";
+import { shellQuote } from "../../../src/lib/core/shell-quote.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
-import { assertExitZero, resultText } from "../fixtures/clients/index.ts";
-import { sandboxAccessEnv, validateSandboxName } from "../fixtures/clients/sandbox.ts";
-import { expect, test } from "../fixtures/e2e-test.ts";
+import { assertExitZero, resultText } from "../fixtures/clients/command.ts";
+import { trustedSandboxShellScript } from "../fixtures/clients/sandbox.ts";
+import { expect, test, type E2ETargetFixtures } from "../fixtures/e2e-test.ts";
+import { requireHostedInferenceConfig } from "../fixtures/hosted-inference.ts";
 import { REPO_ROOT } from "../fixtures/paths.ts";
-import type { NemoClawInstance } from "../fixtures/phases/onboarding.ts";
+import { STOPPED_CONTAINER_STARTUP_LOG_READER } from "../fixtures/stopped-container-startup-log.ts";
 import {
-  restoreRegistryAndSession,
-  snapshotRegistryAndSession,
-} from "../fixtures/phases/state-validation.ts";
-import type { ShellProbeResult } from "../fixtures/shell-probe.ts";
+  OPENCLAW_RESTORE_HOST_PROGRAM,
+  OPENCLAW_RESTORE_NATIVE_PROGRAM,
+  OPENCLAW_RESTORE_SUITE_TIMEOUT_MS,
+  createOpenClawRestoreDeadline,
+  openClawRestoreFixture,
+  type OpenClawRestoreScenario,
+} from "../fixtures/openclaw-restore-fixture.ts";
 
-// Keep the core boundary identical to the former shell lane: write durable
-// workspace state in a real OpenClaw sandbox, run scripts/backup-workspace.sh
-// backup, destroy and recreate the sandbox, run scripts/backup-workspace.sh
-// restore, then verify the five top-level workspace files plus memory/ return.
+const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-state-backup";
+const DASHBOARD_PORT = 18_792;
+// Leave the existing job time for setup, both cleanup callbacks, and artifact upload.
+const restoreDeadline = createOpenClawRestoreDeadline(
+  testTimeout(OPENCLAW_RESTORE_SUITE_TIMEOUT_MS) - 60_000,
+);
 
-const WORKSPACE_PATH = "/sandbox/.openclaw/workspace";
-const WORKSPACE_FILES = ["SOUL.md", "USER.md", "IDENTITY.md", "AGENTS.md", "MEMORY.md"];
-const MEMORY_FILE = "memory/2026-04-20.md";
-const TEST_SANDBOX_PREFIX = "e2e-state-backup";
-const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? TEST_SANDBOX_PREFIX;
-const TEST_TIMEOUT_MS = Number(process.env.NEMOCLAW_E2E_TIMEOUT_SECONDS ?? 3_600) * 1_000;
-const ONBOARD_TIMEOUT_MS = 30 * 60_000;
-const BACKUP_RESTORE_TIMEOUT_MS = 5 * 60_000;
-const DESTROY_ATTEMPTS = 3;
-const DESTROY_RETRY_DELAY_MS = 10_000;
-
-validateSandboxName(SANDBOX_NAME);
-
-type BackupExpectation = {
-  relativePath: string;
-  expected: string;
-};
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function assertTestOwnedSandboxName(): void {
-  if (!SANDBOX_NAME.startsWith(TEST_SANDBOX_PREFIX)) {
-    throw new Error(
-      `state-backup-restore live test is destructive and only accepts sandbox names with prefix ${TEST_SANDBOX_PREFIX}; got ${SANDBOX_NAME}`,
-    );
-  }
-}
-
-function backupRoot(): string {
-  return path.join(process.env.HOME ?? os.homedir(), ".nemoclaw", "backups");
-}
-
-function listBackupDirs(root = backupRoot()): string[] {
-  if (!fs.existsSync(root)) return [];
-  return fs
-    .readdirSync(root, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => path.join(root, entry.name))
-    .sort();
-}
-
-function latestBackupDir(candidates: readonly string[]): string | undefined {
-  return [...candidates]
-    .filter((candidate) => fs.existsSync(candidate))
-    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)
-    .at(0);
-}
-
-function backupRestoreEnv(): NodeJS.ProcessEnv {
-  return {
-    ...buildAvailabilityProbeEnv(),
-    OPENSHELL_GATEWAY: process.env.OPENSHELL_GATEWAY ?? "nemoclaw",
-  };
-}
-
-function commandFailed(result: ShellProbeResult): boolean {
-  return result.exitCode !== 0 || result.timedOut;
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function isNvidiaEndpointValidationUnavailable(text: string): boolean {
-  return (
-    /NVIDIA Endpoints endpoint validation failed/i.test(text) &&
-    (/Validation details were omitted/i.test(text) ||
-      /HTTP 429|rate limit|quota|temporarily unavailable|timed out|timeout/i.test(text))
-  );
-}
-
-async function bestEffortLifecycleCleanup(run: () => Promise<unknown>): Promise<void> {
-  try {
-    await run();
-  } catch {
-    // Cleanup remains best-effort so the primary E2E failure stays visible.
-  }
-}
-
-function hostFileContains(filePath: string, expected: string): boolean {
-  return fs.existsSync(filePath) && fs.readFileSync(filePath, "utf8").includes(expected);
-}
-
-async function destroySandboxUntilAbsent(
-  sandboxName: string,
-  destroy: (artifactName: string) => Promise<ShellProbeResult>,
-  list: (artifactName: string) => Promise<ShellProbeResult>,
-): Promise<void> {
-  let lastList = "";
-  for (let attempt = 1; attempt <= DESTROY_ATTEMPTS; attempt += 1) {
-    await bestEffortLifecycleCleanup(() => destroy(`phase-3-destroy-attempt-${attempt}`));
-    const listResult = await list(`phase-3-list-after-destroy-${attempt}`);
-    lastList = resultText(listResult);
-    if (listResult.exitCode === 0 && !lastList.includes(sandboxName)) return;
-    if (attempt < DESTROY_ATTEMPTS) await sleep(DESTROY_RETRY_DELAY_MS);
-  }
-  throw new Error(
-    `TC-STATE-01: Destroy failed; sandbox ${sandboxName} still exists after ${DESTROY_ATTEMPTS} attempts:\n${lastList}`,
-  );
-}
-
-test("state-backup-restore: backup-workspace.sh restores workspace files and memory directory (#8006)", {
-  timeout: TEST_TIMEOUT_MS,
+const restoreOptions = {
+  timeout: testTimeout(OPENCLAW_RESTORE_SUITE_TIMEOUT_MS),
   meta: {
     e2ePhases: [
-      "confirm Docker and the workspace backup script",
-      "onboard the source sandbox",
-      "write workspace and memory markers",
-      "capture and inspect the host backup",
-      "destroy and re-onboard the sandbox",
-      "restore the backup into the fresh sandbox",
-      "validate restored workspace and memory",
+      "prepare the complete native-home compatibility fixture",
+      "onboard the exact managed image",
+      "write state across the native home",
+      "prepare native state while the production backup gate holds the gateway",
+      "rebuild from the complete native-home backup",
+      "verify the exact original rebuild backup",
+      "verify native-home state and readiness",
     ],
   },
-}, async ({
-  artifacts,
-  cleanup,
-  environment,
-  host,
-  onboard,
-  progress,
-  sandbox,
-  secrets,
-  skip,
-  stateValidation,
-}) => {
-  assertTestOwnedSandboxName();
-  secrets.required("NVIDIA_INFERENCE_API_KEY");
-  expect(fs.existsSync(path.join(REPO_ROOT, "scripts", "backup-workspace.sh"))).toBe(true);
+};
 
-  const dockerInfo = await host.command("docker", ["info"], {
-    artifactName: "prereq-docker-info",
-    env: buildAvailabilityProbeEnv(),
-    timeoutMs: 30_000,
-  });
-  if (dockerInfo.exitCode !== 0) {
-    if (process.env.GITHUB_ACTIONS === "true") {
-      throw new Error(
-        `Docker is required for state-backup-restore live coverage: ${resultText(dockerInfo)}`,
-      );
-    }
-    skip("Docker is required for state-backup-restore live coverage");
-  }
+async function rebuildFixture(
+  scenario: OpenClawRestoreScenario,
+  {
+    artifacts,
+    cleanup,
+    host,
+    progress,
+    runtimeProvider,
+    sandbox,
+    secrets,
+  }: Pick<
+    E2ETargetFixtures,
+    "artifacts" | "cleanup" | "host" | "progress" | "runtimeProvider" | "sandbox" | "secrets"
+  >,
+) {
+  const sandboxName = scenario === "legacy" ? SANDBOX_NAME : `${SANDBOX_NAME}-r`;
+  const deadline = restoreDeadline();
+  const bounded = (cap: number) => {
+    const remaining = Math.floor(deadline - performance.now());
+    expect(remaining, "restore scenario exhausted its existing test budget").toBeGreaterThan(0);
+    return Math.min(cap, remaining);
+  };
+  const hosted = requireHostedInferenceConfig(secrets);
+  const env = {
+    ...buildAvailabilityProbeEnv(),
+    ...hosted.env,
+    NEMOCLAW_AGENT: "openclaw",
+    NEMOCLAW_DASHBOARD_PORT: String(DASHBOARD_PORT),
+    NEMOCLAW_NON_INTERACTIVE: "1",
+    NEMOCLAW_RECREATE_SANDBOX: "1",
+    NEMOCLAW_SANDBOX_NAME: sandboxName,
+    OPENSHELL_GATEWAY: process.env.OPENSHELL_GATEWAY ?? "nemoclaw",
+  };
+  const redactions = [hosted.apiKey];
 
-  await artifacts.writeJson("contract.json", {
-    sandboxName: SANDBOX_NAME,
-    workspacePath: WORKSPACE_PATH,
-    restoredFiles: WORKSPACE_FILES,
-    restoredDirectoryProbe: MEMORY_FILE,
-    preservedBoundaries: [
-      "real nemoclaw onboard with Docker/OpenShell",
-      "openshell sandbox exec workspace marker writes and reads",
-      "real scripts/backup-workspace.sh backup host process",
-      "real nemoclaw <sandbox> destroy --yes",
-      "real scripts/backup-workspace.sh restore host process",
-      "legacy workspace backup and restore remains compatible with AgentDefinition state migration",
+  await artifacts.target.declare({
+    id: "state-backup-restore",
+    boundary: "real OpenShell rebuild, native legacy migrations, and retained recovery backup",
+    contracts: [
+      "the legacy target exercises the supported rebuild replacement",
+      "unknown home, workspace, config, and local-data state survive rebuild",
+      scenario === "legacy"
+        ? "9.5/9.7 migrate legacy replay and sticker state before the restored 10.5 gateway becomes ready"
+        : "startup refuses retained nonempty Telegram state and preserves the exact recovery backup",
     ],
   });
-
-  const stateSnapshot = snapshotRegistryAndSession();
-  let createdBackupDir: string | undefined;
-  cleanup.trackDisposable(`restore NemoClaw state files for ${SANDBOX_NAME}`, () => {
-    restoreRegistryAndSession(stateSnapshot);
+  await runtimeProvider.requireAvailable({
+    artifactName: "state-backup-restore-runtime-provider",
+    scenarioLabel: "complete native-home backup compatibility",
   });
-  cleanup.trackDisposable("remove generated backup-workspace.sh backup", () => {
-    if (!createdBackupDir) return;
-    const root = backupRoot();
-    const resolved = path.resolve(createdBackupDir);
-    if (resolved !== root && resolved.startsWith(`${path.resolve(root)}${path.sep}`)) {
-      fs.rmSync(resolved, { recursive: true, force: true });
-    }
+  await sandbox.cleanupSandboxBeforeOnboard(sandboxName, {
+    artifactName: "state-backup-restore-preclean",
+    env,
+    redactionValues: redactions,
+    timeoutMs: bounded(120_000),
   });
-  if (process.env.NEMOCLAW_E2E_KEEP_SANDBOX !== "1") {
-    cleanup.trackDisposable(`delete OpenShell sandbox ${SANDBOX_NAME}`, () =>
-      sandbox.cleanupSandbox(SANDBOX_NAME, {
-        artifactName: "cleanup-openshell-sandbox-delete",
-        env: sandboxAccessEnv(),
-        timeoutMs: 60_000,
-      }),
-    );
-    cleanup.trackSandbox(host, SANDBOX_NAME, {
-      artifactName: "cleanup-nemoclaw-destroy",
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 15 * 60_000,
-    });
-  }
-  cleanup.trackDisposable("stop NemoClaw gateway", async () => {
-    const result = await host.nemoclaw(["stop"], {
-      artifactName: "cleanup-nemoclaw-stop",
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 60_000,
-    });
-    assertExitZero(result, "cleanup nemoclaw stop");
-  });
-
-  await bestEffortLifecycleCleanup(() =>
-    onboard.destroySandbox(SANDBOX_NAME, "pre-cleanup-nemoclaw-destroy"),
-  );
-  await bestEffortLifecycleCleanup(() =>
-    sandbox.openshell(["sandbox", "delete", SANDBOX_NAME], {
-      artifactName: "pre-cleanup-openshell-sandbox-delete",
-      env: sandboxAccessEnv(),
-      timeoutMs: 60_000,
+  cleanup.trackDisposable(`destroy NemoClaw sandbox ${sandboxName}`, () =>
+    host.cleanupSandbox(sandboxName, {
+      artifactName: "state-backup-restore-cleanup",
+      preserveGatewayRegistration: true,
+      env,
+      redactionValues: redactions,
+      timeoutMs: 120_000,
     }),
   );
 
-  const ready = await environment.assertReady({
-    platform: "ubuntu-local",
-    install: "repo-current",
-    runtime: "docker-running",
-    onboarding: "cloud-openclaw",
+  progress.phase("onboard the exact managed image");
+  const install = await host.command("bash", ["install.sh", "--non-interactive"], {
+    artifactName: "state-backup-restore-install",
+    cwd: REPO_ROOT,
+    env,
+    redactionValues: redactions,
+    timeoutMs: bounded(execTimeout(20 * 60_000)),
   });
+  await host.recordSandboxContainerDiscoveryOnFailure(sandboxName, install.exitCode, redactions);
+  assertExitZero(install, "complete native-home compatibility install");
 
-  progress.phase("onboard the source sandbox");
-  let instance: NemoClawInstance;
-  try {
-    instance = await onboard.from(ready, {
-      sandboxName: SANDBOX_NAME,
-      timeoutMs: ONBOARD_TIMEOUT_MS,
-    });
-  } catch (error) {
-    const text = errorText(error);
-    if (isNvidiaEndpointValidationUnavailable(text)) {
-      await artifacts.target.complete({
-        id: "state-backup-restore",
-        status: "skipped",
-        reason: "external-provider-validation-unavailable-before-state-backup-contract",
-      });
-      skip("NVIDIA endpoint validation was unavailable/rate-limited during onboarding");
-    }
-    throw error;
-  }
+  progress.phase("write state across the native home");
+  const marker = `state-backup-restore-${Date.now()}`;
+  const markerPaths = [
+    "/sandbox/.state-backup-unknown",
+    "/sandbox/.openclaw/workspace/.state-backup-workspace",
+    "/sandbox/.config/e2e-native-home/marker",
+    "/sandbox/.local/share/e2e-native-home/marker",
+  ];
+  const markerDirectories = markerPaths
+    .slice(1)
+    .map((target) => target.slice(0, target.lastIndexOf("/")));
+  const write = await sandbox.execShell(
+    sandboxName,
+    trustedSandboxShellScript(
+      [
+        "set -eu",
+        "umask 077",
+        `mkdir -p ${markerDirectories.map(shellQuote).join(" ")}`,
+        `for target in ${markerPaths.map(shellQuote).join(" ")}; do printf '%s\\n' ${shellQuote(marker)} > "$target"; done`,
+        "sync",
+      ].join("\n"),
+    ),
+    { artifactName: "state-backup-restore-write", env, redactionValues: redactions },
+  );
+  assertExitZero(write, "write complete native-home markers");
 
-  progress.phase("write workspace and memory markers");
-  const markerContent = `E2E_BACKUP_TEST_${Date.now()}`;
-  const expectations: BackupExpectation[] = WORKSPACE_FILES.map((file) => ({
-    relativePath: file,
-    expected: `${markerContent}_${file}`,
-  }));
-  expectations.push({
-    relativePath: MEMORY_FILE,
-    expected: `${markerContent}_daily`,
-  });
-
-  for (const expectation of expectations) {
-    await stateValidation.writeMarkerFile(
-      instance,
-      path.posix.join(WORKSPACE_PATH, expectation.relativePath),
-      expectation.expected,
+  progress.phase("prepare native state while the production backup gate holds the gateway");
+  const fixture = openClawRestoreFixture(marker);
+  const hostFixture = async (mode: string, extra: Record<string, unknown> = {}, cap = 60_000) => {
+    const result = await host.command(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "-e",
+        OPENCLAW_RESTORE_HOST_PROGRAM,
+        JSON.stringify({ mode, sandboxName, gatewayName: env.OPENSHELL_GATEWAY, ...extra }),
+      ],
       {
-        artifactName: `phase-1-write-${expectation.relativePath.replace(/\//g, "-")}`,
-        env: sandboxAccessEnv(),
-        timeoutMs: 60_000,
+        artifactName: `state-backup-restore-${mode}`,
+        cwd: REPO_ROOT,
+        env,
+        redactionValues: redactions,
+        timeoutMs: bounded(cap),
       },
     );
-  }
-  await artifacts.writeJson("phase-1-marker-summary.json", {
-    workspaceFilesWritten: WORKSPACE_FILES.length,
-    memoryFilesWritten: 1,
-  });
-
-  progress.phase("capture and inspect the host backup");
-  const beforeBackupDirs = new Set(listBackupDirs());
-  const backup = await host.command(
-    "bash",
-    [path.join(REPO_ROOT, "scripts", "backup-workspace.sh"), "backup", SANDBOX_NAME],
-    {
-      artifactName: "phase-2-backup-workspace",
-      cwd: REPO_ROOT,
-      env: backupRestoreEnv(),
-      timeoutMs: BACKUP_RESTORE_TIMEOUT_MS,
-    },
-  );
-  const backupText = resultText(backup);
-  if (commandFailed(backup) || !backupText.includes("Backup saved")) {
-    throw new Error(
-      `TC-STATE-01: Backup failed; backup-workspace.sh backup exited ${backup.exitCode}:\n${backupText}`,
-    );
-  }
-
-  const newBackupDirs = listBackupDirs().filter((dir) => !beforeBackupDirs.has(dir));
-  createdBackupDir = latestBackupDir(newBackupDirs) ?? latestBackupDir(listBackupDirs());
-  expect(createdBackupDir, "TC-STATE-01: Backup dir — no backup directory found").toBeTruthy();
-  await artifacts.writeJson("phase-2-backup-summary.json", {
-    backupDir: createdBackupDir,
-    output: backupText,
-  });
-
-  let capturedFiles = 0;
-  WORKSPACE_FILES.forEach((file) => {
-    const expected = `${markerContent}_${file}`;
-    if (hostFileContains(path.join(createdBackupDir!, file), expected)) {
-      capturedFiles += 1;
-    }
-  });
-  expect(
-    capturedFiles,
-    `TC-STATE-01: BackupCaptureFiles — expected all 5 markdown files in host backup ${createdBackupDir}`,
-  ).toBe(WORKSPACE_FILES.length);
-
-  const memoryBackupPath = path.join(createdBackupDir!, MEMORY_FILE);
-  expect(
-    fs.existsSync(memoryBackupPath),
-    `TC-STATE-01: BackupCaptureDir — ${memoryBackupPath} must exist in host backup`,
-  ).toBe(true);
-  expect(
-    hostFileContains(memoryBackupPath, `${markerContent}_daily`),
-    "TC-STATE-01: BackupCaptureDir — memory file must contain expected marker",
-  ).toBe(true);
-
-  progress.phase("destroy and re-onboard the sandbox");
-  await destroySandboxUntilAbsent(
-    SANDBOX_NAME,
-    (artifactName) => onboard.destroySandbox(SANDBOX_NAME, artifactName),
-    (artifactName) =>
-      host.nemoclaw(["list"], {
-        artifactName,
-        env: buildAvailabilityProbeEnv(),
-        timeoutMs: 60_000,
-      }),
-  );
-  await artifacts.writeJson("phase-3-destroy-summary.json", {
-    sandboxName: SANDBOX_NAME,
-    attempts: DESTROY_ATTEMPTS,
-  });
-
-  let restoredInstance: NemoClawInstance;
-  try {
-    restoredInstance = await onboard.from(ready, {
-      sandboxName: SANDBOX_NAME,
-      timeoutMs: ONBOARD_TIMEOUT_MS,
-    });
-  } catch (error) {
-    const text = errorText(error);
-    if (isNvidiaEndpointValidationUnavailable(text)) {
-      await artifacts.target.complete({
-        id: "state-backup-restore",
-        status: "skipped",
-        reason: "external-provider-validation-unavailable-during-reonboard",
-      });
-      skip("NVIDIA endpoint validation was unavailable/rate-limited during re-onboard");
-    }
-    throw error;
-  }
-  await artifacts.writeJson("phase-4-reonboard-summary.json", {
-    sandboxName: restoredInstance.sandboxName,
-  });
-
-  progress.phase("restore the backup into the fresh sandbox");
-  const restore = await host.command(
-    "bash",
-    [path.join(REPO_ROOT, "scripts", "backup-workspace.sh"), "restore", SANDBOX_NAME],
-    {
-      artifactName: "phase-5-restore-workspace",
-      cwd: REPO_ROOT,
-      env: backupRestoreEnv(),
-      timeoutMs: BACKUP_RESTORE_TIMEOUT_MS,
-    },
-  );
-  const restoreText = resultText(restore);
-  if (commandFailed(restore) || !restoreText.includes("Restored")) {
-    throw new Error(
-      `TC-STATE-01: Restore failed; backup-workspace.sh restore exited ${restore.exitCode}:\n${restoreText}`,
-    );
-  }
-  await artifacts.writeText("phase-5-restore-output.txt", restoreText);
-
-  progress.phase("validate restored workspace and memory");
-  let restoredFiles = 0;
-  const mismatches: Array<{ file: string; actual: string }> = [];
-  for (const file of WORKSPACE_FILES) {
-    const remotePath = path.posix.join(WORKSPACE_PATH, file);
-    const read = await sandbox.exec(
-      SANDBOX_NAME,
-      ["sh", "-c", 'cat "$1" 2>/dev/null', "sh", remotePath],
-      {
-        artifactName: `phase-6-read-${file}`,
-        env: sandboxAccessEnv(),
-        timeoutMs: 60_000,
-      },
-    );
-    const expected = `${markerContent}_${file}`;
-    if (read.exitCode === 0 && read.stdout.includes(expected)) {
-      restoredFiles += 1;
-    } else {
-      mismatches.push({ file, actual: resultText(read).slice(0, 200) });
-    }
-  }
-  await artifacts.writeJson("phase-6-files-restore-summary.json", {
-    restoredFiles,
-    expectedFiles: WORKSPACE_FILES.length,
-    mismatches,
-  });
-  expect(
-    restoredFiles,
-    "TC-STATE-01: FilesRestore — backup-workspace.sh must restore all 5 workspace files",
-  ).toBe(WORKSPACE_FILES.length);
-
-  const memoryRemotePath = path.posix.join(WORKSPACE_PATH, MEMORY_FILE);
-  const memoryProbe = await sandbox.exec(
-    SANDBOX_NAME,
+    assertExitZero(result, `restore fixture ${mode}`);
+    return JSON.parse(result.stdout);
+  };
+  const before = await hostFixture("list");
+  await hostFixture("quiesce", {}, 8 * 60_000);
+  const nativeInput = {
+    scenario,
+    stateRoot: "/sandbox/.openclaw",
+    readyPath: "/tmp/nemoclaw-post-upgrade-doctor-ready",
+    startupLog: "/tmp/nemoclaw-start.log",
+    marker,
+    fixture,
+  };
+  const prepare = await sandbox.exec(
+    sandboxName,
     [
-      "sh",
-      "-c",
-      'if [ -f "$1" ]; then printf "STATE=EXISTS\\n"; cat "$1"; else printf "STATE=MISSING\\n"; fi',
-      "sh",
-      memoryRemotePath,
+      "node",
+      "-e",
+      OPENCLAW_RESTORE_NATIVE_PROGRAM,
+      JSON.stringify({ ...nativeInput, mode: "prepare" }),
     ],
     {
-      artifactName: "phase-6-read-memory-directory-file",
-      env: sandboxAccessEnv(),
-      timeoutMs: 60_000,
+      artifactName: "state-backup-restore-native-fixture",
+      env,
+      redactionValues: redactions,
+      timeoutMs: bounded(60_000),
     },
   );
-  const memoryText = resultText(memoryProbe);
-  await artifacts.writeText("phase-6-memory-probe.txt", memoryText);
-  if (memoryText.includes("STATE=MISSING")) {
-    await artifacts.writeText("phase-6-restore-output-for-memory-missing.txt", restoreText);
-  }
-  expect(memoryText).toContain("STATE=EXISTS");
-  expect(memoryText).toContain(`${markerContent}_daily`);
-});
+  assertExitZero(prepare, "prepare native restore inputs under verified quiescence");
+
+  progress.phase("rebuild from the complete native-home backup");
+  const rebuild = await host.nemoclaw([sandboxName, "rebuild", "--yes", "--verbose"], {
+    artifactName: "state-backup-restore-rebuild",
+    env,
+    redactionValues: redactions,
+    timeoutMs: bounded(20 * 60_000),
+  });
+  const verifyBackup = async () => {
+    progress.phase("verify the exact original rebuild backup");
+    const backup = await hostFixture("backup", {
+      before,
+      refused: scenario === "retired-telegram",
+      files: Object.fromEntries([
+        ...Object.entries(scenario === "legacy" ? fixture.legacyFiles : fixture.refusedFiles).map(
+          ([name, bytes]) => [`.openclaw/${name}`, bytes],
+        ),
+        ...markerPaths.map((name) => [name.slice("/sandbox/".length), `${marker}\n`]),
+      ]),
+    });
+    await artifacts.writeJson("original-rebuild-backup.json", backup);
+  };
+  return {
+    sandboxName,
+    env,
+    redactions,
+    bounded,
+    nativeInput,
+    marker,
+    markerPaths,
+    rebuild,
+    hostFixture,
+    verifyBackup,
+  };
+}
+
+test(
+  "state-backup-restore: legacy native state migrates through the real rebuild",
+  restoreOptions,
+  async ({ artifacts, cleanup, host, progress, runtimeProvider, sandbox, secrets }) => {
+    const {
+      sandboxName,
+      env,
+      redactions,
+      bounded,
+      nativeInput,
+      marker,
+      markerPaths,
+      rebuild,
+      verifyBackup,
+    } = await rebuildFixture("legacy", {
+      artifacts,
+      cleanup,
+      host,
+      progress,
+      runtimeProvider,
+      sandbox,
+      secrets,
+    });
+    assertExitZero(rebuild, "rebuild from complete native-home legacy backup");
+    await verifyBackup();
+    progress.phase("verify native-home state and readiness");
+    const migrated = await sandbox.exec(
+      sandboxName,
+      [
+        "node",
+        "-e",
+        OPENCLAW_RESTORE_NATIVE_PROGRAM,
+        JSON.stringify({ ...nativeInput, mode: "verify" }),
+      ],
+      {
+        artifactName: "state-backup-restore-native-migration",
+        env,
+        redactionValues: redactions,
+        timeoutMs: bounded(60_000),
+      },
+    );
+    assertExitZero(migrated, "verify actual restored legacy migrations and canonical data");
+    await artifacts.writeJson("native-legacy-migration.json", JSON.parse(migrated.stdout));
+    const verify = await sandbox.execShell(
+      sandboxName,
+      trustedSandboxShellScript(
+        [
+          "set -eu",
+          `for target in ${markerPaths.map(shellQuote).join(" ")}; do test "$(cat "$target")" = ${shellQuote(marker)}; done`,
+          "attempt=0",
+          'while [ "$attempt" -lt 30 ]; do',
+          `  code="$(curl -q --noproxy '*' -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 http://127.0.0.1:${String(DASHBOARD_PORT)}/health 2>/dev/null || true)"`,
+          '  case "$code" in 200|401) break ;; esac',
+          "  attempt=$((attempt + 1))",
+          "  sleep 5",
+          "done",
+          'case "$code" in 200|401) ;; *) exit 1 ;; esac',
+          `printf '%s\\n' ${shellQuote(marker)}`,
+        ].join("\n"),
+      ),
+      {
+        artifactName: "state-backup-restore-verify",
+        env,
+        redactionValues: redactions,
+        timeoutMs: bounded(330_000),
+      },
+    );
+    expect(
+      verify.exitCode,
+      `verify complete native-home restore and readiness: ${resultText(verify)}`,
+    ).toBe(0);
+
+    await artifacts.target.complete({
+      id: "state-backup-restore",
+      status: "passed",
+      scenario: "legacy",
+      originalBackupPreserved: true,
+      stateRestored: true,
+      nativeReady: true,
+    });
+  },
+);
+
+test(
+  "state-backup-restore: retired Telegram state refuses startup and retains recovery",
+  restoreOptions,
+  async ({ artifacts, cleanup, host, progress, runtimeProvider, sandbox, secrets }) => {
+    const { rebuild, hostFixture, verifyBackup, sandboxName, env, redactions, bounded } =
+      await rebuildFixture("retired-telegram", {
+        artifacts,
+        cleanup,
+        host,
+        progress,
+        runtimeProvider,
+        sandbox,
+        secrets,
+      });
+    expect(rebuild.timedOut, resultText(rebuild)).toBe(false);
+    expect(rebuild.signal, resultText(rebuild)).toBeNull();
+    expect(rebuild.exitCode, resultText(rebuild)).toBe(1);
+    await verifyBackup();
+    progress.phase("verify native-home state and readiness");
+    // OpenShell diagnostic events do not contain entrypoint stderr. Read the
+    // retained native log from the exact runtime, including when it is stopped.
+    const resourceHandle = await runtimeProvider.resolveSandboxResourceHandle(sandboxName, {
+      artifactName: "state-backup-restore-refusal-container",
+      env,
+      redactionValues: redactions,
+      timeoutMs: bounded(30_000),
+    });
+    const copy = runtimeProvider.hostInvocation([
+      "cp",
+      `${resourceHandle}:/tmp/nemoclaw-start.log`,
+      "-",
+    ]);
+    const startup = await host.command(
+      "bash",
+      [
+        "-o",
+        "pipefail",
+        "-c",
+        'reader="$1"; shift; "$@" | python3 -I -c "$reader"',
+        "restore-refusal",
+        STOPPED_CONTAINER_STARTUP_LOG_READER,
+        copy.command,
+        ...copy.args,
+      ],
+      {
+        artifactName: "state-backup-restore-refusal-startup-log",
+        env,
+        redactionValues: redactions,
+        captureLimitBytes: 128 * 1024,
+        timeoutMs: bounded(30_000),
+      },
+    );
+    assertExitZero(startup, "read actual stopped entrypoint refusal evidence");
+    const { log: startupLog } = JSON.parse(startup.stdout) as { log: string };
+    const refusal = await hostFixture("refusal", { startupLog });
+    await artifacts.writeJson("native-retired-state-refusal.json", refusal);
+    await artifacts.target.complete({
+      id: "state-backup-restore",
+      status: "passed",
+      scenario: "retired-telegram",
+      migrationRefused: true,
+      originalBackupPreserved: true,
+    });
+  },
+);

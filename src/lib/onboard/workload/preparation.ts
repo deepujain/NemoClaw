@@ -2,8 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import fs from "node:fs";
+import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
+import { type OpenRegularFile, openRegularFileNoFollow } from "../../adapters/fs/regular-file";
+import { getAgentSandboxBaseImageEnvVar } from "../../agent/base-image-env";
+import { getBuildIdentity } from "../../core/version";
+import { CORPORATE_CA_EXPLICIT_ENV } from "../corporate-ca-policy";
+import { CorporateCaValidationError } from "../corporate-ca-types";
+import type { ToolDisclosure } from "../../tool-disclosure";
+import type { SandboxWorkloadReceipt } from "../../state/registry/types";
+import { cloneSandboxWorkloadReceipt } from "../../state/registry/workload";
+import {
+  prepareExternalImageWorkloadSource,
+  resolveExternalImageToolDisclosure,
+  type PrepareExternalImageDependencies,
+} from "./external-image";
 import {
   ManagedImageCatalogUnavailableError,
   normalizeManagedImageRelease,
@@ -16,6 +30,7 @@ import {
   type ManagedImageContractCatalog,
   type ManagedImageContractV1,
   type ManagedImagePlatform,
+  type ShippedManagedImageAgent,
   parseManagedImageContractV1,
   SHIPPED_MANAGED_IMAGE_AGENTS,
 } from "../managed-image/contract";
@@ -26,7 +41,38 @@ import {
   resolveSandboxWorkloadSource,
   type SandboxWorkloadRuntimeCapabilities,
   type SandboxWorkloadSource,
+  type ExternalImageWorkloadSource,
 } from "./source";
+
+export function prepareExternalImageForOnboardSource(
+  input: {
+    readonly reference: string;
+    readonly agentName: string;
+    readonly runtime: SandboxWorkloadRuntimeCapabilities;
+    readonly requestedToolDisclosure: ToolDisclosure | null;
+  },
+  dependencies: PrepareExternalImageDependencies,
+): {
+  readonly workload: ExternalImageWorkloadSource;
+  readonly toolDisclosure: ToolDisclosure;
+} {
+  const workload = prepareExternalImageWorkloadSource(input, dependencies);
+  return {
+    workload,
+    toolDisclosure: resolveExternalImageToolDisclosure(
+      workload.toolDisclosure,
+      input.requestedToolDisclosure,
+    ),
+  };
+}
+
+export function externalImageWorkloadMatches(
+  reference: string,
+  receipt: SandboxWorkloadReceipt | undefined,
+): boolean {
+  const cloned = cloneSandboxWorkloadReceipt(receipt);
+  return cloned?.kind === "external-image" && cloned.reference === reference;
+}
 
 type ResolveManagedImageCatalog = (options: {
   readonly release: string;
@@ -34,17 +80,25 @@ type ResolveManagedImageCatalog = (options: {
   readonly revision?: string;
 }) => Promise<ManagedImageContractCatalog>;
 
+const EXACT_SOURCE_REVISION_PATTERN = /^[0-9a-f]{40}$/u;
+const SOURCE_REVISION_REF_PATTERN = /^[0-9A-Fa-f]{39,64}$/u;
+
 export interface PrepareSandboxWorkloadSourceInput {
   readonly agentName: string;
   readonly legacyDockerfilePath: string;
   readonly customDockerfilePath?: string | null;
+  readonly preparedExternalImage?: ExternalImageWorkloadSource | null;
   readonly runtime: SandboxWorkloadRuntimeCapabilities;
   readonly version: string;
   readonly policy?: ManagedImageSelectionPolicy;
+  readonly catalog?: ManagedImageContractCatalog | null;
   readonly catalogPath?: string | null;
+  readonly expectedCatalogRevision?: string | null;
   readonly catalogRevision?: string | null;
   /** Contract from the repository-accepted candidate qualification receipt. */
   readonly acceptedCandidateContract?: ManagedImageContractV1 | null;
+  /** Effective environment captured by the lifecycle authority. */
+  readonly environment?: NodeJS.ProcessEnv;
 }
 
 export function liveE2eManagedImageRevision(environment: NodeJS.ProcessEnv): string | null {
@@ -53,25 +107,139 @@ export function liveE2eManagedImageRevision(environment: NodeJS.ProcessEnv): str
   return revision ? revision : null;
 }
 
-function readExactManagedImageCatalog(catalogPath: string): ManagedImageContractCatalog {
-  let descriptor: number | null = null;
+function hasMatchingReleaseStamp(rootDir: string, version: string): boolean {
+  let stampedVersion: string;
   try {
-    descriptor = fs.openSync(catalogPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-    const metadata = fs.fstatSync(descriptor);
-    const pathMetadata = fs.lstatSync(catalogPath);
-    if (
-      pathMetadata.isSymbolicLink() ||
-      !metadata.isFile() ||
-      metadata.dev !== pathMetadata.dev ||
-      metadata.ino !== pathMetadata.ino ||
-      metadata.size < 2 ||
-      metadata.size > 64 * 1024
-    ) {
+    stampedVersion = fs.readFileSync(path.join(rootDir, ".version"), "utf8").trim();
+  } catch {
+    return false;
+  }
+  if (!stampedVersion) return false;
+  try {
+    return normalizeManagedImageRelease(stampedVersion) === normalizeManagedImageRelease(version);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Select the installed source revision for an untagged or exact-SHA install.
+ * Tagged release installs retain the release catalog alias written by the
+ * installer. The build identity, not the caller-provided ref, remains the
+ * source of revision authority.
+ */
+export function installedManagedImageCatalogRevision(
+  environment: NodeJS.ProcessEnv,
+  rootDir: string,
+): string | null {
+  const identity = getBuildIdentity({ rootDir });
+  const installRef = environment.NEMOCLAW_INSTALL_REF?.trim() ?? "";
+  if (EXACT_SOURCE_REVISION_PATTERN.test(installRef)) {
+    if (installRef !== identity.sourceRevision) {
+      throw new SandboxWorkloadPreparationError(
+        "the exact install ref does not match the installed build identity",
+      );
+    }
+    return identity.sourceRevision;
+  }
+  if (SOURCE_REVISION_REF_PATTERN.test(installRef)) {
+    throw new SandboxWorkloadPreparationError(
+      "the exact install ref is not a supported lowercase 40-character source revision",
+    );
+  }
+
+  if (hasMatchingReleaseStamp(rootDir, identity.nemoclawVersion)) return null;
+  if (!EXACT_SOURCE_REVISION_PATTERN.test(identity.sourceRevision)) {
+    throw new SandboxWorkloadPreparationError(
+      "the installed build identity does not contain an exact managed-image source revision",
+    );
+  }
+
+  return identity.sourceRevision;
+}
+
+export type LiveE2eManagedImageCatalog =
+  | {
+      readonly catalog: ManagedImageContractCatalog;
+      readonly path?: never;
+      readonly revision: string;
+    }
+  | { readonly catalog?: never; readonly path: string; readonly revision: string };
+
+function parseInlineManagedImageCatalog(value: string): ManagedImageContractCatalog {
+  const size = Buffer.byteLength(value, "utf8");
+  if (size < 2 || size > 64 * 1024) {
+    throw new SandboxWorkloadPreparationError(
+      "the live E2E managed-image catalog must be bounded JSON",
+    );
+  }
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error();
+    return parsed as ManagedImageContractCatalog;
+  } catch {
+    throw new SandboxWorkloadPreparationError(
+      "the live E2E managed-image catalog must be bounded JSON",
+    );
+  }
+}
+
+/** Select the trusted PR catalog only for an exact live E2E candidate. */
+export function liveE2eManagedImageCatalog(
+  environment: NodeJS.ProcessEnv,
+): LiveE2eManagedImageCatalog | null {
+  if (environment.GITHUB_ACTIONS !== "true" || environment.NEMOCLAW_RUN_LIVE_E2E !== "1") {
+    return null;
+  }
+  const inlineCatalog = environment.NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG_JSON?.trim();
+  const configuredPath = environment.NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG?.trim();
+  const workspace = environment.GITHUB_WORKSPACE?.trim();
+  const catalogPath =
+    configuredPath ||
+    (workspace ? path.join(workspace, "dist", "e2e-managed-image-catalog.json") : "");
+  if (inlineCatalog && configuredPath) {
+    throw new SandboxWorkloadPreparationError(
+      "the live E2E managed-image catalog has conflicting authorities",
+    );
+  }
+  if (inlineCatalog) {
+    const catalog = parseInlineManagedImageCatalog(inlineCatalog);
+    const { revision } = requireCompleteManagedImageCatalog(catalog, null, null, null);
+    return { catalog, revision };
+  }
+  if (!catalogPath) return null;
+  try {
+    fs.lstatSync(catalogPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new SandboxWorkloadPreparationError(
+      "the live E2E managed-image catalog path could not be inspected",
+      { cause: error },
+    );
+  }
+  const revision =
+    environment.NEMOCLAW_E2E_MANAGED_IMAGE_REVISION?.trim() ??
+    environment.NEMOCLAW_E2E_EXPECTED_SHA?.trim() ??
+    "";
+  if (!/^[0-9a-f]{40}$/u.test(revision)) {
+    throw new SandboxWorkloadPreparationError(
+      "the live E2E managed-image catalog requires an exact publication revision",
+    );
+  }
+  return { path: catalogPath, revision };
+}
+
+function readExactManagedImageCatalog(catalogPath: string): ManagedImageContractCatalog {
+  let catalog: OpenRegularFile | null = null;
+  try {
+    catalog = openRegularFileNoFollow(catalogPath);
+    const metadata = catalog.stat();
+    if (metadata.size < 2 || metadata.size > 64 * 1024) {
       throw new SandboxWorkloadPreparationError(
         "managed image catalog file must be a bounded regular file",
       );
     }
-    const parsed: unknown = JSON.parse(fs.readFileSync(descriptor, "utf8"));
+    const parsed: unknown = JSON.parse(catalog.readBytes(64 * 1024).toString("utf8"));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       throw new SandboxWorkloadPreparationError(
         "managed image catalog file must contain an object",
@@ -89,7 +257,7 @@ function readExactManagedImageCatalog(catalogPath: string): ManagedImageContract
       cause: error,
     });
   } finally {
-    if (descriptor !== null) fs.closeSync(descriptor);
+    catalog?.close();
   }
 }
 
@@ -114,9 +282,28 @@ export class SandboxWorkloadPreparationError extends Error {
   }
 }
 
+export function rejectManagedWorkloadBaseImageOverride(
+  agentName: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): void {
+  const overrideEnvVar = getAgentSandboxBaseImageEnvVar(agentName);
+  if (!environment[overrideEnvVar]?.trim()) return;
+  throw new SandboxWorkloadPreparationError(
+    `'${overrideEnvVar}' is set, but the managed image workload for '${agentName}' installs an exact, pre-verified digest and does not consult this override. Use a legacy Dockerfile workload when it is supported; otherwise unset '${overrideEnvVar}' to use the managed image.`,
+  );
+}
+
 function diagnostic(error: unknown): string {
   if (error instanceof Error) return error.message;
   return "managed image catalog resolution failed";
+}
+
+function rejectedCorporateCa(error: unknown): CorporateCaValidationError | null {
+  if (error instanceof CorporateCaValidationError) return error;
+  if (error instanceof Error && error.cause instanceof CorporateCaValidationError) {
+    return error.cause;
+  }
+  return null;
 }
 
 function unavailableResult(
@@ -144,11 +331,19 @@ function unavailableResult(
 
 function requireCompleteManagedImageCatalog(
   catalog: ManagedImageContractCatalog,
-  expectedRelease: string,
-  expectedPlatform: ManagedImagePlatform,
-): void {
+  expectedRelease: string | null,
+  expectedPlatform: ManagedImagePlatform | null,
+  expectedRevision: string | null,
+): {
+  readonly contracts: ReadonlyMap<ShippedManagedImageAgent, ManagedImageContractV1>;
+  readonly release: string;
+  readonly revision: string;
+} {
+  const contracts = new Map<ShippedManagedImageAgent, ManagedImageContractV1>();
   let cohortRevision: string | null = null;
+  let cohortRelease: string | null = null;
   let publicationCohort: string | null = null;
+  let cohortPlatform = expectedPlatform;
   for (const agent of SHIPPED_MANAGED_IMAGE_AGENTS) {
     const candidate = catalog[agent];
     if (candidate === undefined) {
@@ -157,10 +352,21 @@ function requireCompleteManagedImageCatalog(
       );
     }
     try {
-      const contract = parseManagedImageContractV1(candidate, agent, expectedPlatform);
-      if (contract.source.release !== expectedRelease) {
+      const contract = parseManagedImageContractV1(candidate, agent, cohortPlatform ?? undefined);
+      cohortPlatform ??= contract.platform;
+      if (
+        expectedRevision === null &&
+        expectedRelease !== null &&
+        contract.source.release !== expectedRelease
+      ) {
         throw new SandboxWorkloadPreparationError(
           `managed image catalog contract for '${agent}' belongs to '${contract.source.release}', not '${expectedRelease}'`,
+        );
+      }
+      cohortRelease ??= contract.source.release;
+      if (contract.source.release !== cohortRelease) {
+        throw new SandboxWorkloadPreparationError(
+          "managed image catalog does not identify one all-agent release",
         );
       }
       cohortRevision ??= contract.source.revision;
@@ -175,6 +381,7 @@ function requireCompleteManagedImageCatalog(
           "managed image catalog does not identify one all-agent publication cohort",
         );
       }
+      contracts.set(agent, contract);
     } catch (error) {
       if (error instanceof SandboxWorkloadPreparationError) throw error;
       throw new SandboxWorkloadPreparationError(
@@ -183,6 +390,28 @@ function requireCompleteManagedImageCatalog(
       );
     }
   }
+  if (expectedRevision !== null && cohortRevision !== expectedRevision) {
+    throw new SandboxWorkloadPreparationError(
+      "managed image catalog source revision does not match the trusted catalog revision",
+    );
+  }
+  return { contracts, release: cohortRelease!, revision: cohortRevision! };
+}
+
+/** Read and validate every contract in one selected live E2E catalog. */
+export function readLiveE2eManagedImageCatalogContracts(
+  selected: LiveE2eManagedImageCatalog,
+): ReadonlyMap<ShippedManagedImageAgent, ManagedImageContractV1> {
+  const catalog = selected.catalog ?? readExactManagedImageCatalog(selected.path);
+  if (
+    JSON.stringify(Object.keys(catalog).sort()) !==
+    JSON.stringify([...SHIPPED_MANAGED_IMAGE_AGENTS].sort())
+  ) {
+    throw new SandboxWorkloadPreparationError(
+      "managed image catalog must contain only the shipped agent contracts",
+    );
+  }
+  return requireCompleteManagedImageCatalog(catalog, null, null, selected.revision).contracts;
 }
 
 function requireCandidateManagedImageCatalog(
@@ -234,6 +463,21 @@ export async function prepareSandboxWorkloadSource(
   input: PrepareSandboxWorkloadSourceInput,
   dependencies: PrepareSandboxWorkloadSourceDependencies = {},
 ): Promise<PreparedSandboxWorkloadSource> {
+  if (input.preparedExternalImage) {
+    if (input.customDockerfilePath) {
+      throw new SandboxWorkloadPreparationError(
+        "a custom Dockerfile and a user-supplied image cannot both own workload selection",
+      );
+    }
+    if (input.preparedExternalImage.kind !== "external-image") {
+      throw new SandboxWorkloadPreparationError("the prepared external image is invalid");
+    }
+    return {
+      source: input.preparedExternalImage,
+      release: null,
+      fallbackDiagnostic: null,
+    };
+  }
   const policy = input.policy ?? input.runtime.managedImageSelectionPolicy;
   const acceptedCandidateContract = isCandidateManagedImageAgent(input.agentName)
     ? (input.acceptedCandidateContract ?? null)
@@ -259,10 +503,40 @@ export async function prepareSandboxWorkloadSource(
       fallbackDiagnostic: null,
     };
   }
-
-  if (candidateSelection && !input.catalogPath) {
+  // Past this point onboarding is committed to a managed-image workload, which
+  // installs an exact, pre-verified digest and never reads a base-image
+  // override. Silently ignoring an operator-supplied override would accept it
+  // without ever resolving it to a trusted digest (#11138). The check runs
+  // before catalog resolution so a catalog outage cannot turn the rejection
+  // into a legacy Dockerfile build that consumes the override instead.
+  // Every managed workload rejects an override before catalog resolution.
+  // Legacy Dockerfile selection returns above and retains its base-image preflight.
+  rejectManagedWorkloadBaseImageOverride(input.agentName, input.environment);
+  if (input.catalog && input.catalogPath) {
     throw new SandboxWorkloadPreparationError(
-      `'${input.agentName}' is a release candidate and requires an exact managed image catalog file`,
+      "managed image catalog has conflicting content authorities",
+    );
+  }
+
+  if (candidateSelection && !input.catalog && !input.catalogPath) {
+    throw new SandboxWorkloadPreparationError(
+      `'${input.agentName}' is a release candidate and requires an exact managed image catalog`,
+    );
+  }
+
+  const trustedCatalogRevision = input.expectedCatalogRevision ?? input.catalogRevision ?? null;
+  if (
+    input.expectedCatalogRevision &&
+    input.catalogRevision &&
+    input.expectedCatalogRevision !== input.catalogRevision
+  ) {
+    throw new SandboxWorkloadPreparationError(
+      "managed image catalog has conflicting trusted revision authorities",
+    );
+  }
+  if (trustedCatalogRevision !== null && !/^[0-9a-f]{40}$/u.test(trustedCatalogRevision)) {
+    throw new SandboxWorkloadPreparationError(
+      "managed image catalog trusted revision must be a lowercase 40-character SHA",
     );
   }
 
@@ -284,16 +558,30 @@ export async function prepareSandboxWorkloadSource(
     );
   }
   try {
-    catalog = input.catalogPath
-      ? readExactManagedImageCatalog(input.catalogPath)
-      : await (
-          dependencies.resolveCatalog ?? ((options) => resolveManagedImageCatalogFromGhcr(options))
-        )({
-          release,
-          platform,
-          ...(input.catalogRevision ? { revision: input.catalogRevision } : {}),
-        });
+    catalog = input.catalog
+      ? input.catalog
+      : input.catalogPath
+        ? readExactManagedImageCatalog(input.catalogPath)
+        : await (
+            dependencies.resolveCatalog ??
+            ((options) =>
+              resolveManagedImageCatalogFromGhcr({
+                ...options,
+                ...(input.environment === undefined ? {} : { environment: input.environment }),
+              }))
+          )({
+            release,
+            platform,
+            ...(input.catalogRevision ? { revision: input.catalogRevision } : {}),
+          });
   } catch (error) {
+    const corporateCaError = rejectedCorporateCa(error);
+    if (corporateCaError) {
+      throw new SandboxWorkloadPreparationError(
+        `${CORPORATE_CA_EXPLICIT_ENV} was rejected: ${corporateCaError.reason}`,
+        { cause: error },
+      );
+    }
     if (!(error instanceof ManagedImageCatalogUnavailableError)) {
       throw new SandboxWorkloadPreparationError(
         `managed image catalog '${release}' failed validation`,
@@ -313,7 +601,13 @@ export async function prepareSandboxWorkloadSource(
       acceptedCandidateContract,
     );
   } else {
-    requireCompleteManagedImageCatalog(catalog, release, platform);
+    const catalogIdentity = requireCompleteManagedImageCatalog(
+      catalog,
+      release,
+      platform,
+      trustedCatalogRevision,
+    );
+    release = catalogIdentity.release;
   }
 
   return {

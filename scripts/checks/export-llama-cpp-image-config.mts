@@ -19,7 +19,6 @@ type ServerImageManifest = {
   apiVersion?: unknown;
   kind?: unknown;
   metadata?: {
-    annotations?: { "nemoclaw.nvidia.com/request-guard-state"?: unknown };
     id?: unknown;
   };
   spec?: {
@@ -59,7 +58,6 @@ type ServerImageManifest = {
         probes?: unknown;
         profile?: unknown;
         recipeRef?: unknown;
-        requestGuard?: unknown;
         required?: unknown;
         runner?: unknown;
       };
@@ -114,7 +112,6 @@ type LlamaCppQualificationRecipe = {
       image: string;
       imageDownloadSizeBytes: number;
       platforms: string[];
-      containerRuntime: string;
       networkExposure: string;
       restartPolicy: string;
       hosts: number;
@@ -137,13 +134,8 @@ type LlamaCppQualificationRecipe = {
       kvCache: { key: string; value: string };
       speculativeDecoding: string;
       limits: {
-        maxRequestBodyBytes: number;
-        maxRequestHeaderBytes: number;
-        maxOutputTokens: number;
         requestTimeoutSeconds: number;
-        shutdownTimeoutSeconds: number;
       };
-      requestGuard: { upstreamPort: number };
     };
     readiness: {
       contractRef: string;
@@ -168,6 +160,7 @@ const recipePath = path.join(
   "recipes",
   "llama-cpp.nemotron-3-nano-30b-a3b.spark-single.v1.yaml",
 );
+const modelSchemaPath = path.join(repoRoot, "managed-inference", "schemas", "model.schema.json");
 const recipeSchemaPath = path.join(repoRoot, "managed-inference", "schemas", "recipe.schema.json");
 
 const nvidiaCudaDigestReference = /^docker\.io\/nvidia\/cuda@sha256:[0-9a-f]{64}$/u;
@@ -243,7 +236,9 @@ function parseQualificationRecipe(
   }
   const value = document.toJS({ maxAliasCount: 0 }) as unknown;
   const schema = JSON.parse(schemaSource) as object;
-  const validate = new Ajv2020({ allErrors: true, strict: true }).compile(schema);
+  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  ajv.addSchema(JSON.parse(fs.readFileSync(modelSchemaPath, "utf8")) as object);
+  const validate = ajv.compile(schema);
   if (!validate(value)) {
     const details = (validate.errors ?? [])
       .map((error) => `${error.instancePath || "/"} ${error.message ?? "is invalid"}`)
@@ -305,10 +300,7 @@ export function loadLlamaCppImageConfig(
   const recipe = parseQualificationRecipe(recipeSource, recipeSchemaSource);
   const agentQualification = parseAgentQualificationDocument(agentQualificationSource);
   assertExactKeys(manifest, "manifest", ["apiVersion", "kind", "metadata", "spec"]);
-  assertExactKeys(manifest.metadata, "metadata", ["annotations", "id"]);
-  assertExactKeys(manifest.metadata?.annotations, "metadata annotations", [
-    "nemoclaw.nvidia.com/request-guard-state",
-  ]);
+  assertExactKeys(manifest.metadata, "metadata", ["id"]);
   assertExactKeys(manifest.spec, "spec", [
     "build",
     "cuda",
@@ -387,7 +379,6 @@ export function loadLlamaCppImageConfig(
     "probes",
     "profile",
     "recipeRef",
-    "requestGuard",
     "required",
     "runner",
   ]);
@@ -404,8 +395,7 @@ export function loadLlamaCppImageConfig(
   if (
     manifest?.apiVersion !== "nemoclaw.nvidia.com/managed-inference/v1" ||
     manifest?.kind !== "ServerImageBuild" ||
-    manifest?.metadata?.id !== "llama-cpp-server.v1" ||
-    manifest?.metadata?.annotations?.["nemoclaw.nvidia.com/request-guard-state"] !== "dormant"
+    manifest?.metadata?.id !== "llama-cpp-server.v1"
   ) {
     throw new Error("invalid llama.cpp server image manifest identity");
   }
@@ -432,11 +422,6 @@ export function loadLlamaCppImageConfig(
     qualification?.recipeRef,
     "qualification recipe reference",
     /^llama-cpp\.nemotron-3-nano-30b-a3b\.spark-single\.v1$/u,
-  );
-  const qualificationRequestGuard = requiredString(
-    qualification?.requestGuard,
-    "qualification request guard",
-    /^required$/u,
   );
   const qualificationModel = qualification?.model as
     | { digest?: unknown; hostPath?: unknown; id?: unknown }
@@ -516,7 +501,6 @@ export function loadLlamaCppImageConfig(
     recipe.spec.server.source.revision !== spec?.source?.revision ||
     recipe.spec.model.files.length !== 1 ||
     recipeModelFile?.format !== "gguf" ||
-    recipe.spec.runtime.containerRuntime !== "docker" ||
     recipe.spec.runtime.networkExposure !== "loopback" ||
     recipe.spec.runtime.hosts !== 1 ||
     !recipe.spec.runtime.platforms.includes("linux/arm64") ||
@@ -600,7 +584,6 @@ export function loadLlamaCppImageConfig(
     probes: qualification?.probes,
     profile: qualification?.profile,
     recipeRef: qualificationRecipeRef,
-    requestGuard: qualificationRequestGuard,
     required: qualification?.required,
     runner: qualificationRunner,
   };
@@ -623,14 +606,13 @@ export function loadLlamaCppImageConfig(
   };
   const expectedBuildPackages = {
     "build-essential": "12.10ubuntu1",
-    "ca-certificates": "20260601~24.04.1",
+    "ca-certificates": "20260816ubuntu0.24.04.1",
     cmake: "3.28.3-1build7",
-    curl: "8.5.0-2ubuntu10.11",
+    curl: "8.5.0-2ubuntu10.16",
     "g++-14": "14.2.0-4ubuntu2~24.04.1",
     "gcc-14": "14.2.0-4ubuntu2~24.04.1",
-    "golang-go": "2:1.22~2build1",
-    "libcurl4-openssl-dev": "8.5.0-2ubuntu10.11",
-    "libssl-dev": "3.0.13-0ubuntu3.12",
+    "libcurl4-openssl-dev": "8.5.0-2ubuntu10.16",
+    "libssl-dev": "3.0.13-0ubuntu3.16",
   };
   const expectedCompiler = {
     c: "gcc-14",
@@ -638,15 +620,16 @@ export function loadLlamaCppImageConfig(
     cxx: "g++-14",
   };
   const expectedRuntimePackages = {
-    "ca-certificates": "20260601~24.04.1",
-    libcurl4t64: "8.5.0-2ubuntu10.11",
+    "ca-certificates": "20260816ubuntu0.24.04.1",
+    curl: "8.5.0-2ubuntu10.16",
+    libcurl4t64: "8.5.0-2ubuntu10.16",
     libgomp1: "14.2.0-4ubuntu2~24.04.1",
+    libssl3t64: "3.0.13-0ubuntu3.16",
   };
   const expectedRequiredPaths = [
     "/opt/llama.cpp/lib/libggml-cuda.so",
+    "/usr/bin/curl",
     "/usr/local/bin/llama-server",
-    "/usr/local/bin/nemoclaw-llama-cpp-request-guard",
-    "/usr/local/share/licenses/go/copyright",
     "/usr/local/share/licenses/llama.cpp/AUTHORS",
     "/usr/local/share/licenses/llama.cpp/LICENSE",
   ];
@@ -695,8 +678,9 @@ export function loadLlamaCppImageConfig(
       `CUDA architectures for ${platform}`,
       /^[0-9]+[a-z]?(?:-real)?(?:;[0-9]+[a-z]?(?:-real)?)*$/u,
     );
+    const arch = platform.slice("linux/".length) as "amd64" | "arm64";
     return {
-      arch: platform.slice("linux/".length),
+      arch,
       cuda_architectures: cudaArchitectures,
       platform,
       runner: expectedRunner,
@@ -738,7 +722,6 @@ export function loadLlamaCppImageConfig(
       agentQualification,
       probeBounds: qualification?.probeBounds,
       probes: qualification?.probes,
-      requestGuard: qualificationRequestGuard,
     },
     recipe: {
       capabilities: recipe.spec.capabilities,

@@ -50,7 +50,7 @@ describe("Google Chat template resolver", () => {
     ).toBe("000000000000000000000");
   });
 
-  it("normalizes the DM allowlist into nested dm.policy / dm.allowFrom", () => {
+  it("normalizes the DM allowlist for top-level dmPolicy / allowFrom", () => {
     const withIds: SandboxMessagingInputReference[] = [
       configInput("allowFrom", "allowedIds.googlechat", "users/111, user@example.com"),
     ];
@@ -63,7 +63,7 @@ describe("Google Chat template resolver", () => {
         ?.value,
     ).toEqual(["users/111", "user@example.com"]);
 
-    // No allowlist → both undefined so the whole `dm` object drops out.
+    // No allowlist → both top-level policy fields drop out.
     const noIds: SandboxMessagingInputReference[] = [];
     expect(
       resolveGooglechatTemplateReference("allowedIds.googlechat.dmPolicy", { inputs: noIds })
@@ -71,6 +71,42 @@ describe("Google Chat template resolver", () => {
     ).toBeUndefined();
     expect(
       resolveGooglechatTemplateReference("allowedIds.googlechat.values", { inputs: noIds })?.value,
+    ).toBeUndefined();
+  });
+
+  it("resolves the Hermes pull config + CSV allowlist; drops each when unset", () => {
+    const set: SandboxMessagingInputReference[] = [
+      configInput("projectId", "googlechatConfig.projectId", "nemoclaw-project-500901"),
+      configInput(
+        "subscriptionName",
+        "googlechatConfig.subscriptionName",
+        "projects/nemoclaw-project-500901/subscriptions/hermes-chat-events-sub",
+      ),
+      configInput("allowFrom", "allowedIds.googlechat", "users/111, users/222"),
+    ];
+    expect(
+      resolveGooglechatTemplateReference("googlechatConfig.projectId", { inputs: set })?.value,
+    ).toBe("nemoclaw-project-500901");
+    expect(
+      resolveGooglechatTemplateReference("googlechatConfig.subscriptionName", { inputs: set })
+        ?.value,
+    ).toBe("projects/nemoclaw-project-500901/subscriptions/hermes-chat-events-sub");
+    expect(
+      resolveGooglechatTemplateReference("allowedIds.googlechat.csv", { inputs: set })?.value,
+    ).toBe("users/111,users/222");
+
+    // Unset → undefined so the render engine drops the env line (no literal
+    // "{{...}}" leaks into ~/.hermes/.env).
+    const empty: SandboxMessagingInputReference[] = [];
+    expect(
+      resolveGooglechatTemplateReference("googlechatConfig.projectId", { inputs: empty })?.value,
+    ).toBeUndefined();
+    expect(
+      resolveGooglechatTemplateReference("googlechatConfig.subscriptionName", { inputs: empty })
+        ?.value,
+    ).toBeUndefined();
+    expect(
+      resolveGooglechatTemplateReference("allowedIds.googlechat.csv", { inputs: empty })?.value,
     ).toBeUndefined();
   });
 

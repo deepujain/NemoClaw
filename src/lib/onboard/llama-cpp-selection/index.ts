@@ -9,6 +9,7 @@ import {
   type LlamaCppAttachmentResult,
 } from "../../inference/llama-cpp";
 import type { SetupNimSelectionResult, SetupNimSelectionState } from "../setup-nim-flow";
+import { applyDetectedEndpointContextWindow } from "../../inference/compatible-endpoint-context";
 
 type CredentialNavigation = string | Readonly<{ kind: string }>;
 
@@ -19,7 +20,7 @@ export interface LlamaCppSelectionDeps {
   returningToProviderSelection(result: unknown): boolean;
   probeLlamaCppAttachment(
     apiKey: string,
-    options: { requestedModel?: string | null },
+    options: { requestedModel?: string | null; managedRuntime?: true },
   ): LlamaCppAttachmentResult;
   validateOpenAiLikeSelection(
     label: string,
@@ -46,11 +47,13 @@ export function createLlamaCppSelectionHandler(
   state: SetupNimSelectionState,
   requestedModel: string | null,
   recoveredModel: string | null,
+  managedRuntime?: true,
 ) => Promise<SetupNimSelectionResult> {
-  return async function handleLlamaCppSelection(
+  return /** Validate server identity and inference before applying the selected model and context. */ async function handleLlamaCppSelection(
     state,
     requestedModel,
     recoveredModel,
+    managedRuntime,
   ): Promise<SetupNimSelectionResult> {
     let apiKey = deps.resolveCredential(LLAMA_CPP_CREDENTIAL_ENV);
     if (!apiKey && deps.isNonInteractive()) {
@@ -80,6 +83,7 @@ export function createLlamaCppSelectionHandler(
     const constrainedModel = typeof state.model === "string" ? state.model : null;
     const attachment = deps.probeLlamaCppAttachment(apiKey, {
       requestedModel: constrainedModel,
+      ...(managedRuntime ? { managedRuntime } : {}),
     });
     if (!attachment.ok) {
       deps.error(`  ${attachment.message}`);
@@ -108,6 +112,7 @@ export function createLlamaCppSelectionHandler(
     }
     state.preferredInferenceApi = "openai-completions";
     deps.log(`  Attached Local llama.cpp with served model alias: ${attachment.model}`);
+    applyDetectedEndpointContextWindow(attachment.contextWindow);
     return "selected";
   };
 }

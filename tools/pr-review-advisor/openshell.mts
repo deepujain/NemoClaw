@@ -8,15 +8,16 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { getDiff } from "../advisors/git.mts";
 import { ADVISOR_OPENSHELL_INFERENCE_BASE_URL } from "../advisors/provider-constants.mts";
 import {
-  configureOpenShellInference,
+  startOwnedOpenShellInference,
+  type OwnedOpenShellInference,
   createOpenShellSandbox,
-  credentialFreeEnvironment,
   defaultOpenShellTools,
   deleteOpenShellSandbox,
   downloadOpenShellPath,
-  execOpenShellSandbox,
+  execOpenShellSandboxAsync,
   type OpenShellTools,
   required,
 } from "../openshell-agent/runtime.mts";
@@ -25,6 +26,11 @@ import {
   type GitHubReviewContext,
   serializePreparedGitHubContext,
 } from "./github-context.mts";
+import {
+  SPECIALIST_FOLLOW_UP_DIFF_FILE_NAME,
+  writeSpecialistDiff,
+  writeSpecialistFollowUpDiff,
+} from "./specialist-context.mts";
 
 const ADVISOR_CONTEXT_DIRECTORY_NAME = "pr-review-advisor-context";
 const ADVISOR_RUNTIME_DIRECTORY_NAME = "pr-review-advisor-runtime";
@@ -34,6 +40,7 @@ const REPOSITORY_BOUNDARY_PROOF_DIRECTORY = `.git/${ADVISOR_BOUNDARY_PROOF_DIREC
 const ADVISOR_BOUNDARY_PROOF_SOURCE_NAME = "source";
 const ADVISOR_BOUNDARY_PROOF_TARGET_NAME = "target";
 const ADVISOR_CONTEXT_FILE_NAME = "github-context.json";
+const ADVISOR_SPECIALIST_CONTEXT_DIRECTORY_NAME = "specialist";
 const SANDBOX_ADVISOR_DIR = "/advisor";
 const SANDBOX_WORKDIR = "/pr-workdir";
 const SANDBOX_GIT_DIR = `${SANDBOX_WORKDIR}/.git`;
@@ -41,11 +48,10 @@ const SANDBOX_CONTEXT_DIR = `/${ADVISOR_CONTEXT_DIRECTORY_NAME}`;
 const SANDBOX_RUNTIME_DIR = `/sandbox/${ADVISOR_RUNTIME_DIRECTORY_NAME}`;
 const SANDBOX_TOOLS_DIR = `/${ADVISOR_TOOLS_DIRECTORY_NAME}`;
 const SANDBOX_CONTEXT_PATH = `${SANDBOX_CONTEXT_DIR}/${ADVISOR_CONTEXT_FILE_NAME}`;
+const SANDBOX_SPECIALIST_CONTEXT_DIR = `${SANDBOX_CONTEXT_DIR}/${ADVISOR_SPECIALIST_CONTEXT_DIRECTORY_NAME}`;
 const ADVISOR_RUNTIME_TMPFS_BYTES = 512 * 1024 * 1024;
 const SANDBOX_API_KEY = "unused";
 const DEFAULT_SANDBOX_TIMEOUT_SECONDS = 2100;
-const DEFAULT_UNAVAILABLE_REASON =
-  "OpenShell inference configuration failed or the advisor credential is unavailable";
 const EXPECTED_WRITE_DENIAL_CODES = new Set(["EACCES", "EPERM", "EROFS"]);
 
 type PrepareAdvisorSandboxOptions = {
@@ -79,7 +85,7 @@ function createBoundaryProof(directory: string, relativeProofDirectory: string):
   fs.chmodSync(proofDirectory, 0o777);
 }
 
-function writeExclusive(file: string, content: string): void {
+export function writeExclusive(file: string, content: string): void {
   const fd = fs.openSync(
     file,
     fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
@@ -102,6 +108,34 @@ function resolveExecutable(name: string, env: NodeJS.ProcessEnv): string {
     env,
     stdio: ["ignore", "pipe", "inherit"],
   }).trim();
+}
+
+function usableFollowUpContext(
+  context: GitHubReviewContext | null,
+  workdir: string,
+  headRef: string,
+): GitHubReviewContext | null {
+  const reviewedHeadSha = context?.followUpReview?.reviewedHeadSha;
+  if (!reviewedHeadSha) return context;
+  const headSha = execFileSync("git", ["rev-parse", headRef], {
+    cwd: workdir,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+  if (!/^[0-9a-f]{40}$/u.test(reviewedHeadSha) || reviewedHeadSha === headSha) {
+    const { followUpReview: _discarded, ...initialContext } = context;
+    return initialContext;
+  }
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", reviewedHeadSha, headRef], {
+      cwd: workdir,
+      stdio: "ignore",
+    });
+    return context;
+  } catch {
+    const { followUpReview: _discarded, ...initialContext } = context;
+    return initialContext;
+  }
 }
 
 function copyExecutable(source: string, destination: string): void {
@@ -203,13 +237,33 @@ export async function prepareAdvisorSandboxInputs(
   resetDirectory(toolsDirectory);
 
   const contextEnv = { ...env };
-  delete contextEnv.PR_REVIEW_ADVISOR_GITHUB_CONTEXT_PATH;
-  const context = await (options.collectContext ?? collectGitHubReviewContext)(contextEnv);
+  if (options.collectContext) delete contextEnv.PR_REVIEW_ADVISOR_GITHUB_CONTEXT_PATH;
+  const rawContext = await (options.collectContext ?? collectGitHubReviewContext)(contextEnv);
+  const headRef = env.PR_REVIEW_ADVISOR_INTEREST ? required(env.HEAD_REF, "HEAD_REF") : "HEAD";
+  const context = usableFollowUpContext(rawContext, advisorWorkdir, headRef);
   writeExclusive(
     path.join(contextDirectory, ADVISOR_CONTEXT_FILE_NAME),
     serializePreparedGitHubContext(context),
   );
   fs.chmodSync(path.join(contextDirectory, ADVISOR_CONTEXT_FILE_NAME), 0o444);
+  if (env.PR_REVIEW_ADVISOR_INTEREST) {
+    const baseRef = required(env.BASE_REF, "BASE_REF");
+    const specialistDirectory = path.join(
+      contextDirectory,
+      ADVISOR_SPECIALIST_CONTEXT_DIRECTORY_NAME,
+    );
+    const diff = getDiff(baseRef, headRef, advisorWorkdir);
+    writeSpecialistDiff(specialistDirectory, diff);
+    if (context?.followUpReview) {
+      const followUpDiff = getDiff(context.followUpReview.reviewedHeadSha, headRef, advisorWorkdir);
+      writeSpecialistFollowUpDiff(specialistDirectory, followUpDiff);
+    }
+    fs.chmodSync(specialistDirectory, 0o555);
+    fs.chmodSync(path.join(specialistDirectory, "diff.patch"), 0o444);
+    if (context?.followUpReview) {
+      fs.chmodSync(path.join(specialistDirectory, SPECIALIST_FOLLOW_UP_DIFF_FILE_NAME), 0o444);
+    }
+  }
 
   const findExecutable = options.resolveExecutable ?? resolveExecutable;
   const rg = findExecutable("rg", env);
@@ -229,46 +283,20 @@ export async function prepareAdvisorSandboxInputs(
   fs.chmodSync(toolsDirectory, 0o755);
 }
 
-export async function configureAdvisorOpenShellInference(
-  env: NodeJS.ProcessEnv,
-  tools: OpenShellTools = defaultOpenShellTools,
-): Promise<void> {
-  await configureOpenShellInference(
-    env,
-    {
-      enableBindMounts: true,
-      gatewayId: "pr-review-advisor",
-      modelId: required(env.PR_REVIEW_ADVISOR_MODEL, "PR_REVIEW_ADVISOR_MODEL"),
-      providerName: "advisor",
-    },
-    tools,
-  );
+function advisorInferenceOptions(env: NodeJS.ProcessEnv) {
+  return {
+    enableBindMounts: true,
+    gatewayId: "pr-review-advisor",
+    modelId: required(env.PR_REVIEW_ADVISOR_MODEL, "PR_REVIEW_ADVISOR_MODEL"),
+    providerName: "advisor",
+  } as const;
 }
 
-export function writeUnavailableAdvisorArtifacts(
+export function startAdvisorOpenShellInference(
   env: NodeJS.ProcessEnv,
   tools: OpenShellTools = defaultOpenShellTools,
-): void {
-  const advisorDirectory = required(env.ADVISOR_DIR, "ADVISOR_DIR");
-  const commandEnv = credentialFreeEnvironment({
-    ...env,
-    PR_REVIEW_ADVISOR_GITHUB_CONTEXT_PATH: path.join(
-      runnerDirectory(env, ADVISOR_CONTEXT_DIRECTORY_NAME),
-      ADVISOR_CONTEXT_FILE_NAME,
-    ),
-    PR_REVIEW_ADVISOR_RUN_ANALYSIS: "0",
-    PR_REVIEW_ADVISOR_UNAVAILABLE_REASON:
-      env.PR_REVIEW_ADVISOR_UNAVAILABLE_REASON || DEFAULT_UNAVAILABLE_REASON,
-  });
-  tools.run(
-    process.execPath,
-    [
-      "--experimental-strip-types",
-      "--no-warnings",
-      path.join(advisorDirectory, "tools", "pr-review-advisor", "run-analysis.mts"),
-    ],
-    { env: commandEnv },
-  );
+): OwnedOpenShellInference {
+  return startOwnedOpenShellInference(env, advisorInferenceOptions(env), tools);
 }
 
 export function createAdvisorSandbox(
@@ -296,7 +324,6 @@ export function createAdvisorSandbox(
     "advisor tools directory",
   );
   const sandboxName = required(env.SANDBOX_NAME, "SANDBOX_NAME");
-
   createOpenShellSandbox(
     env,
     {
@@ -317,7 +344,6 @@ export function createAdvisorSandbox(
       uploads: [],
       command: [
         "/usr/bin/node",
-        "--experimental-strip-types",
         "--no-warnings",
         `${SANDBOX_ADVISOR_DIR}/tools/pr-review-advisor/openshell.mts`,
         "initialize",
@@ -332,6 +358,10 @@ function passthroughEnvironment(env: NodeJS.ProcessEnv): Record<string, string> 
   for (const name of [
     "BASE_REF",
     "GITHUB_REPOSITORY",
+    "GITHUB_RUN_ID",
+    "GITHUB_RUN_ATTEMPT",
+    "GITHUB_WORKFLOW_SHA",
+    "GITHUB_EVENT_NAME",
     "HEAD_REF",
     "PR_NUMBER",
     "PR_REVIEW_ADVISOR_ARTIFACT_DIR",
@@ -339,10 +369,9 @@ function passthroughEnvironment(env: NodeJS.ProcessEnv): Record<string, string> 
     "PR_REVIEW_ADVISOR_COMMENT_MARKER",
     "PR_REVIEW_ADVISOR_COMMENT_TITLE",
     "PR_REVIEW_ADVISOR_HEARTBEAT_MS",
-    "PR_REVIEW_ADVISOR_LOAD_PREVIOUS_REVIEW",
+    "PR_REVIEW_ADVISOR_INTEREST",
     "PR_REVIEW_ADVISOR_MAX_CAPTURE_BYTES",
     "PR_REVIEW_ADVISOR_MODEL",
-    "PR_REVIEW_ADVISOR_RUN_ANALYSIS",
     "PR_REVIEW_ADVISOR_TIMEOUT_MS",
     "PR_REVIEW_ADVISOR_UNAVAILABLE_REASON",
     "PR_REVIEW_ADVISOR_WORKFLOW_NAME",
@@ -367,12 +396,12 @@ function advisorArtifactDirectory(env: NodeJS.ProcessEnv): string {
   return value;
 }
 
-export function runAdvisorSandbox(
+export function runAdvisorSandboxAsync(
   env: NodeJS.ProcessEnv,
   tools: OpenShellTools = defaultOpenShellTools,
-): void {
+): ReturnType<typeof execOpenShellSandboxAsync> {
   advisorArtifactDirectory(env);
-  execOpenShellSandbox(
+  return execOpenShellSandboxAsync(
     env,
     {
       name: required(env.SANDBOX_NAME, "SANDBOX_NAME"),
@@ -391,14 +420,18 @@ export function runAdvisorSandbox(
         PR_REVIEW_ADVISOR_API_KEY: SANDBOX_API_KEY,
         PR_REVIEW_ADVISOR_BASE_URL: ADVISOR_OPENSHELL_INFERENCE_BASE_URL,
         PR_REVIEW_ADVISOR_CONFIG_DIR: `${SANDBOX_RUNTIME_DIR}/config`,
+        PR_REVIEW_ADVISOR_CONTEXT_DIR: SANDBOX_SPECIALIST_CONTEXT_DIR,
         PR_REVIEW_ADVISOR_GITHUB_CONTEXT_PATH: SANDBOX_CONTEXT_PATH,
         TMPDIR: `${SANDBOX_RUNTIME_DIR}/tmp`,
       },
       command: [
         "/usr/bin/node",
-        "--experimental-strip-types",
         "--no-warnings",
-        `${SANDBOX_ADVISOR_DIR}/tools/pr-review-advisor/run-analysis.mts`,
+        `${SANDBOX_ADVISOR_DIR}/tools/pr-review-advisor/run-specialist.mts`,
+        "--base",
+        required(env.BASE_REF, "BASE_REF"),
+        "--head",
+        required(env.HEAD_REF, "HEAD_REF"),
       ],
     },
     tools,
@@ -421,6 +454,7 @@ export function downloadAdvisorArtifacts(
     {
       name: required(env.SANDBOX_NAME, "SANDBOX_NAME"),
       source: `${SANDBOX_RUNTIME_DIR}/artifacts/${artifactDirectory}`,
+      timeoutMs: 60_000,
       destination,
     },
     tools,
@@ -570,39 +604,44 @@ export function initializeAdvisorSandboxRuntime(): void {
   checkAdvisorSandboxRuntime();
 }
 
-async function main(): Promise<void> {
-  const command = required(process.argv[2], "openshell command");
-  switch (command) {
-    case "prepare":
-      await prepareAdvisorSandboxInputs(process.env);
-      return;
-    case "configure":
-      await configureAdvisorOpenShellInference(process.env);
-      return;
-    case "unavailable":
-      writeUnavailableAdvisorArtifacts(process.env);
-      return;
-    case "create":
-      createAdvisorSandbox(process.env);
-      return;
-    case "run":
-      runAdvisorSandbox(process.env);
-      return;
-    case "download":
-      downloadAdvisorArtifacts(process.env);
-      return;
-    case "delete":
-      deleteAdvisorSandbox(process.env);
-      return;
-    case "initialize":
-      initializeAdvisorSandboxRuntime();
-      return;
-    case "check":
-      checkAdvisorSandboxRuntime();
-      return;
-    default:
-      throw new Error(`Unsupported OpenShell advisor command: ${command}`);
+export async function runOpenShellAdvisorCommand(
+  command: string | undefined,
+  initialize: () => void = initializeAdvisorSandboxRuntime,
+  waitForTermination: () => Promise<void> = waitForAdvisorSandboxTermination,
+): Promise<void> {
+  const requiredCommand = required(command, "openshell command");
+  if (requiredCommand !== "initialize") {
+    throw new Error(`Unsupported OpenShell advisor command: ${requiredCommand}`);
   }
+  initialize();
+  await waitForTermination();
+}
+
+type AdvisorSandboxSignals = {
+  once(event: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+  removeListener(event: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+};
+
+export function waitForAdvisorSandboxTermination(
+  signals: AdvisorSandboxSignals = process,
+): Promise<void> {
+  return new Promise((resolve) => {
+    // Signal listeners and an unresolved promise do not keep Node running when
+    // no active handles remain. Own one handle until OpenShell terminates PID 1.
+    const keepAlive = setInterval(() => undefined, 60_000);
+    const finish = () => {
+      clearInterval(keepAlive);
+      signals.removeListener("SIGTERM", finish);
+      signals.removeListener("SIGINT", finish);
+      resolve();
+    };
+    signals.once("SIGTERM", finish);
+    signals.once("SIGINT", finish);
+  });
+}
+
+async function main(): Promise<void> {
+  await runOpenShellAdvisorCommand(process.argv[2]);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

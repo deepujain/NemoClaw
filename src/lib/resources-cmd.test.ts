@@ -7,11 +7,13 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import * as docker from "./adapters/docker/exec";
 import {
   appendResourceFlags,
   getHardwareResources,
   loadResourceProfiles,
   printHardwareResources,
+  resolveCpuModel,
   resolveProfile,
   resolveResourceValue,
 } from "./resources-cmd.js";
@@ -47,6 +49,7 @@ describe("resources-cmd", () => {
     expect(() => resolveResourceValue("0%", 16, "cpu")).toThrow("integer between 1% and 100%");
     expect(() => resolveResourceValue("101%", 16, "cpu")).toThrow("integer between 1% and 100%");
     expect(() => resolveResourceValue("12.5%", 16, "cpu")).toThrow("integer between 1% and 100%");
+    expect(() => resolveResourceValue("%25", 16, "cpu")).toThrow("integer between 1% and 100%");
   });
 
   it("resolves profiles against Kubernetes allocatable capacity when available", () => {
@@ -69,6 +72,24 @@ describe("resources-cmd", () => {
     });
   });
 
+  it.each(["4Gi", "4096Mi", "4194304Ki", "4294967296"])(
+    "resolves a half-memory profile against %s of allocatable node memory",
+    (memory) => {
+      vi.spyOn(docker, "dockerSpawnSync").mockReturnValue({
+        status: 0,
+        stdout: JSON.stringify({ items: [{ status: { allocatable: { memory } } }] }),
+        stderr: "",
+        pid: 1,
+        output: [],
+        signal: null,
+      });
+
+      const hw = getHardwareResources();
+      expect(hw.memory.allocatableMB).toBe(4096);
+      expect(resolveProfile({ cpu: "1", memory: "50%" }, hw).memory).toBe("2048Mi");
+    },
+  );
+
   it("loads resource profiles from the blueprint", () => {
     const profiles = loadResourceProfiles();
 
@@ -86,6 +107,76 @@ describe("resources-cmd", () => {
     expect(hw.cpu.model).toEqual(expect.any(String));
     expect(hw.memory.totalMB).toBeGreaterThan(0);
     expect(hw.profiles?.creator.cpu).toBe("50%");
+  });
+
+  it("keeps complete Node CPU models without running lscpu (#9403)", () => {
+    const readLscpu = vi.fn(() => null);
+
+    expect(
+      resolveCpuModel(
+        [{ model: "Cortex-X925" }, { model: "Cortex-X925" }, { model: "Cortex-A725" }],
+        { platform: "linux", readLscpu },
+      ),
+    ).toBe("Cortex-X925 / Cortex-A725");
+    expect(readLscpu).not.toHaveBeenCalled();
+  });
+
+  it("reports distinct lscpu models when Node reports unknown on Linux (#9403)", () => {
+    const readLscpu = vi.fn(() =>
+      JSON.stringify({
+        cpus: [
+          { cpu: 0, modelname: "Cortex-X925" },
+          { cpu: 1, modelname: "Cortex-X925" },
+          { cpu: 2, modelname: "Cortex-A725" },
+          { cpu: 3, modelname: "Cortex-A725" },
+        ],
+      }),
+    );
+
+    expect(
+      resolveCpuModel([{ model: "unknown" }, { model: "unknown" }], {
+        platform: "linux",
+        readLscpu,
+      }),
+    ).toBe("Cortex-X925 / Cortex-A725");
+    expect(readLscpu).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["unavailable", null],
+    ["malformed", "not JSON"],
+    ["missing rows", JSON.stringify({ cpus: "unknown" })],
+    [
+      "unsafe values",
+      JSON.stringify({
+        cpus: [{ modelname: "unknown" }, { modelname: "-" }, { modelname: "bad\nmodel" }],
+      }),
+    ],
+  ])("falls back safely when lscpu output is %s (#9403)", (_case, output) => {
+    expect(
+      resolveCpuModel([{ model: "unknown" }], {
+        platform: "linux",
+        readLscpu: () => output,
+      }),
+    ).toBe("unknown");
+  });
+
+  it("keeps known Node models when the Linux fallback cannot help (#9403)", () => {
+    expect(
+      resolveCpuModel([{ model: "Cortex-X925" }, { model: "unknown" }], {
+        platform: "linux",
+        readLscpu: () => null,
+      }),
+    ).toBe("Cortex-X925");
+  });
+
+  it("combines known Node models with additional Linux models (#9403)", () => {
+    expect(
+      resolveCpuModel([{ model: "Cortex-X925" }, { model: "unknown" }], {
+        platform: "linux",
+        readLscpu: () => JSON.stringify({ cpus: [{ modelname: "Cortex-A725" }] }),
+      }),
+    ).toBe("Cortex-X925 / Cortex-A725");
   });
 
   it("prints JSON and returns the hardware object in JSON mode", () => {
@@ -127,11 +218,13 @@ describe("resources-cmd", () => {
     expect(args).toEqual(["sandbox", "create"]);
   });
 
-  it("gracefully skips resource flags when profile resolution fails", () => {
+  it("rejects an invalid percentage instead of skipping supported resource flags", () => {
     const openshell = makeExecutable("#!/usr/bin/env sh\necho '--cpu --memory'\n");
     const args = ["sandbox", "create"];
 
-    expect(appendResourceFlags(args, { cpu: "bogus%", memory: "25%" }, openshell)).toBe(false);
+    expect(() => appendResourceFlags(args, { cpu: "bogus%", memory: "25%" }, openshell)).toThrow(
+      "Invalid percentage 'bogus%': must be an integer between 1% and 100%",
+    );
     expect(args).toEqual(["sandbox", "create"]);
   });
 });

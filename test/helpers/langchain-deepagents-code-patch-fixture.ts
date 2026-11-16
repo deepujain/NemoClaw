@@ -1,6 +1,32 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+/*
+ * The fixture code adapted from deepagents-code 0.1.71 and 0.1.87 below uses the following license.
+ *
+ * MIT License
+ *
+ * Copyright (c) LangChain, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,6 +37,7 @@ import { addDarwinFcntlSealConstants } from "./darwin-fcntl-seal-fixture";
 export const agentDir = path.join(process.cwd(), "agents", "langchain-deepagents-code");
 export const patcher = path.join(agentDir, "patch-managed-deepagents-code.py");
 const packageFixtureDirs = new Set<string>();
+let cachedPatchedFixture: string | undefined;
 
 export function managedAutoApprovalPath(root: string): string {
   return path.join(root, "managed-auto-approval");
@@ -53,11 +80,219 @@ export function writeFixtureFile(root: string, relativePath: string, content: st
   fs.writeFileSync(target, `${content.trim()}\n`, "utf8");
 }
 
-export function createPackageFixture(version = "0.1.34"): string {
+export const approvalPackageSources: Readonly<Record<string, string>> = {
+  "tui/widgets/tool_renderers.py": `
+class ToolApprovalWidget:
+    def __init__(self, data):
+        self.data = data
+
+
+class ToolRenderer:
+    @staticmethod
+    def get_approval_widget(tool_args, assistant_id=None):
+        return ToolApprovalWidget, dict(tool_args)
+
+
+def get_renderer(tool_name):
+    return ToolRenderer()
+`,
+  "tui/widgets/approval.py": `
+from __future__ import annotations
+
+from types import SimpleNamespace
+from deepagents_code.tui.widgets.tool_renderers import get_renderer
+
+
+class ApprovalMenu:
+    def __init__(self):
+        self._is_auto_fallback = False
+        self._show_auto_option = True
+        self._options = self._build_options()
+        self.decisions = []
+        self.notifications = []
+        self.app = SimpleNamespace(
+            notify=lambda *args, **kwargs: self.notifications.append((args, kwargs))
+        )
+
+    async def _update_tool_info(self) -> None:
+        """Mount the tool-specific approval widgets for all tools."""
+        if not self._tool_info_container:
+            return
+
+        # Clear existing content
+        await self._tool_info_container.remove_children()
+
+        # Mount info for each tool
+        for i, action_request in enumerate(self._action_requests):
+            tool_name = action_request.get("name", "unknown")
+            tool_args = action_request.get("args", {})
+
+            # Add tool header if multiple tools
+            if len(self._action_requests) > 1:
+                header = Static(
+                    Content.from_markup(
+                        "[bold]$num. $name[/bold]",
+                        num=i + 1,
+                        name=tool_name,
+                    )
+                )
+                await self._tool_info_container.mount(header)
+
+            # Show description if present
+            description = action_request.get("description")
+            if description:
+                await self._tool_info_container.mount(_description_widget(description))
+
+            # Get the appropriate renderer for this tool
+            renderer = get_renderer(tool_name)
+            widget_class, data = renderer.get_approval_widget(
+                tool_args, assistant_id=self._assistant_id
+            )
+            if "show_numbers" in data:
+                data["show_numbers"] = (
+                    bool(data["show_numbers"]) and self._show_diff_line_numbers
+                )
+            approval_widget = widget_class(data)
+            await self._tool_info_container.mount(approval_widget)
+
+    def _build_options(self):
+        return [
+            ("Approve (y)", "approve"),
+            ("Enable Auto for this thread (a)", "auto_approve_all"),
+            ("Reject (n)", "reject"),
+        ]
+
+    def _handle_selection(self, option, *, reject_message=None):
+        decision_map = {0: "approve", 1: "auto_approve_all", 2: "reject"}
+        self.decisions.append((decision_map[option], reject_message))
+
+    def action_select_auto(self):
+        self._handle_selection(1)
+`,
+};
+
+export const nonInteractivePackageSource = `
+from __future__ import annotations
+
+import logging
+import sys
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_shell_allow_list():
+    return ["bash"]
+
+
+class _Console:
+    def __init__(self, stderr=False):
+        self.file = sys.stderr if stderr else sys.stdout
+
+    def print(self, message, **kwargs):
+        print(message, file=self.file)
+
+
+def escape_markup(value):
+    return value
+
+
+def generate_thread_id():
+    return "thread-1"
+
+
+def _workspace_conflict_text(exc: BaseException) -> str | None:
+    from langgraph_sdk.errors import ConflictError
+    if not isinstance(exc, ConflictError):
+        return None
+    from deepagents_code.client.headless_resume import WORKSPACE_CONFLICT_MESSAGE
+    from deepagents_code.client.remote_client import workspace_conflict_diagnostics
+    from deepagents_code.workspace_diagnostics import SAFE_SNAPSHOT_FIELDS
+    diagnostics = workspace_conflict_diagnostics(exc)
+    changed = sorted({change.name for change in diagnostics.changes} & SAFE_SNAPSHOT_FIELDS if diagnostics is not None else set())
+    if not changed:
+        return WORKSPACE_CONFLICT_MESSAGE
+    return f"{WORKSPACE_CONFLICT_MESSAGE} Changed: {', '.join(changed)}."
+
+
+def _write_text(text):
+    print(text, end="", flush=True)
+
+
+def _write_newline():
+    print()
+
+
+async def _run_non_interactive_impl(*args, **kwargs):
+    del args
+    from deepagents_code.hooks.manager import HooksManager
+
+    HooksManager.create().dispatch()
+    if kwargs.get("message") == "fixture-json-task":
+        return 0
+    return kwargs
+
+
+async def _run_agent_loop(*args, **kwargs):
+    return await _run_non_interactive_impl(*args, **kwargs)
+
+
+async def run_non_interactive(*args, **kwargs):
+    quiet = kwargs.get("quiet", False)
+    console = _Console(stderr=quiet)
+    thread_id = generate_thread_id()
+    if quiet:
+        # Printed despite \`-q\`: scripts parse it to resume the thread later.
+        console.print(
+            f"Thread: {thread_id}", markup=False, highlight=False, soft_wrap=True
+        )
+    resume = kwargs.get("resume")
+    try:
+        result = await _run_agent_loop(*args, **kwargs)
+        return result
+    except Exception as e:
+        logger.exception("Unexpected error during non-interactive execution")
+        if resume is not None and (conflict := _workspace_conflict_text(e)):
+            console.print(
+                f"\\n[red]Error: {escape_markup(conflict)}[/red]", soft_wrap=True
+            )
+            return 1
+        if e.args and isinstance(e.args[0], dict):
+            # The server raised it; show its type and message, not the dict.
+            from deepagents_code.client.remote_client import format_agent_exception
+
+            detail = format_agent_exception(e)
+            console.print(f"\\n[red]Agent error: {escape_markup(detail)}[/red]")
+        else:
+            console.print(
+                f"\\n[red]Unexpected error ({type(e).__name__}): "
+                f"{escape_markup(str(e))}[/red]"
+            )
+        return 1
+
+
+async def _run_startup_command(command, console, *, quiet):
+    del console, quiet
+    return command
+`;
+
+export function createPackageFixture(version = "0.1.87"): string {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-dcode-patch-"));
   packageFixtureDirs.add(tempDir);
   const packageDir = path.join(tempDir, "deepagents_code");
   writeFixtureFile(packageDir, "__init__.py", '"""Test package."""');
+  writeFixtureFile(
+    packageDir,
+    "approval_mode.py",
+    `
+from enum import Enum
+
+
+class ApprovalMode(str, Enum):
+    MANUAL = "manual"
+    AUTO = "auto"
+    YOLO = "yolo"
+`,
+  );
   writeFixtureFile(
     tempDir,
     "httpx/__init__.py",
@@ -118,6 +353,16 @@ class ProxyError(TransportError):
     pass
 `,
   );
+  writeFixtureFile(tempDir, "langgraph/__init__.py", '"""Test package."""');
+  writeFixtureFile(tempDir, "langgraph/pregel/__init__.py", '"""Test package."""');
+  writeFixtureFile(
+    tempDir,
+    "langgraph/pregel/remote.py",
+    `
+class RemoteException(Exception):
+    pass
+`,
+  );
   writeFixtureFile(tempDir, "langgraph_sdk/__init__.py", '"""Test package."""');
   writeFixtureFile(
     tempDir,
@@ -132,6 +377,12 @@ class APIError(LangGraphError):
 
 
 class APIStatusError(APIError):
+    def __init__(self, message, *, body=None):
+        super().__init__(message)
+        self.body = body
+
+
+class ConflictError(APIStatusError):
     pass
 
 
@@ -169,7 +420,7 @@ class InternalServerError(APIStatusError):
     `
 """Allow running the test package as a module."""
 
-from deepagents_code.main import cli_main
+from deepagents_code import cli_main
 
 
 if __name__ == "__main__":
@@ -215,6 +466,9 @@ class Parser:
             ),
             interpreter=(True if "--interpreter" in argv else None),
             auto_approve=any(arg in {"-y", "--auto-approve"} for arg in argv),
+            yolo="--yolo" in argv,
+            startup_mode="auto",
+            approval_mode="auto",
             acp="--acp" in argv,
             startup_cmd=("touch /tmp/unsafe" if any(arg.startswith("--startup") for arg in argv) else None),
             sandbox="docker",
@@ -237,6 +491,12 @@ class Parser:
 
 
 parser = Parser()
+
+
+def _resolve_approval_mode(args):
+    from deepagents_code.approval_mode import ApprovalMode
+
+    return ApprovalMode(os.environ.get("FIXTURE_NATIVE_STARTUP_MODE", "manual"))
 
 
 def parse_args():
@@ -276,7 +536,16 @@ def cli_main():
             )
         )
         raise SystemExit(exit_code)
-    print(f"managed-posture-ok auto_approve={args.auto_approve}")
+    print(
+        f"managed-posture-ok auto_approve={args.auto_approve} "
+        f"yolo={getattr(args, 'yolo', False)} "
+        f"startup_mode={args.startup_mode} approval_mode={args.approval_mode} "
+        f"resolved_mode={_resolve_approval_mode(args).value}"
+    )
+
+
+if __name__ == "__main__":
+    cli_main()
 `,
   );
   writeFixtureFile(
@@ -298,18 +567,27 @@ def should_run_onboarding(state_dir=None):
     )
     .replace(
       "class DeepAgentsApp:\n",
-      `class _StatusBar:
+      `from deepagents_code.approval_mode import ApprovalMode
+
+
+class _StatusBar:
     def __init__(self):
         self.auto_approve = True
+        self.approval_mode = "yolo"
 
     def set_auto_approve(self, *, enabled):
         self.auto_approve = enabled
+
+    def set_approval_mode(self, mode):
+        self.approval_mode = mode
+        self.auto_approve = mode == "yolo"
 
 
 class _SessionState:
     def __init__(self):
         self.thread_id = "thread-1"
         self.auto_approve = True
+        self.approval_mode = ApprovalMode.YOLO
         self.approval_mode_key = "approval/thread-1"
 
 
@@ -318,7 +596,8 @@ class DeepAgentsApp:
     )
     .replace(
       "        self._auto_approve = True\n        self._status_bar = None\n        self._session_state = None\n",
-      `        self._auto_approve = True
+      `        self._approval_mode = ApprovalMode.YOLO
+        self._auto_approve = True
         self._status_bar = _StatusBar()
         self._session_state = _SessionState()
         self._agent = object()
@@ -333,15 +612,24 @@ class DeepAgentsApp:
     )
     .replace(
       "    async def _on_auto_approve_enabled(self):\n        self._auto_approve = True\n\n    async def action_toggle_auto_approve(self):\n        self._auto_approve = not self._auto_approve\n",
-      `    async def _on_auto_approve_enabled(self):
-        self._auto_approve = True
-        self._status_bar.set_auto_approve(enabled=True)
-        self._session_state.auto_approve = True
+      `    async def _set_approval_mode(self, target):
+        self._approval_mode = target
+        self._auto_approve = target is ApprovalMode.YOLO
+        self._status_bar.set_approval_mode(target.value)
+        self._session_state.approval_mode = target
+        self._session_state.auto_approve = self._auto_approve
+        return True
+
+    async def _on_auto_approve_enabled(self):
+        return await self._set_approval_mode(ApprovalMode.AUTO)
 
     async def action_toggle_auto_approve(self):
-        self._auto_approve = not self._auto_approve
-        self._status_bar.set_auto_approve(enabled=self._auto_approve)
-        self._session_state.auto_approve = self._auto_approve
+        target = (
+            ApprovalMode.AUTO
+            if self._approval_mode is ApprovalMode.MANUAL
+            else ApprovalMode.MANUAL
+        )
+        await self._set_approval_mode(target)
 
     async def _resume_thread(self, thread_id):
         if self.resume_should_fail:
@@ -411,7 +699,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 _dotenv_loaded_values = {}
-CLI_MAX_RETRIES_KEY = "__deepagents_cli_max_retries__"
 
 
 def _preview_dotenv_environ(*, start_path=None):
@@ -463,6 +750,10 @@ def _fetch_with_redirects(url, *, timeout):
     "model_config.py",
     `
 from __future__ import annotations
+
+from pathlib import Path
+
+DEFAULT_CONFIG_DIR = Path("/tmp")
 
 
 class ModelConfigError(RuntimeError):
@@ -578,10 +869,21 @@ def _normalize_path(raw_path, project_context, label):
   );
   writeFixtureFile(
     packageDir,
-    "hooks.py",
+    "hooks/__init__.py",
+    `
+from deepagents_code.hooks.legacy import dispatch_hook, _load_hooks, _run_single_hook
+
+__all__ = ["dispatch_hook", "_load_hooks", "_run_single_hook"]
+`,
+  );
+  writeFixtureFile(
+    packageDir,
+    "hooks/legacy.py",
     `
 from __future__ import annotations
 
+import asyncio
+import json
 import subprocess
 from typing import Any
 
@@ -589,77 +891,140 @@ _hooks_config = None
 
 
 def _load_hooks():
-    return [{"command": ["touch", "/tmp/unsafe-hook"]}]
+    global _hooks_config
+    if _hooks_config is None:
+        from deepagents_code.model_config import DEFAULT_CONFIG_DIR
+
+        path = DEFAULT_CONFIG_DIR / "hooks.json"
+        _hooks_config = json.loads(path.read_text()).get("hooks", []) if path.is_file() else []
+    return _hooks_config
 
 
 def _run_single_hook(command, event, payload_bytes):
     del event, payload_bytes
     subprocess.run(command, check=False)
+
+
+async def dispatch_hook(event, payload):
+    payload_bytes = json.dumps({"event": event, **payload}).encode()
+    for hook in _load_hooks():
+        if not hook.get("events") or event in hook["events"]:
+            await asyncio.to_thread(_run_single_hook, hook["command"], event, payload_bytes)
 `,
   );
   writeFixtureFile(
     packageDir,
-    "client/non_interactive.py",
+    "hooks/manager.py",
     `
 from __future__ import annotations
 
-import logging
-from types import SimpleNamespace
-
-settings = SimpleNamespace(shell_allow_list=["bash"])
-logger = logging.getLogger(__name__)
+import os
+from pathlib import Path
 
 
-class _Console:
-    def print(self, message):
-        print(message)
+class HooksManager:
+    def __init__(self, enabled):
+        self.enabled = enabled
 
+    @classmethod
+    def create(cls, *args, **kwargs):
+        del args, kwargs
+        return cls(True)
 
-def escape_markup(value):
-    return value
+    @classmethod
+    def inert(cls):
+        return cls(False)
 
+    def dispatch(self):
+        marker = os.environ.get("DCODE_FIXTURE_HOOK_MARKER")
+        if self.enabled and marker:
+            Path(marker).touch()
+`,
+  );
+  writeFixtureFile(packageDir, "client/non_interactive.py", nonInteractivePackageSource);
+  // Pinned 0.1.87 classifier dependencies; omit unrelated rendering/serialization methods.
+  writeFixtureFile(
+    packageDir,
+    "client/headless_resume.py",
+    `
+WORKSPACE_CONFLICT_MESSAGE = "Couldn't resume this thread because it was created with different settings. A thread keeps the directory, agent, approval, shell, sandbox, and MCP settings it started with, so threads from the interactive UI can't be resumed with -n. Rerun from the same directory with the same flags as the run that created it."
+`,
+  );
+  writeFixtureFile(
+    packageDir,
+    "client/remote_client.py",
+    `
+from __future__ import annotations
+from typing import cast
 
-def generate_thread_id():
-    return "thread-1"
+def workspace_conflict_diagnostics(exc: BaseException) -> WorkspaceDiagnostics | None:
+    from deepagents_code.workspace_diagnostics import WorkspaceDiagnostics
+    body = getattr(exc, 'body', None)
+    if not isinstance(body, dict):
+        return None
+    return WorkspaceDiagnostics.from_dict(cast('dict[str, Any]', body).get('diagnostics'))
+`,
+  );
+  writeFixtureFile(
+    packageDir,
+    "workspace_diagnostics.py",
+    `
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import cast
 
+SAFE_SNAPSHOT_FIELDS = frozenset({'allow_fs_tools', 'assistant_id', 'auto_approve', 'enable_ask_user', 'enable_interpreter', 'enable_memory', 'enable_shell', 'enable_skills', 'interactive', 'interpreter_ptc', 'interpreter_ptc_acknowledge_unsafe', 'interrupt_shell_only', 'no_mcp', 'recursion_limit', 'sandbox_type', 'shell_allow_list', 'trust_project_extensions', 'trust_project_mcp'})
 
-def _write_text(text):
-    print(text, end="", flush=True)
+@dataclass(frozen=True)
+class FieldChange:
+    name: str
+    bound: object = field(default=None)
+    current: object = field(default=None)
+    state: Literal['changed', 'values_unavailable'] = 'changed'
 
+@dataclass(frozen=True)
+class WorkspaceDiagnostics:
+    category: _DiagnosticCategory
+    reason: str
+    changes: tuple[FieldChange, ...] = ()
+    snapshot_status: Literal['current', 'unavailable'] = 'current'
+    binding_schema_version: int | None = None
+    server_schema_version: int | None = None
 
-def _write_newline():
-    print()
+    @classmethod
+    def from_dict(cls, data: object) -> WorkspaceDiagnostics | None:
+        if not isinstance(data, dict):
+            return None
+        category = data.get('category')
+        reason = data.get('reason')
+        snapshot_status = data.get('snapshot_status')
+        if not isinstance(category, str) or not isinstance(reason, str) or (not isinstance(snapshot_status, str)) or (snapshot_status not in {'current', 'unavailable'}):
+            return None
+        changes: list[FieldChange] = []
+        raw_changes = data.get('changes')
+        if isinstance(raw_changes, list):
+            for item in raw_changes:
+                parsed = _parse_field_change(item)
+                if parsed is None:
+                    return None
+                changes.append(parsed)
+        binding_schema = data.get('binding_schema_version')
+        server_schema = data.get('server_schema_version')
+        return cls(category=cast('_DiagnosticCategory', category), reason=reason, changes=tuple(changes), snapshot_status=snapshot_status, binding_schema_version=binding_schema if isinstance(binding_schema, int) else None, server_schema_version=server_schema if isinstance(server_schema, int) else None)
 
-
-async def _run_non_interactive_impl(*args, **kwargs):
-    del args
-    if kwargs.get("message") == "fixture-json-task":
-        return 0
-    return kwargs
-
-
-async def _run_agent_loop(*args, **kwargs):
-    return await _run_non_interactive_impl(*args, **kwargs)
-
-
-async def run_non_interactive(*args, **kwargs):
-    console = _Console()
-    thread_id = generate_thread_id()
-    try:
-        result = await _run_agent_loop(*args, **kwargs)
-        return result
-    except Exception as e:
-        logger.exception("Unexpected error during non-interactive execution")
-        console.print(
-            f"\\n[red]Unexpected error ({type(e).__name__}): "
-            f"{escape_markup(str(e))}[/red]"
-        )
-        return 1
-
-
-async def _run_startup_command(command, console, *, quiet):
-    del console, quiet
-    return command
+def _parse_field_change(item: object) -> FieldChange | None:
+    if not isinstance(item, dict):
+        return None
+    entry = cast('dict[str, object]', item)
+    name = entry.get('name')
+    if not isinstance(name, str):
+        return None
+    state = entry.get('state')
+    if state == 'values_unavailable':
+        return FieldChange(name=name, state='values_unavailable')
+    if state == 'changed':
+        return FieldChange(name=name, bound=entry.get('bound'), current=entry.get('current'))
+    return None
 `,
   );
   writeFixtureFile(
@@ -716,6 +1081,10 @@ async def _caller_four():
 
 async def _caller_five():
     return await _run_install_subprocess("five", progress=None, log_path=None)
+
+
+async def _caller_six():
+    return await _run_install_subprocess("six", progress=None, log_path=None)
 `,
   );
   writeFixtureFile(packageDir, "integrations/__init__.py", '"""Test integrations."""');
@@ -862,31 +1231,9 @@ class ModelSelectorScreen:
         self.original_selection = (model_spec, provider)
 `,
   );
-  writeFixtureFile(
-    packageDir,
-    "tui/widgets/approval.py",
-    `
-from __future__ import annotations
-
-from types import SimpleNamespace
-
-
-class ApprovalMenu:
-    def __init__(self):
-        self.decisions = []
-        self.notifications = []
-        self.app = SimpleNamespace(
-            notify=lambda *args, **kwargs: self.notifications.append((args, kwargs))
-        )
-
-    def _handle_selection(self, option, *, reject_message=None):
-        decision_map = {0: "approve", 1: "auto_approve_all", 2: "reject"}
-        self.decisions.append((decision_map[option], reject_message))
-
-    def action_select_auto(self):
-        self._handle_selection(1)
-`,
-  );
+  for (const [relativePath, source] of Object.entries(approvalPackageSources)) {
+    writeFixtureFile(packageDir, relativePath, source);
+  }
   writeFixtureFile(
     packageDir,
     "tui/widgets/status.py",
@@ -943,7 +1290,12 @@ export function cleanupPackageFixtures(): void {
   packageFixtureDirs.clear();
 }
 
-export function patchFixture(tempDir: string): void {
+export function cleanupCachedPatchedFixture(): void {
+  if (cachedPatchedFixture) fs.rmSync(cachedPatchedFixture, { recursive: true, force: true });
+  cachedPatchedFixture = undefined;
+}
+
+function runPatcher(tempDir: string): void {
   execFileSync("python3", [patcher], {
     env: { PATH: process.env.PATH, PYTHONPATH: tempDir },
   });
@@ -968,4 +1320,27 @@ export function patchFixture(tempDir: string): void {
     )
     .replace("_MANAGED_FILE_OWNER_UID = 0", `_MANAGED_FILE_OWNER_UID = ${process.getuid?.() ?? 0}`);
   fs.writeFileSync(helperPath, helper, "utf8");
+}
+
+export function createPatchedPackageFixture(): string {
+  if (!cachedPatchedFixture) {
+    cachedPatchedFixture = createPackageFixture();
+    packageFixtureDirs.delete(cachedPatchedFixture);
+    runPatcher(cachedPatchedFixture);
+  }
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-dcode-patched-"));
+  packageFixtureDirs.add(tempDir);
+  for (const name of fs.readdirSync(cachedPatchedFixture)) {
+    const target = path.join(tempDir, name);
+    fs.rmSync(target, { force: true, recursive: true });
+    fs.cpSync(path.join(cachedPatchedFixture, name), target, { recursive: true });
+  }
+  const helperPath = path.join(tempDir, "deepagents_code", "_nemoclaw_managed.py");
+  const helper = fs.readFileSync(helperPath, "utf8").replaceAll(cachedPatchedFixture, tempDir);
+  fs.writeFileSync(helperPath, helper, "utf8");
+  return tempDir;
+}
+
+export function patchFixture(tempDir: string): void {
+  runPatcher(tempDir);
 }

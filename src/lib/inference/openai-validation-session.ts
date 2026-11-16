@@ -18,9 +18,12 @@ import {
   STRICT_TOOL_PROBE_RETRY_TOKEN_LADDER,
   strictToolProbeReasoningRetryMessage,
 } from "./openai-probe-models";
-import { STREAMING_EVENT_PROBE_MAX_SECONDS } from "./probe-http-helpers";
+import {
+  MAX_ONBOARD_VALIDATION_TIMEOUT_SECONDS,
+  STREAMING_EVENT_PROBE_MAX_SECONDS,
+} from "./probe-http-helpers";
+import { RETRIABLE_HTTP_PROBE_STATUSES } from "./probe/transient-http-policy";
 
-const RETRIABLE_HTTP_STATUSES = new Set([429, 502, 503, 504]);
 const RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
 
 export interface OpenAiValidationOptions {
@@ -29,6 +32,7 @@ export interface OpenAiValidationOptions {
   requireResponsesToolCalling?: boolean;
   requireChatCompletionsToolCalling?: boolean;
   retryChatCompletionsToolReadiness?: boolean;
+  useNvidiaEndpointProbePayload?: boolean;
 
   skipResponsesProbe?: boolean;
   probeStreaming?: boolean;
@@ -56,7 +60,7 @@ export interface OpenAiValidationSessionDeps {
   hasResponsesToolCall(body: string): boolean;
   hasChatCompletionsToolCall(body: string): boolean;
   hasChatCompletionsToolCallLeak(body: string): boolean;
-  getChatPayload(model: string): Record<string, unknown>;
+  getChatPayload(model: string, options: OpenAiValidationOptions): Record<string, unknown>;
   getResponsesTimeoutMs(options: OpenAiValidationOptions): number;
   getChatTimeoutMs(model: string, options: OpenAiValidationOptions): number;
   sessionOptions?: ValidationSessionOptions;
@@ -208,7 +212,7 @@ async function requestWithHttpRetry(
       accept: (result) =>
         !retryTransientHttp ||
         result.curlStatus !== 0 ||
-        !RETRIABLE_HTTP_STATUSES.has(result.httpStatus),
+        !RETRIABLE_HTTP_PROBE_STATUSES.has(result.httpStatus),
       retryDelaysMs: RETRY_DELAYS_MS,
       onRetry: (result, delayMs) => {
         console.log(
@@ -246,8 +250,10 @@ export async function probeOpenAiLikeEndpointWithValidationSession(
     return deps.legacyProbe(endpointUrl, model, apiKey, options);
   }
   // Custom-endpoint SSRF preflight pins approved addresses through curl's
-  // reviewed --resolve boundary. Keep that security path authoritative until
-  // native address pinning has equivalent end-to-end rebinding coverage.
+  // reviewed --resolve boundary. This #6661 migration fallback is bounded to
+  // the native-session rollout: remove it once the native transport can enforce
+  // the exact preflight address set and the caller-level rebinding test passes
+  // with legacyProbe unavailable.
   if (
     (options.pinnedAddresses && options.pinnedAddresses.length > 0) ||
     options.trustedPrivateCapability
@@ -263,6 +269,9 @@ export async function probeOpenAiLikeEndpointWithValidationSession(
   if (!session) return deps.legacyProbe(endpointUrl, model, apiKey, options);
 
   const baseUrl = endpointUrl.replace(/\/+$/, "");
+  // Preserve curl diagnostics during the #6661 migration only. Remove this
+  // replay once native proxy, CA, streaming, and terminal-failure parity is
+  // complete and the public-helper migration tests pass without legacyProbe.
   const nativeFailureFallback = async (reason: string): Promise<OpenAiValidationResult> => {
     addTraceEvent("validation_transport_fallback", { reason });
     session.close();
@@ -339,8 +348,11 @@ export async function probeOpenAiLikeEndpointWithValidationSession(
                 ...auth,
                 body: requireToolCall
                   ? chatToolPayload(model, maxTokens)
-                  : JSON.stringify(deps.getChatPayload(model)),
-                timeoutMs: deps.getChatTimeoutMs(model, options) * timeoutMultiplier,
+                  : JSON.stringify(deps.getChatPayload(model, options)),
+                timeoutMs: Math.min(
+                  deps.getChatTimeoutMs(model, options) * timeoutMultiplier,
+                  MAX_ONBOARD_VALIDATION_TIMEOUT_SECONDS * 1000,
+                ),
               }),
             retryTransientHttp,
           );

@@ -31,15 +31,23 @@
 //      non-interactive one-shot, yet PR #8191 moved the non-JSON transport
 //      off `execSandbox` onto a raw `spawnSync` with a hard-coded
 //      `stdio[0] = "inherit"`, dropping the TTY-aware stdin guard that
-//      `buildSandboxExecStdio` applies to every other sandbox exec. The JSON
+//      `buildSandboxCommandStdio` applies to every other sandbox exec. The JSON
 //      transport has carried the same hard-coded inherit since #5683. The
 //      result is a live terminal on fd 0 handed to a dispatch whose stdout
 //      and stderr are pipes and whose argv says `--no-tty`.
 //    - Source boundary: NemoClaw owns which fds it hands to OpenShell.
-//      Forwarding a real pipe stays supported so `printf ... | nemoclaw
-//      <name> agent` keeps working; only an interactive terminal is withheld.
+//      When the message is in argv, fd 0 is closed: OpenShell reads piped
+//      stdin to EOF before dispatch, so an idle pipe from automation can
+//      otherwise delay a ready sandbox indefinitely (#11371). Calls without
+//      an explicit message retain the existing piped-input behavior.
 //    - Removal condition: drop the TTY carve-out if `openclaw agent` gains a
 //      documented interactive stdin mode reachable through this wrapper.
+//    - Input deadline (#13621): because OpenShell starts the remote command
+//      only at EOF, the in-sandbox parser's piped-input deadline cannot fire
+//      while a producer keeps the pipe open. The host therefore reads piped
+//      input itself within the same budget (positive `--timeout`, else 30
+//      seconds) and the same size limit, then hands the bytes to OpenShell.
+//      Removal condition: OpenShell dispatches before stdin reaches EOF.
 //
 // 8. Host interruption propagation.
 //
@@ -74,14 +82,24 @@
 //    - Removal condition: drop this guard when `openclaw agent` exits non-zero
 //      for a turn whose deadline fired.
 //
-// Regression tests: `passthrough-dispatch.test.ts` owns the classifier and the
-// supervised process lifecycle; `passthrough-help.test.ts` owns the diagnostic
-// text.
+// Regression tests: `passthrough-dispatch.test.ts` owns the classifier; the
+// CLI session and core capture tests own the process lifecycle.
+// `passthrough-help.test.ts` owns the diagnostic text.
 
-import { spawn, type StdioOptions } from "node:child_process";
+import {
+  createCliOpenShellSandboxSessionExecutor,
+  type CliOpenShellSessionSpawner,
+} from "../../../adapters/openshell/sandbox-command-cli";
+import type {
+  OpenShellSandboxSessionCompletion,
+  OpenShellSandboxSessionRequest,
+  OpenShellSandboxSessionExecutor,
+} from "../../../adapters/openshell/sandbox-session";
 
 import { isStdinTty } from "../../../core/stdin";
-import { runSandboxExecChild, type SandboxExecChild, type SandboxExecSignalSource } from "../exec";
+import { MAX_TIMER_DELAY_MS } from "../../../core/timer";
+import { getKnownSandboxTargetGatewayName } from "../gateway-target";
+import { wrapOpenClawAgentCommandWithRuntimeEnv } from "../runtime-env";
 
 /**
  * Exit code for a dispatch that reported success without delivering a turn.
@@ -89,154 +107,152 @@ import { runSandboxExecChild, type SandboxExecChild, type SandboxExecSignalSourc
  */
 export const SILENT_AGENT_DISPATCH_EXIT_CODE = 1;
 
-/** The subset of a child-process result the delivery classifier reads. */
-export type AgentDispatchOutcome = {
-  error?: Error;
-  status: number | null;
-  signal?: NodeJS.Signals | null;
-};
-
-export type AgentDispatchResult = AgentDispatchOutcome & {
-  stderr: string;
-  stdout: string;
-};
-
-type AgentDispatchReadable = {
-  on(event: "data", listener: (chunk: Buffer | string) => void): unknown;
-};
-
-type AgentDispatchCaptureBudget = {
-  bytes: number;
-  overflowed: boolean;
-};
-
-export type AgentDispatchChild = SandboxExecChild & {
-  stderr: AgentDispatchReadable | null;
-  stdout: AgentDispatchReadable | null;
-};
-
-export type AgentDispatchSpawner = (
-  binary: string,
-  args: readonly string[],
-  stdio: StdioOptions,
-) => AgentDispatchChild;
-
+export type AgentDispatchOutcome = Pick<OpenShellSandboxSessionCompletion, "outcome">;
+export type AgentDispatchResult = Omit<OpenShellSandboxSessionCompletion, "release">;
 export type AgentDispatchRunner = (
-  binary: string,
-  args: readonly string[],
-  options?: {
-    maxBufferBytes?: number;
-    stdinIsTty?: boolean;
-  },
+  request: OpenShellSandboxSessionRequest,
 ) => Promise<AgentDispatchResult>;
 
-export type AgentDispatchRunDeps = {
-  signalSource?: SandboxExecSignalSource;
-  spawnChild?: AgentDispatchSpawner;
-};
+export async function runAgentDispatch(
+  request: OpenShellSandboxSessionRequest,
+  executor: OpenShellSandboxSessionExecutor = createCliOpenShellSandboxSessionExecutor(),
+): Promise<AgentDispatchResult> {
+  const result = await executor.start(request).completion;
+  result.release();
+  return { outcome: result.outcome, stdout: result.stdout, stderr: result.stderr };
+}
 
-const DEFAULT_AGENT_DISPATCH_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+/** The in-sandbox OpenClaw parser uses the same default wait and size limit. */
+export const AGENT_STDIN_DEFAULT_DEADLINE_SECONDS = 30;
+export const AGENT_STDIN_MAX_BYTES = 4 * 1024 * 1024;
 
-const defaultAgentDispatchSpawner: AgentDispatchSpawner = (binary, args, stdio) =>
-  spawn(binary, [...args], { stdio }) as unknown as AgentDispatchChild;
+export type AgentStdinRead =
+  | { kind: "eof"; data: Buffer }
+  | { kind: "deadline" }
+  | { kind: "too-large" }
+  | { kind: "read-error" };
 
-function captureAgentDispatchStream(
-  stream: AgentDispatchReadable | null,
-  child: AgentDispatchChild,
-  chunks: Buffer[],
-  maxBufferBytes: number,
-  budget: AgentDispatchCaptureBudget,
-  setOverflowError: (error: Error) => void,
-): void {
-  stream?.on("data", (chunk) => {
-    if (budget.overflowed) return;
-    const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    const nextSize = budget.bytes + data.byteLength;
-    if (nextSize > maxBufferBytes) {
-      budget.overflowed = true;
-      setOverflowError(
-        new Error(`agent output exceeded the ${maxBufferBytes}-byte combined capture limit`),
-      );
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-      return;
-    }
-    budget.bytes = nextSize;
-    chunks.push(data);
+/** Read piped input to EOF, or stop at the deadline or size limit. */
+export function readAgentStdinWithinDeadline(
+  source: Pick<NodeJS.ReadableStream, "on" | "off"> & { destroy(): unknown },
+  deadlineMs: number,
+  maxBytes: number = AGENT_STDIN_MAX_BYTES,
+): Promise<AgentStdinRead> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    const onData = (chunk: Buffer | string) => {
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += data.byteLength;
+      if (size > maxBytes) return finish({ kind: "too-large" }, true);
+      chunks.push(data);
+    };
+    const onEnd = () => finish({ kind: "eof", data: Buffer.concat(chunks) }, false);
+    // A read error can follow partial input; never dispatch a truncated message.
+    const onError = () => finish({ kind: "read-error" }, true);
+    const finish = (result: AgentStdinRead, release: boolean) => {
+      clearTimeout(timer);
+      source.off("data", onData);
+      source.off("end", onEnd);
+      source.off("error", onError);
+      if (release) source.destroy();
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish({ kind: "deadline" }, true), deadlineMs);
+    source.on("data", onData);
+    source.on("end", onEnd);
+    source.on("error", onError);
   });
 }
 
-/**
- * Capture one agent dispatch while the shared sandbox exec supervisor forwards
- * host termination signals to OpenShell and waits for the child to exit.
- */
-export async function runAgentDispatch(
-  binary: string,
-  args: readonly string[],
-  options: {
-    maxBufferBytes?: number;
-    stdinIsTty?: boolean;
-  } = {},
-  deps: AgentDispatchRunDeps = {},
-): Promise<AgentDispatchResult> {
-  const stderrChunks: Buffer[] = [];
-  const stdoutChunks: Buffer[] = [];
-  const captureBudget: AgentDispatchCaptureBudget = { bytes: 0, overflowed: false };
-  let overflowError: Error | undefined;
-  const maxBufferBytes = options.maxBufferBytes ?? DEFAULT_AGENT_DISPATCH_MAX_BUFFER_BYTES;
-  const spawnChild = deps.spawnChild ?? defaultAgentDispatchSpawner;
-  const result = await runSandboxExecChild(
-    binary,
-    args,
-    { tty: false },
-    (runBinary, runArgs) => {
-      const child = spawnChild(
-        runBinary,
-        runArgs,
-        agentDispatchStdio(options.stdinIsTty ?? isStdinTty()),
-      );
-      const setOverflowError = (error: Error) => {
-        overflowError ??= error;
-      };
-      captureAgentDispatchStream(
-        child.stdout,
-        child,
-        stdoutChunks,
-        maxBufferBytes,
-        captureBudget,
-        setOverflowError,
-      );
-      captureAgentDispatchStream(
-        child.stderr,
-        child,
-        stderrChunks,
-        maxBufferBytes,
-        captureBudget,
-        setOverflowError,
-      );
-      return child;
-    },
-    deps.signalSource,
-  );
-  try {
-    return {
-      status: result.status,
-      signal: result.signal,
-      ...(result.error || overflowError ? { error: result.error ?? overflowError } : {}),
-      stderr: Buffer.concat(stderrChunks).toString("utf-8"),
-      stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
-    };
-  } finally {
-    result.releaseSignals?.();
-  }
+function agentStdinFailure(read: Exclude<AgentStdinRead, { kind: "eof" }>, seconds: number) {
+  const problem = {
+    deadline: `Timed out after ${seconds} second(s) waiting for the piped message to end`,
+    "too-large": `The piped message exceeds ${AGENT_STDIN_MAX_BYTES} bytes`,
+    "read-error": "Could not read the piped message from stdin",
+  }[read.kind];
+  return `  ${problem}. Close the producer after it writes the message, provide --message, or set --timeout <seconds>.\n`;
 }
 
+export type AgentStdinDispatchDeps = {
+  stdinIsTty?: () => boolean;
+  readStdin?: (deadlineMs: number) => Promise<AgentStdinRead>;
+};
+
 /**
- * Stdio for a non-interactive agent dispatch. An interactive terminal is
- * withheld from fd 0; a genuine pipe or redirect is still forwarded so
- * scripted stdin keeps working.
+ * Give OpenShell piped input that already reached EOF, so the input deadline
+ * applies before dispatch. A closed or interactive stdin keeps its posture.
  */
-export function agentDispatchStdio(stdinIsTty: boolean = isStdinTty()): StdioOptions {
-  return [stdinIsTty ? "ignore" : "inherit", "pipe", "pipe"];
+export async function dispatchWithAgentStdinDeadline(
+  request: OpenShellSandboxSessionRequest,
+  deadlineSeconds: number,
+  run: AgentDispatchRunner,
+  deps: AgentStdinDispatchDeps = {},
+): Promise<AgentDispatchResult> {
+  if (
+    request.kind !== "command" ||
+    request.stdin !== undefined ||
+    (deps.stdinIsTty ?? isStdinTty)()
+  )
+    return run(request);
+  const read = await (
+    deps.readStdin ?? ((deadlineMs) => readAgentStdinWithinDeadline(process.stdin, deadlineMs))
+  )(Math.min(deadlineSeconds * 1000, MAX_TIMER_DELAY_MS));
+  if (read.kind === "eof") return run({ ...request, stdin: read.data });
+  return {
+    outcome: { kind: "exited", exitCode: 1 },
+    stdout: "",
+    stderr: agentStdinFailure(read, deadlineSeconds),
+  };
+}
+
+export type OpenClawAgentDispatchDeps = AgentStdinDispatchDeps & {
+  getOpenshellBinary?: () => string;
+  getGatewayName?: (sandboxName: string) => string | null;
+  runDispatch?: AgentDispatchRunner;
+  spawnChild?: CliOpenShellSessionSpawner;
+};
+
+/** Both output formats use the same argv, owning gateway, deadline, and stdin policy. */
+export function runOpenClawAgentDispatch(
+  sandboxName: string,
+  command: readonly string[],
+  deps: OpenClawAgentDispatchDeps = {},
+): Promise<AgentDispatchResult> {
+  const gatewayName = (deps.getGatewayName ?? getKnownSandboxTargetGatewayName)(sandboxName);
+  // Only a timeout that also bounds the OpenShell wait sets the input wait.
+  const requestedSeconds = requestedAgentTimeoutSeconds(command);
+  const inputDeadlineSeconds =
+    requestedSeconds !== null && agentDispatchDeadlineSeconds(command) !== undefined
+      ? requestedSeconds
+      : AGENT_STDIN_DEFAULT_DEADLINE_SECONDS;
+  const runDispatch: AgentDispatchRunner =
+    deps.runDispatch ??
+    ((request) =>
+      dispatchWithAgentStdinDeadline(
+        request,
+        inputDeadlineSeconds,
+        (prepared) =>
+          runAgentDispatch(
+            prepared,
+            createCliOpenShellSandboxSessionExecutor({
+              resolveBinary: deps.getOpenshellBinary,
+              stdinIsTty: deps.stdinIsTty,
+              spawnChild: deps.spawnChild,
+            }),
+          ),
+        deps,
+      ));
+  return runDispatch({
+    kind: "command",
+    sandboxName,
+    target: gatewayName ? { kind: "named", gatewayName } : { kind: "selected" },
+    command: wrapOpenClawAgentCommandWithRuntimeEnv(command),
+    tty: false,
+    output: "capture",
+    timeoutSeconds: agentDispatchDeadlineSeconds(command),
+    ...(canCloseAgentStdin(command) ? { stdin: false } : {}),
+  });
 }
 
 /**
@@ -249,7 +265,12 @@ export function isSilentAgentDispatch(
   stdout: string,
   stderr: string,
 ): boolean {
-  return !result.error && result.status === 0 && stdout.length === 0 && stderr.length === 0;
+  return (
+    result.outcome.kind === "exited" &&
+    result.outcome.exitCode === 0 &&
+    stdout.length === 0 &&
+    stderr.length === 0
+  );
 }
 
 /**
@@ -281,105 +302,144 @@ export function isTimedOutAgentDispatch(stdout: string, stderr: string): boolean
   return OPENCLAW_AGENT_TIMEOUT_PATTERN.test(stdout) || OPENCLAW_AGENT_TIMEOUT_PATTERN.test(stderr);
 }
 
-/** Documented `openclaw agent` options that consume the next argv element. */
-export const OPENCLAW_AGENT_VALUE_FLAGS = new Set([
-  "-a",
+// OpenClaw owns argv validation. Inspect its supported options only to choose
+// stdin, output, and deadline behavior; never rewrite or read message payloads.
+// Unknown options stop inspection because their argument arity is unknown.
+const OPENCLAW_AGENT_VALUE_FLAGS = new Set([
   "--agent",
-  "-m",
   "--message",
+  "--message-file",
   "--model",
   "--provider",
+  "--channel",
+  "--reply-to",
   "--reply-channel",
+  "--reply-account",
   "--session-id",
   "--session-key",
   "--thinking",
   "--timeout",
   "--to",
+  "--verbose",
+  "--profile",
+  "--log-level",
+  "--container",
 ]);
+const OPENCLAW_AGENT_BOOLEAN_FLAGS = new Set([
+  "--deliver",
+  "--local",
+  "--json",
+  "--help",
+  "--dev",
+  "--no-color",
+  "--version",
+]);
+// Retain NemoClaw's existing -a/--provider recognition alongside OpenClaw 2026.7.1.
+const SHORT_FLAGS: Readonly<Record<string, string>> = {
+  "-a": "--agent",
+  "-m": "--message",
+  "-t": "--to",
+  "-h": "--help",
+  "-V": "--version",
+  "-v": "--version",
+};
 
-/** Documented `openclaw agent` options that consume no argv element. */
-export const OPENCLAW_AGENT_BOOLEAN_FLAGS = new Set(["--deliver"]);
+type AgentOption = {
+  value: string | undefined;
+  argumentIndex: number;
+  inline: boolean;
+};
 
-/**
- * Extra seconds added to a requested `--timeout` before the host transport
- * stops waiting.
- *
- * The in-sandbox turn owns the deadline and answers first while it can still
- * write to stderr: it reports the timeout, names the config key, and exits.
- * Only a turn that stops answering reaches the host bound, so the extra seconds
- * must outlast an ordinary late finish.
- *
- * This value is a choice, not a derivation. #8723 timed five aborted runs
- * finishing 0.1 s to 20.8 s after their deadline, and four further aborted runs
- * recorded no finish at all, so no measurement establishes an upper bound.
- * Below roughly five seconds the host truncates the turn's own timeout report;
- * above roughly a minute the host bound no longer catches a turn that stops
- * answering. Thirty is inside that range and above every post-deadline finish
- * #8723 recorded. Choose another value inside that range if a slower model or a
- * busier host requires it.
- */
+function agentOptions(command: readonly string[]) {
+  const options = new Map<string, AgentOption>();
+  if (command[0] !== "openclaw" || command[1] !== "agent") return { options, complete: false };
+  for (let index = 2; index < command.length; index += 1) {
+    const arg = command[index] as string;
+    if (arg === "--") return { options, complete: true };
+    const argumentIndex = index;
+    const shortFlag = SHORT_FLAGS[arg.slice(0, 2)];
+    const equals = arg.startsWith("--") ? arg.indexOf("=") : -1;
+    const flag = shortFlag ?? (equals < 0 ? arg : arg.slice(0, equals));
+    const takesValue = OPENCLAW_AGENT_VALUE_FLAGS.has(flag);
+    const inline = shortFlag ? arg.length > 2 : equals >= 0;
+    if (!takesValue && (!OPENCLAW_AGENT_BOOLEAN_FLAGS.has(flag) || (inline && flag !== "--json")))
+      return { options, complete: false };
+    const value = inline
+      ? arg.slice(shortFlag ? 2 : equals + 1)
+      : takesValue
+        ? command[++index]
+        : undefined;
+    options.set(flag, { value, argumentIndex, inline });
+  }
+  return { options, complete: true };
+}
+
+export function canCloseAgentStdin(command: readonly string[]): boolean {
+  const { options } = agentOptions(command);
+  // Only an inline message proves that valid input needs no stdin. Any sandbox
+  // file can resolve to fd 0 through symlinks, regardless of its pathname.
+  if (options.has("--message")) return true;
+  // A missing/empty file argument fails upstream before any file is read.
+  const file = options.get("--message-file");
+  return file !== undefined && !file.value?.trim();
+}
+
+export function requestsOpenClawJsonOutput(command: readonly string[]): boolean {
+  const option = agentOptions(command).options.get("--json");
+  return (
+    option !== undefined &&
+    !["0", "false", "no", "off"].includes((option.value ?? "").toLowerCase())
+  );
+}
+
+export function hasOpenClawAgentSelector(command: readonly string[]): boolean | undefined {
+  const parsed = agentOptions(command);
+  if (["--agent", "--session-id", "--session-key", "--to"].some((flag) => parsed.options.has(flag)))
+    return true;
+  // Unknown options belong to OpenClaw. Do not invent a missing-selector error
+  // when their arity prevents the host from interpreting later arguments.
+  return parsed.complete ? false : undefined;
+}
+
+export function requestsOpenClawLocalMode(command: readonly string[]): boolean {
+  return agentOptions(command).options.has("--local");
+}
+
+// #8723 observed timeout reports arriving up to 20.8 seconds after the requested
+// deadline. Keep 30 seconds for the remote turn to report its own failure.
+// This is an execution deadline, not a bound on host readiness or lock acquisition.
 export const AGENT_DISPATCH_DEADLINE_BUFFER_SECONDS = 30;
 
-/**
- * The `--timeout` an `openclaw agent` argv requests, or null when the argv
- * requests none.
- *
- * Mirrors the documented flag grammar only far enough to read one value.
- * Anything unrecognized, malformed, or past a `--` terminator returns null so
- * the host keeps the wait unbounded rather than shortening a turn without
- * evidence. `--timeout 0` disables the deadline upstream and returns null here
- * for the same reason.
- */
-export function requestedAgentTimeoutSeconds(argv: readonly string[]): number | null {
-  if (argv[0] !== "openclaw" || argv[1] !== "agent") return null;
-  for (let index = 2; index < argv.length; index += 1) {
-    const arg = argv[index] as string;
-    if (arg === "--") return null;
-    if (arg === "--timeout") return parseDeadlineSeconds(argv[index + 1]);
-    if (arg.startsWith("--timeout=")) return parseDeadlineSeconds(arg.slice("--timeout=".length));
-    if (OPENCLAW_AGENT_VALUE_FLAGS.has(arg)) {
-      index += 1;
-      continue;
-    }
-    const equalsIndex = arg.indexOf("=");
-    if (
-      equalsIndex > 0 &&
-      arg.startsWith("--") &&
-      OPENCLAW_AGENT_VALUE_FLAGS.has(arg.slice(0, equalsIndex))
-    ) {
-      continue;
-    }
-    if (
-      arg === "--json" ||
-      arg.startsWith("--json=") ||
-      OPENCLAW_AGENT_BOOLEAN_FLAGS.has(arg)
-    ) {
-      continue;
-    }
-    return null;
-  }
-  return null;
+function findRequestedAgentTimeout(
+  command: readonly string[],
+): (AgentOption & { seconds: number }) | null {
+  const option = agentOptions(command).options.get("--timeout");
+  if (option?.value === undefined || !/^\d+$/.test(option.value)) return null;
+  const seconds = Number(option.value);
+  return Number.isSafeInteger(seconds) && seconds > 0 ? { ...option, seconds } : null;
 }
 
-function parseDeadlineSeconds(raw: string | undefined): number | null {
-  if (raw === undefined || !/^\d+$/.test(raw)) return null;
-  const seconds = Number(raw);
-  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : null;
+/** Zero, malformed, absent, or ambiguous timeouts keep the existing unbounded behavior. */
+export function requestedAgentTimeoutSeconds(command: readonly string[]): number | null {
+  return findRequestedAgentTimeout(command)?.seconds ?? null;
 }
 
-/**
- * The host transport deadline for an `openclaw agent` argv, or undefined when
- * the argv requested none. Undefined leaves `openshell sandbox exec` on its own
- * default, which is no timeout.
- *
- * A requested deadline near the safe-integer ceiling stays unbounded rather
- * than becoming a bound the host cannot represent. Past that ceiling the buffer
- * addition rounds, so the wait would silently differ from the number written to
- * the command line. That matches how this module treats every other value it
- * cannot read.
- */
-export function agentDispatchDeadlineSeconds(argv: readonly string[]): number | undefined {
-  const requested = requestedAgentTimeoutSeconds(argv);
+export function replaceRequestedAgentTimeoutSeconds(
+  argv: readonly string[],
+  timeoutSeconds: number,
+): readonly string[] {
+  const requested = findRequestedAgentTimeout(argv);
+  if (!requested) return argv;
+  const value = String(Math.max(1, Math.floor(timeoutSeconds)));
+  const command = [...argv];
+  command[requested.argumentIndex + (requested.inline ? 0 : 1)] = requested.inline
+    ? `--timeout=${value}`
+    : value;
+  return command;
+}
+
+export function agentDispatchDeadlineSeconds(command: readonly string[]): number | undefined {
+  const requested = requestedAgentTimeoutSeconds(command);
   if (requested === null) return undefined;
   const deadline = requested + AGENT_DISPATCH_DEADLINE_BUFFER_SECONDS;
   return Number.isSafeInteger(deadline) ? deadline : undefined;

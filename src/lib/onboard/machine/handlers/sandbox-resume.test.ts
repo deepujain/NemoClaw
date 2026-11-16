@@ -7,6 +7,7 @@ import {
   decideSandboxResume,
   hasCompatibleEndpointReasoningDrift,
   hasHermesCompatibleAnthropicInferenceRouteDrift,
+  hasMessagingChannelConfigDrift,
   type SandboxResumeSignals,
 } from "./sandbox-resume";
 
@@ -37,9 +38,21 @@ describe("decideSandboxResume", () => {
     expect(decideSandboxResume(resumeSignals())).toEqual({ kind: "reuse" });
   });
 
+  it("continues pending Hermes Portable lifecycle custody instead of reusing its Ready sandbox (#9211)", () => {
+    expect(decideSandboxResume(resumeSignals({ hermesPortableLifecyclePending: true }))).toEqual({
+      kind: "create",
+      continueHermesPortableLifecycle: true,
+    });
+  });
+
+  it("reuses a Hermes Portable sandbox after lifecycle custody is finalized (#9211)", () => {
+    expect(decideSandboxResume(resumeSignals({ hermesPortableLifecyclePending: false }))).toEqual({
+      kind: "reuse",
+    });
+  });
+
   it.each([
     ["agent", { resumeAgentChanged: true }, false],
-    ["compatible endpoint reasoning", { compatibleEndpointReasoningChanged: true }, false],
     ["web search", { webSearchConfigChanged: true }, true],
     ["explicit recreate", { recreateSandboxRequested: true }, false],
     ["sandbox GPU", { sandboxGpuConfigChanged: true }, true],
@@ -57,6 +70,23 @@ describe("decideSandboxResume", () => {
       kind: "recreate",
       removeRegistryEntry,
     });
+  });
+
+  it("reuses a Ready sandbox when its baked reasoning capability drifted without an explicit recreate (#13732)", () => {
+    expect(
+      decideSandboxResume(resumeSignals({ compatibleEndpointReasoningChanged: true })),
+    ).toEqual({
+      kind: "reuse",
+      note: "  [resume] Reasoning capability differs from the Ready sandbox; keeping its baked value. Pass --recreate-sandbox to apply the saved onboarding value.",
+    });
+  });
+
+  it("recreates a Ready sandbox with reasoning drift only when recreate is explicitly requested (#13732)", () => {
+    expect(
+      decideSandboxResume(
+        resumeSignals({ compatibleEndpointReasoningChanged: true, recreateSandboxRequested: true }),
+      ),
+    ).toMatchObject({ kind: "recreate" });
   });
 
   it("preserves registry fidelity while recreating for Hermes inference route drift", () => {
@@ -137,24 +167,55 @@ describe("decideSandboxResume", () => {
     });
   });
 
-  it.each([
-    "missing",
-    "not_ready",
-  ])("continues an owned recreate when the outer transaction leaves the source %s", (sandboxReuseState) => {
+  it.each(["missing", "not_ready"])(
+    "continues an owned recreate when the outer transaction leaves the source %s (#10056)",
+    (sandboxReuseState) => {
+      expect(
+        decideSandboxResume(
+          resumeSignals({
+            sandboxStepComplete: false,
+            sandboxReuseState,
+            recreateSandboxRequested: true,
+            recreateJournalHandoff: true,
+          }),
+        ),
+      ).toEqual({
+        kind: "recreate",
+        note: "  [resume] Continuing journaled sandbox recreation.",
+        removeRegistryEntry: false,
+      });
+    },
+  );
+
+  it.each(["ready", "missing", "not_ready"])(
+    "continues a validated active recreate while its source is %s (#10056)",
+    (sandboxReuseState) => {
+      expect(
+        decideSandboxResume(
+          resumeSignals({
+            sandboxStepComplete: false,
+            sandboxReuseState,
+            activeRecreateJournal: true,
+          }),
+        ),
+      ).toEqual({
+        kind: "recreate",
+        note: "  [resume] Continuing journaled sandbox recreation.",
+        removeRegistryEntry: false,
+      });
+    },
+  );
+
+  it("does not continue an active recreate when source state is unknown (#10056)", () => {
     expect(
       decideSandboxResume(
         resumeSignals({
           sandboxStepComplete: false,
-          sandboxReuseState,
-          recreateSandboxRequested: true,
-          recreateJournalHandoff: true,
+          sandboxReuseState: "unknown",
+          activeRecreateJournal: true,
         }),
       ),
-    ).toEqual({
-      kind: "recreate",
-      note: "  [resume] Continuing journaled sandbox recreation.",
-      removeRegistryEntry: false,
-    });
+    ).toEqual({ kind: "create" });
   });
 
   it("does not trust a journal handoff when the sandbox state is unknown", () => {
@@ -205,8 +266,9 @@ describe("decideSandboxResume", () => {
   });
 
   it("repairs a not-ready sandbox even with reasoning capability drift (#7570)", () => {
-    // compatibleEndpointReasoningChanged only triggers recreate when the
-    // sandbox is ready; when not_ready, the sandbox falls through to repair.
+    // compatibleEndpointReasoningChanged never triggers a recreate on its own:
+    // a Ready sandbox is reused with its recorded value on a plain resume
+    // (#13732), and a not-ready sandbox still falls through to repair.
     expect(
       decideSandboxResume(
         resumeSignals({
@@ -229,20 +291,23 @@ describe("decideSandboxResume", () => {
       { inferenceRouteConfigChanged: true },
       "Hermes inference route configuration changed",
     ],
-  ] as const)("uses compatibility recreate for %s drift even when not-ready", (_label, drift, expectedNoteFragment) => {
-    expect(
-      decideSandboxResume(
-        resumeSignals({
-          sandboxReuseState: "not_ready",
-          ...drift,
-        }),
-      ),
-    ).toEqual({
-      kind: "recreate",
-      note: expect.stringContaining(expectedNoteFragment),
-      removeRegistryEntry: false,
-    });
-  });
+  ] as const)(
+    "uses compatibility recreate for %s drift even when not-ready (#10056)",
+    (_label, drift, expectedNoteFragment) => {
+      expect(
+        decideSandboxResume(
+          resumeSignals({
+            sandboxReuseState: "not_ready",
+            ...drift,
+          }),
+        ),
+      ).toEqual({
+        kind: "recreate",
+        note: expect.stringContaining(expectedNoteFragment),
+        removeRegistryEntry: false,
+      });
+    },
+  );
 
   it.each([
     [
@@ -275,20 +340,23 @@ describe("decideSandboxResume", () => {
       "Observability configuration changed",
       false,
     ],
-  ] as const)("uses runtime-configuration recreate for %s even when not-ready", (_label, drift, expectedNoteFragment, expectedRemoveRegistry) => {
-    expect(
-      decideSandboxResume(
-        resumeSignals({
-          sandboxReuseState: "not_ready",
-          ...drift,
-        }),
-      ),
-    ).toEqual({
-      kind: "recreate",
-      note: expect.stringContaining(expectedNoteFragment),
-      removeRegistryEntry: expectedRemoveRegistry,
-    });
-  });
+  ] as const)(
+    "uses runtime-configuration recreate for %s even when not-ready (#10056)",
+    (_label, drift, expectedNoteFragment, expectedRemoveRegistry) => {
+      expect(
+        decideSandboxResume(
+          resumeSignals({
+            sandboxReuseState: "not_ready",
+            ...drift,
+          }),
+        ),
+      ).toEqual({
+        kind: "recreate",
+        note: expect.stringContaining(expectedNoteFragment),
+        removeRegistryEntry: expectedRemoveRegistry,
+      });
+    },
+  );
 
   it.each([
     [
@@ -298,20 +366,23 @@ describe("decideSandboxResume", () => {
       false,
     ],
     ["tool disclosure change", { toolDisclosureChanged: true }, "configuration changed", false],
-  ] as const)("uses tool-disclosure recreate for %s even when not-ready", (_label, drift, expectedNoteFragment, expectedRemoveRegistry) => {
-    expect(
-      decideSandboxResume(
-        resumeSignals({
-          sandboxReuseState: "not_ready",
-          ...drift,
-        }),
-      ),
-    ).toEqual({
-      kind: "recreate",
-      note: expect.stringContaining(expectedNoteFragment),
-      removeRegistryEntry: expectedRemoveRegistry,
-    });
-  });
+  ] as const)(
+    "uses tool-disclosure recreate for %s even when not-ready (#10056)",
+    (_label, drift, expectedNoteFragment, expectedRemoveRegistry) => {
+      expect(
+        decideSandboxResume(
+          resumeSignals({
+            sandboxReuseState: "not_ready",
+            ...drift,
+          }),
+        ),
+      ).toEqual({
+        kind: "recreate",
+        note: expect.stringContaining(expectedNoteFragment),
+        removeRegistryEntry: expectedRemoveRegistry,
+      });
+    },
+  );
 
   it("creates without resume-specific cleanup when the step is incomplete", () => {
     expect(
@@ -358,6 +429,39 @@ describe("hasCompatibleEndpointReasoningDrift", () => {
         compatibleEndpointReasoning: "true",
         registryEntry: { name: "saved", compatibleEndpointReasoning: "false" },
       }),
+    ).toBe(false);
+  });
+});
+
+describe("hasMessagingChannelConfigDrift", () => {
+  const configsEqual = (
+    left: Record<string, string> | null,
+    right: Record<string, string> | null,
+  ) => JSON.stringify(left) === JSON.stringify(right);
+
+  it("ignores process-environment channel values when the sandbox recorded no channel configuration", () => {
+    expect(
+      hasMessagingChannelConfigDrift({ TELEGRAM_REQUIRE_MENTION: "0" }, null, configsEqual),
+    ).toBe(false);
+  });
+
+  it("reports a recorded channel value that the process environment overrides", () => {
+    expect(
+      hasMessagingChannelConfigDrift(
+        { TELEGRAM_REQUIRE_MENTION: "0" },
+        { TELEGRAM_REQUIRE_MENTION: "1" },
+        configsEqual,
+      ),
+    ).toBe(true);
+  });
+
+  it("reports no drift when the effective configuration matches the recorded configuration", () => {
+    expect(
+      hasMessagingChannelConfigDrift(
+        { TELEGRAM_REQUIRE_MENTION: "1" },
+        { TELEGRAM_REQUIRE_MENTION: "1" },
+        configsEqual,
+      ),
     ).toBe(false);
   });
 });

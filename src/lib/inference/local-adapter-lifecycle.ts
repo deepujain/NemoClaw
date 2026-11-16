@@ -8,7 +8,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
-import { DEFAULT_GATEWAY_PORT, GATEWAY_PORT } from "../core/ports";
+import { DEFAULT_GATEWAY_PORT, GATEWAY_PORT, OLLAMA_PORT } from "../core/ports";
 import { waitUntilAsync } from "../core/wait";
 import { rejectSymlinksOnPath } from "../state/config-io";
 import { nemoclawStateRoot } from "../state/state-root";
@@ -42,6 +42,53 @@ export function resolveSharedLocalAdapterStateRoot(homeDir: string = os.homedir(
 
 export const SHARED_LOCAL_ADAPTER_STATE_DIR = resolveSharedLocalAdapterStateRoot();
 export const LOCAL_ADAPTER_HEALTH_MAX_RESPONSE_BYTES = 64 * 1024;
+export const OLLAMA_LOCALHOST = "127.0.0.1";
+export const OLLAMA_HOST_DOCKER_INTERNAL = "host.docker.internal";
+
+export type OllamaHostRoute = typeof OLLAMA_LOCALHOST | typeof OLLAMA_HOST_DOCKER_INTERNAL;
+
+/** Registry fields that identify a route backed by NemoClaw's host Ollama daemon. */
+export type OllamaRouteHolder = {
+  readonly provider?: string | null;
+  readonly endpointUrl?: string | null;
+};
+
+function isSupportedOllamaRouteHost(host: string): host is OllamaHostRoute {
+  return host === OLLAMA_LOCALHOST || host === OLLAMA_HOST_DOCKER_INTERNAL;
+}
+
+/**
+ * Return whether a recorded inference route uses NemoClaw's host Ollama daemon.
+ *
+ * Direct and legacy Ollama providers own that daemon by definition. A
+ * compatible endpoint owns it only when its credential-free HTTP URL names
+ * the selected fixed host route and Ollama port. Remote compatible endpoints
+ * are never classified as local owners.
+ */
+export function isLocalOllamaRouteOwner(
+  route: OllamaRouteHolder,
+  selectedHost: OllamaHostRoute | null = null,
+): boolean {
+  if (route.provider === "ollama-local" || route.provider?.startsWith("ollama/")) return true;
+  if (route.provider !== "compatible-endpoint" || !route.endpointUrl) return false;
+
+  try {
+    const endpoint = new URL(route.endpointUrl);
+    const endpointHost = endpoint.hostname.toLowerCase();
+    const hostMatches = selectedHost
+      ? endpointHost === selectedHost
+      : isSupportedOllamaRouteHost(endpointHost);
+    return (
+      endpoint.protocol === "http:" &&
+      endpoint.username === "" &&
+      endpoint.password === "" &&
+      Number(endpoint.port) === OLLAMA_PORT &&
+      hostMatches
+    );
+  } catch {
+    return false;
+  }
+}
 
 export function ensureLocalAdapterStateDir(stateDir = DEFAULT_LOCAL_ADAPTER_STATE_DIR): void {
   rejectSymlinksOnPath(stateDir);
@@ -165,17 +212,37 @@ export function isLocalAdapterProcess(
     : processMatcher(commandLine);
 }
 
-export function killLocalAdapterPid(options: {
+export type LocalAdapterProcessOptions = {
   pidPath: string;
   processMatcher: LocalAdapterProcessMatcher;
   run: RunFn;
   runCapture: RunCaptureFn;
-}): void {
-  const persistedPid = loadLocalAdapterPid(options.pidPath);
-  if (isLocalAdapterProcess(persistedPid, options.processMatcher, options.runCapture)) {
-    options.run(["kill", String(persistedPid)], { ignoreError: true, suppressOutput: true });
+};
+
+export function killLocalAdapterPid(
+  options: LocalAdapterProcessOptions,
+  pid: number | null | undefined = loadLocalAdapterPid(options.pidPath),
+): void {
+  if (isLocalAdapterProcess(pid, options.processMatcher, options.runCapture)) {
+    options.run(["kill", String(pid)], { ignoreError: true, suppressOutput: true });
   }
   removeLocalAdapterFile(options.pidPath);
+}
+
+/**
+ * Undoes a partial adapter startup so a failed `ensure` leaves no adapter holding the port and no
+ * state file describing an adapter that is not running. It removes the pid and state files only,
+ * so any other file an adapter deliberately reuses across a respawn survives.
+ *
+ * Callers pass `spawnedPid` so the child of the failed startup is still signalled when the pid file
+ * was never written — persisting it can itself fail, and the pid file is then the wrong source.
+ */
+export function cleanupFailedLocalAdapterStartup(
+  options: LocalAdapterProcessOptions & { statePath: string },
+  spawnedPid?: number,
+): void {
+  killLocalAdapterPid(options, spawnedPid);
+  removeLocalAdapterFile(options.statePath);
 }
 
 export function spawnDetachedNodeAdapter(options: {
@@ -183,15 +250,11 @@ export function spawnDetachedNodeAdapter(options: {
   env: Record<string, string>;
   buildEnv: (extraEnv?: Record<string, string>) => NodeJS.ProcessEnv;
 }): ChildProcess {
-  const child = spawn(
-    process.execPath,
-    ["--experimental-strip-types", "--no-warnings", options.scriptPath],
-    {
-      detached: true,
-      stdio: "ignore",
-      env: options.buildEnv(options.env),
-    },
-  );
+  const child = spawn(process.execPath, ["--no-warnings", options.scriptPath], {
+    detached: true,
+    stdio: "ignore",
+    env: options.buildEnv(options.env),
+  });
   child.unref();
   return child;
 }

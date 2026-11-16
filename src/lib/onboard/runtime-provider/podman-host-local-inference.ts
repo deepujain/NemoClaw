@@ -8,8 +8,9 @@ import type {
   ContainerEngine,
   ContainerEngineCommandResult,
 } from "../../adapters/container-engine";
-import type { PodmanContainerEngine } from "../../adapters/podman";
+import type { PodmanBoundContainerEngine, PodmanContainerEngine } from "../../adapters/podman";
 import {
+  deadlineBoundHostLocalInferenceEngine,
   HOST_LOCAL_INFERENCE_SANDBOX_HOST,
   type HostLocalInferenceEndpointAuthority,
   type HostLocalInferenceEndpointInput,
@@ -26,7 +27,6 @@ import {
   type HostLocalInferenceRouteAuthorityStore,
   type HostLocalInferenceRuntime,
   type HostLocalInferenceRuntimeAuthority,
-  type HostLocalInferenceService,
   type HostLocalManagedInferenceInput,
   type HostLocalManagedInferenceInspection,
   type HostLocalOllamaAccelerationAuthority,
@@ -34,17 +34,25 @@ import {
   normalizeHostLocalInferenceImageRef,
   normalizeHostLocalInferenceReceipt,
   normalizeHostLocalOllamaModelRef,
+  parseHostLocalInferenceReceipt,
   serializeHostLocalInferenceReceipt,
 } from "./host-local-inference";
 import {
   createPersistedEngineAuthority,
+  normalizePersistedEngineAuthority,
+  serializePersistedEngineAuthority,
   type PersistedEngineAuthority,
   type PersistedEngineAuthorityStore,
   requirePersistedEngineAuthority,
 } from "./persisted-engine-authority";
 import { translatePodmanLocalInferenceArgs } from "./podman-inference-args";
 import {
+  assertInferencePublishPortsFree,
+  type InspectPublishedPort,
+} from "./podman-inference-publish-preflight";
+import {
   type PodmanInferenceAuthorityReceipt,
+  type PodmanInferenceQualificationOptions,
   qualifyPodmanInferenceAuthority,
   revalidatePodmanInferenceAuthority,
 } from "./podman-preflight";
@@ -65,6 +73,14 @@ export const PODMAN_INFERENCE_NETWORK_PROVIDER_LABEL =
 export const PODMAN_INFERENCE_NETWORK_ENGINE_AUTHORITY_LABEL =
   "ai.nvidia.nemoclaw.inference.network.engine-authority-sha256";
 export const PODMAN_INFERENCE_PROBE_MANAGED_LABEL = "ai.nvidia.nemoclaw.inference.probe.managed";
+
+/** Closed owner signal retained across exact published-runtime rollback. */
+export class PublishedInferenceForwardAuthorityError extends Error {
+  constructor() {
+    super("Published inference forward authority changed.");
+    this.name = "PublishedInferenceForwardAuthorityError";
+  }
+}
 export const PODMAN_INFERENCE_PROBE_PHASE_LABEL = "ai.nvidia.nemoclaw.inference.probe.phase";
 export const PODMAN_INFERENCE_PROBE_SPEC_LABEL = "ai.nvidia.nemoclaw.inference.probe.spec-sha256";
 const PODMAN_INFERENCE_LABEL_PREFIX = "ai.nvidia.nemoclaw.inference.";
@@ -92,14 +108,135 @@ const RESERVED_NETWORK_NAMES = new Set([
 ]);
 const AT_REST_STATES = new Set(["configured", "created", "dead", "exited", "stopped"]);
 const PROBE_TIMEOUT_MS = 30_000;
+const POST_CREATE_PROBE_INSPECT_MAX_ATTEMPTS = 3;
+const PROBE_CLEANUP_SETTLEMENT_TIMEOUT_MS = 30_000;
+const PROBE_CLEANUP_SETTLEMENT_INTERVAL_MS = 1_000;
+const PROBE_CLEANUP_SLEEP_BUFFER = new Int32Array(new SharedArrayBuffer(4));
+const INFERENCE_PROBE_TIMEOUT_MS = 150_000;
 const READY_PROBE_TIMEOUT_MS = 240_000;
+const PROBE_CURL_MAX_TIME_SECONDS = 20;
+const INFERENCE_PROBE_CURL_MAX_TIME_SECONDS = 120;
 const MUTATION_TIMEOUT_MS = 60_000;
+const OLLAMA_MODEL_PULL_TIMEOUT_MS = 30 * 60_000;
 const STOP_GRACE_SECONDS = 30;
 const SECRET_ENVIRONMENT_BY_SERVICE = Object.freeze({
+  ollama: new Set<string>(),
   nim: new Set(["NGC_API_KEY", "NIM_NGC_API_KEY"]),
   // B4-D qualifies only loopback, gateway-controlled, unauthenticated vLLM.
   vllm: new Set<string>(),
 });
+
+export interface PodmanProbeCleanupTiming {
+  readonly now?: () => number;
+  readonly sleep?: (milliseconds: number) => void;
+}
+
+export const PODMAN_PUBLISHED_RESUME_TIMING_STAGES = [
+  "start",
+  "managedReady",
+  "gpuIdentity",
+  "generatedProof",
+  "modelPlacement",
+  "cleanupCurrentness",
+] as const;
+
+export type PodmanPublishedResumeTimingStage =
+  (typeof PODMAN_PUBLISHED_RESUME_TIMING_STAGES)[number];
+
+export interface PodmanPublishedResumeTimingEvidence {
+  readonly startMs: number;
+  readonly managedReadyMs: number;
+  readonly gpuIdentityMs: number;
+  readonly generatedProofMs: number;
+  readonly modelPlacementMs: number;
+  /** Exclusive aggregate across disposable-probe cleanup and currentness checks. */
+  readonly cleanupCurrentnessMs: number;
+  readonly totalMs: number;
+  readonly runtimeAction: "reused" | "started";
+}
+
+export interface PodmanPublishedResumeTiming {
+  readonly now?: () => number;
+  readonly onComplete: (evidence: PodmanPublishedResumeTimingEvidence) => void;
+}
+
+type PodmanPublishedResumeTimingRecorder = {
+  measure<T>(stage: PodmanPublishedResumeTimingStage, operation: () => T): T;
+  finish(runtimeAction: PodmanPublishedResumeTimingEvidence["runtimeAction"]): void;
+};
+
+const PODMAN_PUBLISHED_RESUME_TIMING_MAX_MS = 9_999_999;
+
+function createPodmanPublishedResumeTimingRecorder(
+  timing: PodmanPublishedResumeTiming | undefined,
+): PodmanPublishedResumeTimingRecorder {
+  const now = timing?.now ?? (() => performance.now());
+  const durations = new Map<PodmanPublishedResumeTimingStage, number>();
+  const active: {
+    stage: PodmanPublishedResumeTimingStage;
+    startedAt: number | null;
+  }[] = [];
+  let finished = false;
+  const safeNow = (): number | null => {
+    try {
+      const value = now();
+      return Number.isFinite(value) ? value : null;
+    } catch {
+      return null;
+    }
+  };
+  const elapsed = (startedAt: number | null, finishedAt: number | null): number => {
+    if (startedAt === null || finishedAt === null) return 0;
+    const value = Math.round(finishedAt - startedAt);
+    if (!Number.isFinite(value)) return 0;
+    return Math.min(PODMAN_PUBLISHED_RESUME_TIMING_MAX_MS, Math.max(0, value));
+  };
+  const add = (stage: PodmanPublishedResumeTimingStage, value: number): void => {
+    durations.set(stage, (durations.get(stage) ?? 0) + value);
+  };
+  const totalStartedAt = safeNow();
+
+  const measure = <T>(stage: PodmanPublishedResumeTimingStage, operation: () => T): T => {
+    const enteredAt = safeNow();
+    const parent = active.at(-1);
+    if (parent) add(parent.stage, elapsed(parent.startedAt, enteredAt));
+    active.push({ stage, startedAt: enteredAt });
+    try {
+      return operation();
+    } finally {
+      const finishedAt = safeNow();
+      const frame = active.pop();
+      add(stage, elapsed(frame?.startedAt ?? null, finishedAt));
+      const resumed = active.at(-1);
+      if (resumed) resumed.startedAt = finishedAt;
+    }
+  };
+
+  return {
+    measure,
+    finish(runtimeAction): void {
+      if (finished) return;
+      finished = true;
+      if (!timing) return;
+      try {
+        timing.onComplete(
+          Object.freeze({
+            startMs: durations.get("start") ?? 0,
+            managedReadyMs: durations.get("managedReady") ?? 0,
+            gpuIdentityMs: durations.get("gpuIdentity") ?? 0,
+            generatedProofMs: durations.get("generatedProof") ?? 0,
+            modelPlacementMs: durations.get("modelPlacement") ?? 0,
+            cleanupCurrentnessMs: durations.get("cleanupCurrentness") ?? 0,
+            totalMs: elapsed(totalStartedAt, safeNow()),
+            runtimeAction,
+          }),
+        );
+      } catch {
+        // Timing output must not change published-runtime recovery.
+      }
+    },
+  };
+}
 
 export interface PodmanHostLocalInferenceRuntimeOptions {
   readonly engine: PodmanContainerEngine;
@@ -108,10 +245,24 @@ export interface PodmanHostLocalInferenceRuntimeOptions {
   readonly authorityStore: PersistedEngineAuthorityStore;
   readonly routeAuthorityStore: HostLocalInferenceRouteAuthorityStore;
   readonly authority: PodmanInferenceAuthorityReceipt;
+  readonly authorityQualification?: PodmanInferenceQualificationOptions;
+  /** Immutable creation identity for one product-requalified published runtime. */
+  readonly hermesPortablePublishedEngineAuthority?: {
+    readonly intent: "connect-probe-only";
+    readonly creationAuthority: PersistedEngineAuthority;
+    readonly serializedReceipt: string;
+    readonly assertForwardAuthority: () => void;
+  };
+  /** Fixed, credential-free successful-resume timing. Diagnostic failures are fail-open. */
+  readonly publishedResumeTiming?: PodmanPublishedResumeTiming;
+  readonly probeCleanupTiming?: PodmanProbeCleanupTiming;
+  readonly externalNetwork?: PodmanExternalInferenceNetworkAuthority;
   /** Immutable accepted acceleration scope for this one operation. */
   readonly operationAcceleration?: HostLocalOllamaAccelerationAuthority;
   readonly onFailureEvidence: (evidence: PodmanInferenceFailureEvidence) => void;
   readonly redactSensitive: PodmanInferenceRedactor;
+  /** Test seam: inspect a host publish target before `podman run`. */
+  readonly inspectPublishedPort?: InspectPublishedPort;
 }
 
 export interface PodmanHostLocalInferenceOperationOptions {
@@ -120,13 +271,53 @@ export interface PodmanHostLocalInferenceOperationOptions {
   readonly env: NodeJS.ProcessEnv;
   /** Accepted acceleration scope for this one operation. */
   readonly acceleration?: HostLocalOllamaAccelerationAuthority;
+  /** Shared absolute deadline for every provider observation in this operation. */
+  readonly deadlineMs?: number;
+  /** Prequalified product network whose host listener is not its IPAM gateway. */
+  readonly externalNetwork?: PodmanExternalInferenceNetworkAuthority;
+  /** Product-specific exact authority when the generic Podman 6 discovery path is unavailable. */
+  readonly authority?: PodmanInferenceAuthorityReceipt;
+  readonly authorityQualification?: PodmanInferenceQualificationOptions;
+  readonly hermesPortablePublishedEngineAuthority?: PodmanHostLocalInferenceRuntimeOptions["hermesPortablePublishedEngineAuthority"];
+  readonly publishedResumeTiming?: PodmanPublishedResumeTiming;
+  readonly probeCleanupTiming?: PodmanProbeCleanupTiming;
   readonly authorityStore: PersistedEngineAuthorityStore;
   readonly routeAuthorityStore: HostLocalInferenceRouteAuthorityStore;
   readonly onFailureEvidence: (evidence: PodmanInferenceFailureEvidence) => void;
   readonly redactSensitive: PodmanInferenceRedactor;
+  /** Test seam: inspect a host publish target before `podman run`. */
+  readonly inspectPublishedPort?: InspectPublishedPort;
+}
+
+export type PodmanPreparedHostLocalInferenceOperationOptions = Omit<
+  PodmanHostLocalInferenceOperationOptions,
+  "acceleration" | "authority" | "authorityQualification" | "engine" | "env" | "redactSensitive"
+>;
+
+/** One fully qualified Podman authority that can create one operation without recapturing it. */
+export interface PreparedPodmanHostLocalInferenceOperationAuthority {
+  readonly createOperation: (
+    options: PodmanPreparedHostLocalInferenceOperationOptions,
+  ) => HostLocalInferenceOperation;
+  readonly assertTransactionCurrent: () => void;
+  readonly assertCurrent: () => void;
 }
 
 export type PodmanInferenceRedactor = (value: string) => string;
+
+export interface PodmanExternalInferenceNetworkAuthority {
+  /**
+   * The caller's fresh assertion and the pinned identity, addressing, and listener below replace
+   * provider-owned network labels as the trust anchor, so assertCurrent must prove them exactly.
+   */
+  readonly networkId: string;
+  readonly name: string;
+  readonly subnet: string;
+  readonly gatewayIp: string;
+  readonly listenerIp: string;
+  readonly authoritySha256: string;
+  readonly assertCurrent: () => void;
+}
 
 function normalizeOperationAcceleration(value: unknown): HostLocalOllamaAccelerationAuthority {
   if (value === undefined) return "nvidia-gpu";
@@ -149,12 +340,13 @@ export interface PodmanInferenceFailureEvidence {
 }
 
 interface ManagedSpec {
-  readonly service: "nim" | "vllm";
+  readonly service: "ollama" | "nim" | "vllm";
   readonly containerName: string;
   readonly containerPort: number;
   readonly imageRef: string;
   readonly gpuDevices: readonly string[];
   readonly environment: readonly string[];
+  readonly ollamaContextLength: number | null;
   readonly mounts: readonly Required<HostLocalInferenceMount>[];
   readonly sharedMemory: string;
   readonly ipc: "private";
@@ -182,7 +374,10 @@ type ManagedContainerRuntime = Extract<
   HostLocalInferenceRuntimeAuthority,
   { readonly kind: "container" }
 > & {
-  readonly gpu: { readonly vendor: "nvidia"; readonly devices: readonly string[] };
+  readonly gpu: {
+    readonly vendor: "nvidia";
+    readonly devices: readonly string[];
+  };
 };
 
 type OllamaHostRuntimeAuthority = Extract<
@@ -191,7 +386,7 @@ type OllamaHostRuntimeAuthority = Extract<
 >;
 
 type ManagedReceipt = HostLocalInferenceReceipt & {
-  readonly service: "nim" | "vllm";
+  readonly service: "ollama" | "nim" | "vllm";
   readonly runtime: ManagedContainerRuntime;
   readonly inference: HostLocalInferenceProofAuthority;
   readonly publication: HostLocalInferencePublicationAuthority;
@@ -206,6 +401,7 @@ interface ManagedContainer {
   readonly status: string;
   readonly createArguments: readonly string[];
   readonly environmentNames: readonly string[];
+  readonly ollamaContextLength: number | null;
   readonly ipcMode: string;
   readonly networkId: string;
   readonly networkName: string;
@@ -226,6 +422,11 @@ interface ProbeSpec {
   readonly name: string;
   readonly specSha256: string;
   readonly launchArguments: readonly string[];
+}
+
+interface ProbeSpecSet {
+  readonly current: ProbeSpec;
+  readonly legacy: readonly ProbeSpec[];
 }
 
 interface OllamaModelPlacementAuthority {
@@ -342,13 +543,21 @@ function sanitizeFailureResult(
   redactor: PodmanInferenceRedactor,
 ): ContainerEngineCommandResult {
   const failed = result.status !== 0 || result.error !== undefined;
+  const error =
+    result.error === undefined
+      ? undefined
+      : Object.assign(new Error(redactEvidence(redactor, result.error.message)), {
+          ...((result.error as NodeJS.ErrnoException).code === "ETIMEDOUT"
+            ? { code: "ETIMEDOUT" }
+            : {}),
+        });
   return Object.freeze({
     status: result.status,
     // Successful stdout remains intact because it carries provider JSON and
     // exact runtime identities. Stderr is never parsed and is always redacted.
     stdout: failed ? redactEvidence(redactor, result.stdout) : result.stdout,
     stderr: redactEvidence(redactor, result.stderr),
-    ...(result.error ? { error: new Error(redactEvidence(redactor, result.error.message)) } : {}),
+    ...(error ? { error } : {}),
   });
 }
 
@@ -356,12 +565,16 @@ function redactingEngine(
   engine: PodmanContainerEngine,
   redactor: PodmanInferenceRedactor,
 ): PodmanContainerEngine {
+  const bound = engine as PodmanContainerEngine & {
+    readonly assertAuthority?: () => void;
+  };
   return Object.freeze({
     operation: engine.operation,
     engineId: engine.engineId,
     displayName: engine.displayName,
     authorityId: engine.authorityId,
     endpointAuthorityId: engine.endpointAuthorityId,
+    ...(bound.assertAuthority ? { assertAuthority: bound.assertAuthority } : {}),
     capture: (args: readonly string[], timeoutMs?: number, input?: Buffer) =>
       sanitizeFailureResult(engine.capture(args, timeoutMs, input), redactor),
     captureHost: (args: readonly string[], timeoutMs?: number) =>
@@ -391,6 +604,10 @@ function commandEvidence(result: ContainerEngineCommandResult): string {
   return boundedEvidence(
     result.stderr || result.stdout || result.error?.message || "unknown failure",
   );
+}
+
+function commandTimedOut(result: ContainerEngineCommandResult): boolean {
+  return (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
 }
 
 function redactedCommandEvidence(
@@ -467,6 +684,17 @@ function normalizedEnvironment(values: readonly string[] | undefined): readonly 
   return Object.freeze([...environment].sort());
 }
 
+function normalizedOllamaContextLength(
+  service: HostLocalManagedInferenceInput["service"],
+  value: number | undefined,
+): number | null {
+  if (value === undefined) return null;
+  if (service !== "ollama" || value !== 64_000) {
+    throw new Error("Podman managed Ollama context length is invalid.");
+  }
+  return value;
+}
+
 function normalizedMounts(
   values: readonly HostLocalInferenceMount[] | undefined,
 ): readonly Required<HostLocalInferenceMount>[] {
@@ -494,8 +722,8 @@ function requireSecretFreeCommand(
   }
 }
 
-function managedSecretEnvironment(
-  spec: Pick<ManagedSpec, "environment" | "service">,
+function managedOperationEnvironment(
+  spec: Pick<ManagedSpec, "environment" | "ollamaContextLength" | "service">,
   operationEnv: NodeJS.ProcessEnv,
 ): Readonly<Record<string, string>> {
   if (spec.service === "vllm" && spec.environment.length > 0) {
@@ -519,6 +747,9 @@ function managedSecretEnvironment(
       throw new Error(`Podman ${spec.service} inference requires environment '${name}'.`);
     }
     resolved[name] = value;
+  }
+  if (spec.ollamaContextLength !== null) {
+    resolved.OLLAMA_CONTEXT_LENGTH = String(spec.ollamaContextLength);
   }
   return Object.freeze(resolved);
 }
@@ -568,11 +799,15 @@ function inspectProviderNetwork(
   authority: PodmanInferenceAuthorityReceipt,
   expected: Pick<
     HostLocalInferenceEndpointInput,
-    "networkGatewayIp" | "networkId" | "networkName"
+    "networkGatewayIp" | "networkId" | "networkListenerIp" | "networkName"
   > & {
     readonly networkAuthoritySha256?: string;
   },
+  external?: PodmanExternalInferenceNetworkAuthority,
 ): PodmanInferenceNetworkAuthority {
+  if (!external && expected.networkListenerIp !== undefined) {
+    throw new Error("Podman inference listener requires exact external network authority.");
+  }
   const expectedId = exactText(expected.networkId, FULL_NETWORK_ID, "Inference network identity");
   const expectedName = exactNetworkName(expected.networkName, "Inference network name");
   const expectedGateway = exactIpv4(expected.networkGatewayIp, "Inference network gateway");
@@ -608,14 +843,67 @@ function inspectProviderNetwork(
   const subnet = record(network.subnets[0], "Podman inference network subnet");
   const gatewayIp = exactIpv4(subnet.gateway, "Inspected inference network gateway");
   const subnetCidr = exactIpv4Subnet(subnet.subnet);
-  if (gatewayIp !== expectedGateway) {
+  const externalListenerIp = external
+    ? exactIpv4(external.listenerIp, "External inference listener")
+    : null;
+  if (externalListenerIp !== null) {
+    const toNumber = (address: string): number =>
+      address
+        .split(".")
+        .map(Number)
+        .reduce((total, octet) => (total * 256 + octet) >>> 0, 0);
+    const separator = subnetCidr.lastIndexOf("/");
+    const subnetAddress = subnetCidr.slice(0, separator);
+    const prefix = Number(subnetCidr.slice(separator + 1));
+    const mask = prefix === 32 ? 0xffffffff : (0xffffffff << (32 - prefix)) >>> 0;
+    const listener = toNumber(externalListenerIp);
+    const network = (toNumber(subnetAddress) & mask) >>> 0;
+    const firstOctet = Number(externalListenerIp.slice(0, externalListenerIp.indexOf(".")));
+    if (firstOctet === 0 || firstOctet >= 224 || (listener & mask) >>> 0 === network) {
+      throw new Error(
+        "External inference listener must be an exact unicast host address outside the qualified sandbox subnet.",
+      );
+    }
+  }
+  const externalNetwork = external
+    ? Object.freeze({
+        networkId: exactText(external.networkId, FULL_NETWORK_ID, "External network identity"),
+        name: exactNetworkName(external.name, "External inference network name"),
+        subnet: exactIpv4Subnet(external.subnet),
+        gatewayIp: exactIpv4(external.gatewayIp, "External inference network gateway"),
+        listenerIp: externalListenerIp!,
+        authoritySha256: exactText(
+          external.authoritySha256,
+          SHA256,
+          "External inference network authority digest",
+        ),
+      })
+    : null;
+  external?.assertCurrent();
+  if (
+    externalNetwork
+      ? externalNetwork.networkId !== expectedId ||
+        externalNetwork.name !== expectedName ||
+        externalNetwork.subnet !== subnetCidr ||
+        externalNetwork.gatewayIp !== gatewayIp ||
+        expectedGateway !== gatewayIp
+      : gatewayIp !== expectedGateway
+  ) {
     throw new Error("Podman inference network gateway changed after qualification.");
+  }
+  if (
+    externalNetwork &&
+    externalNetwork.listenerIp !==
+      exactIpv4(expected.networkListenerIp, "Inference network listener")
+  ) {
+    throw new Error("Podman inference network listener changed after qualification.");
   }
   const labels = sortedStringRecord(network.labels, "Inference network labels");
   if (
-    labels[PODMAN_INFERENCE_NETWORK_MANAGED_LABEL] !== "true" ||
-    labels[PODMAN_INFERENCE_NETWORK_PROVIDER_LABEL] !== PROVIDER_ID ||
-    labels[PODMAN_INFERENCE_NETWORK_ENGINE_AUTHORITY_LABEL] !== authority.receiptSha256
+    !externalNetwork &&
+    (labels[PODMAN_INFERENCE_NETWORK_MANAGED_LABEL] !== "true" ||
+      labels[PODMAN_INFERENCE_NETWORK_PROVIDER_LABEL] !== PROVIDER_ID ||
+      labels[PODMAN_INFERENCE_NETWORK_ENGINE_AUTHORITY_LABEL] !== authority.receiptSha256)
   ) {
     throw new Error("Podman inference network lacks exact provider ownership authority.");
   }
@@ -636,8 +924,9 @@ function inspectProviderNetwork(
     labels,
     ipamOptions: sortedStringRecord(network.ipam_options, "Inference network IPAM options"),
     options: sortedStringRecord(network.options, "Inference network options"),
+    ...(externalNetwork ? { external: externalNetwork } : {}),
   });
-  const authoritySha256 = digest(canonical);
+  const authoritySha256 = externalNetwork?.authoritySha256 ?? digest(canonical);
   if (
     expected.networkAuthoritySha256 !== undefined &&
     exactText(expected.networkAuthoritySha256, SHA256, "Inference network authority digest") !==
@@ -645,7 +934,12 @@ function inspectProviderNetwork(
   ) {
     throw new Error("Podman inference network authority changed after qualification.");
   }
-  return Object.freeze({ id, name, gatewayIp, authoritySha256 });
+  return Object.freeze({
+    id,
+    name,
+    gatewayIp,
+    authoritySha256,
+  });
 }
 
 function requireProofEndpoint(
@@ -713,9 +1007,10 @@ function normalizeManagedSpec(
   authority: PodmanInferenceAuthorityReceipt,
   network: PodmanInferenceNetworkAuthority,
   priorState: "absent" | "running" | "stopped",
+  engineBindingSha256 = authority.receiptSha256,
 ): ManagedSpec {
-  if (input.service !== "nim" && input.service !== "vllm") {
-    throw new Error("Podman managed inference supports NIM or vLLM containers.");
+  if (input.service !== "ollama" && input.service !== "nim" && input.service !== "vllm") {
+    throw new Error("Podman managed inference supports Ollama, NIM, or vLLM containers.");
   }
   const writer = requireWriter(writerValue);
   const containerName = exactText(input.containerName, SAFE_NAME, "Inference container name");
@@ -750,6 +1045,10 @@ function normalizeManagedSpec(
   }
   const gpuDevices = Object.freeze([...requestedDevices].sort());
   const environment = normalizedEnvironment(input.environment);
+  const ollamaContextLength = normalizedOllamaContextLength(
+    input.service,
+    input.ollamaContextLength,
+  );
   const mounts = normalizedMounts(input.mounts);
   const sharedMemory = exactText(
     input.sharedMemory ?? "64m",
@@ -761,7 +1060,10 @@ function normalizeManagedSpec(
     throw new Error("Podman host-local inference requires a private IPC namespace.");
   }
   const command = normalizedArguments(input.command ?? [], "Inference command arguments");
-  const model = exactText(input.model, /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,511}$/u, "Inference model");
+  const model =
+    input.service === "ollama"
+      ? normalizeHostLocalOllamaModelRef(input.model)
+      : exactText(input.model, /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,511}$/u, "Inference model");
   if (typeof input.requireToolCalling !== "boolean") {
     throw new Error("Inference tool-calling requirement must be a boolean.");
   }
@@ -771,6 +1073,7 @@ function normalizeManagedSpec(
     networkName,
     networkId: network.id,
     networkGatewayIp: network.gatewayIp,
+    ...(input.networkListenerIp ? { networkListenerIp: input.networkListenerIp } : {}),
     networkAuthoritySha256: network.authoritySha256,
   });
   const canonical = {
@@ -780,6 +1083,7 @@ function normalizeManagedSpec(
     imageRef,
     gpuDevices,
     environment,
+    ollamaContextLength,
     mounts,
     sharedMemory,
     ipc,
@@ -791,7 +1095,7 @@ function normalizeManagedSpec(
     transactionId: writer.transactionId,
     receiptTargetSha256: writer.targetSha256,
     priorState,
-    engineBindingSha256: authority.receiptSha256,
+    engineBindingSha256,
   };
   const spec: ManagedSpec = {
     ...canonical,
@@ -805,7 +1109,7 @@ function normalizeManagedSpec(
 }
 
 function managedAuthorityDigest(input: {
-  readonly service: "nim" | "vllm";
+  readonly service: "ollama" | "nim" | "vllm";
   readonly endpoint: HostLocalInferenceEndpointAuthority;
   readonly name: string;
   readonly imageRef: string;
@@ -863,7 +1167,7 @@ function managedSpecAuthorityDigest(spec: ManagedSpec): string {
 function managedReceiptAuthorityDigest(receipt: HostLocalInferenceReceipt): string {
   if (
     receipt.runtime.kind !== "container" ||
-    (receipt.service !== "nim" && receipt.service !== "vllm") ||
+    (receipt.service !== "ollama" && receipt.service !== "nim" && receipt.service !== "vllm") ||
     receipt.inference === undefined ||
     receipt.publication === undefined ||
     !("devices" in receipt.runtime.gpu)
@@ -910,7 +1214,7 @@ function receiptProbeParent(receipt: HostLocalInferenceReceipt): ProbeParentAuth
     transactionId: receipt.publication.transactionId,
     receiptTargetSha256: receipt.publication.targetSha256,
     parentAuthoritySha256:
-      receipt.service === "ollama"
+      receipt.service === "ollama" && receipt.runtime.kind === "host"
         ? ollamaRouteAuthority(receipt).receiptSha256
         : managedReceiptAuthorityDigest(receipt),
   });
@@ -987,6 +1291,21 @@ function inspectedEnvironmentNames(value: unknown): readonly string[] {
   );
 }
 
+function inspectedOllamaContextLength(value: unknown): number | null {
+  const entries = exactStringArray(value ?? [], "Podman inference environment", 1024).filter(
+    (entry) => entry.startsWith("OLLAMA_CONTEXT_LENGTH="),
+  );
+  if (entries.length === 0) return null;
+  if (entries.length !== 1) {
+    throw new Error("Podman managed Ollama context length authority is ambiguous.");
+  }
+  const parsed = Number(entries[0]!.slice("OLLAMA_CONTEXT_LENGTH=".length));
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 1_048_576) {
+    throw new Error("Podman managed Ollama context length authority is invalid.");
+  }
+  return parsed;
+}
+
 function inspectedPortBindings(value: unknown): readonly string[] {
   const bindings = record(value, "Podman inference port bindings");
   const normalized: string[] = [];
@@ -1047,6 +1366,7 @@ function inspectContainer(engine: ContainerEngine, runtimeId: string): ManagedCo
     status: exactText(state.Status, SAFE_NAME, "Podman inference container state").toLowerCase(),
     createArguments: inspectedCreateArguments(config.CreateCommand),
     environmentNames: inspectedEnvironmentNames(config.Env),
+    ollamaContextLength: inspectedOllamaContextLength(config.Env),
     ipcMode: exactText(hostConfig.IpcMode, SAFE_NAME, "Podman inference IPC mode"),
     networkId: exactText(
       attachedNetwork.NetworkID ?? attachedNetwork.NetworkId,
@@ -1065,11 +1385,7 @@ function inspectContainer(engine: ContainerEngine, runtimeId: string): ManagedCo
   });
 }
 
-function inspectProbeContainer(engine: ContainerEngine, runtimeId: string): ProbeContainer {
-  const output = requireSuccess(
-    "probe container inspection",
-    engine.capture(["container", "inspect", runtimeId], PROBE_TIMEOUT_MS),
-  );
+function parseProbeContainerInspection(output: string): ProbeContainer {
   let parsed: unknown;
   try {
     parsed = JSON.parse(output);
@@ -1135,6 +1451,22 @@ function inspectProbeContainer(engine: ContainerEngine, runtimeId: string): Prob
   });
 }
 
+function inspectProbeContainer(
+  engine: ContainerEngine,
+  runtimeId: string,
+  maxAttempts = 1,
+  beforeAttempt: () => void = () => undefined,
+): ProbeContainer {
+  const args = ["container", "inspect", runtimeId] as const;
+  beforeAttempt();
+  let result = engine.capture(args, PROBE_TIMEOUT_MS);
+  for (let attempt = 1; attempt < maxAttempts && commandTimedOut(result); attempt += 1) {
+    beforeAttempt();
+    result = engine.capture(args, PROBE_TIMEOUT_MS);
+  }
+  return parseProbeContainerInspection(requireSuccess("probe container inspection", result));
+}
+
 function exactContainerExists(engine: ContainerEngine, runtimeId: string): boolean {
   const result = engine.capture(["container", "exists", runtimeId], PROBE_TIMEOUT_MS);
   if (result.error) {
@@ -1147,22 +1479,7 @@ function exactContainerExists(engine: ContainerEngine, runtimeId: string): boole
   throw new Error(`Podman inference container existence check failed: ${commandEvidence(result)}`);
 }
 
-function lookupContainerId(engine: ContainerEngine, containerName: string): string | null {
-  const output = requireSuccess(
-    "container lookup",
-    engine.capture(
-      [
-        "ps",
-        "--all",
-        "--no-trunc",
-        "--filter",
-        `name=^${containerName}$`,
-        "--format",
-        "{{.ID}}\t{{.Names}}",
-      ],
-      PROBE_TIMEOUT_MS,
-    ),
-  );
+function parseContainerLookup(output: string, containerName: string): string | null {
   const rows = output
     .split(/\r?\n/u)
     .map((row) => row.trim())
@@ -1178,13 +1495,35 @@ function lookupContainerId(engine: ContainerEngine, containerName: string): stri
   return exactContainerId(fields[0]);
 }
 
+function containerLookupArgs(containerName: string): readonly string[] {
+  return Object.freeze([
+    "ps",
+    "--all",
+    "--no-trunc",
+    "--filter",
+    `name=^${containerName}$`,
+    "--format",
+    "{{.ID}}\t{{.Names}}",
+  ]);
+}
+
+function lookupContainerId(engine: ContainerEngine, containerName: string): string | null {
+  return parseContainerLookup(
+    requireSuccess(
+      "container lookup",
+      engine.capture(containerLookupArgs(containerName), PROBE_TIMEOUT_MS),
+    ),
+    containerName,
+  );
+}
+
 function requireManagedIdentity(
   container: ManagedContainer,
   expected: {
     readonly runtimeId: string;
     readonly name: string;
     readonly imageRef: string;
-    readonly service: "nim" | "vllm";
+    readonly service: "ollama" | "nim" | "vllm";
     readonly specSha256: string;
     readonly authoritySha256: string;
     readonly transactionId: string;
@@ -1271,7 +1610,7 @@ function requireReceiptIdentity(
 ): ManagedContainer {
   if (
     receipt.runtime.kind !== "container" ||
-    (receipt.service !== "nim" && receipt.service !== "vllm")
+    (receipt.service !== "ollama" && receipt.service !== "nim" && receipt.service !== "vllm")
   ) {
     throw new Error("Podman managed inference requires a container receipt.");
   }
@@ -1309,10 +1648,61 @@ function requireReceiptIdentity(
   });
 }
 
+/** Inspect one exact published Ollama runtime without creating a lifecycle operation. */
+export function inspectPodmanPublishedOllamaReadinessRuntime(options: {
+  readonly engine: PodmanContainerEngine;
+  readonly persistedEngineAuthority: PersistedEngineAuthority;
+  readonly serializedReceipt: string;
+  readonly assertCurrent: () => void;
+}): HostLocalManagedInferenceInspection {
+  const receipt = parseHostLocalInferenceReceipt(options.serializedReceipt);
+  if (
+    serializeHostLocalInferenceReceipt(receipt) !== options.serializedReceipt ||
+    receipt.providerId !== PROVIDER_ID ||
+    receipt.service !== "ollama" ||
+    receipt.runtime.kind !== "container" ||
+    receipt.inference === undefined ||
+    receipt.publication === undefined ||
+    !("devices" in receipt.runtime.gpu)
+  ) {
+    throw new Error("Podman published readiness requires an exact Ollama container receipt.");
+  }
+  if (
+    serializePersistedEngineAuthority(options.persistedEngineAuthority) !==
+    serializePersistedEngineAuthority(receipt.engineAuthority)
+  ) {
+    throw new Error("Podman published readiness engine authority changed.");
+  }
+  if (
+    options.persistedEngineAuthority.providerId !== PROVIDER_ID ||
+    options.persistedEngineAuthority.operation !== "host-local-inference" ||
+    options.persistedEngineAuthority.engineId !== PROVIDER_ID ||
+    options.engine.operation !== options.persistedEngineAuthority.operation ||
+    options.engine.engineId !== options.persistedEngineAuthority.engineId
+  ) {
+    throw new Error("Podman published readiness engine authority is invalid.");
+  }
+  options.assertCurrent();
+  let inspected: ManagedContainer | undefined;
+  let failure: unknown;
+  try {
+    inspected = requireReceiptIdentity(
+      inspectContainer(options.engine, receipt.runtime.runtimeId),
+      receipt,
+    );
+  } catch (error) {
+    failure = error;
+  }
+  options.assertCurrent();
+  if (failure !== undefined) throw failure;
+  return Object.freeze({ running: inspected!.running, receipt });
+}
+
 function receiptFor(
   authority: PersistedEngineAuthority,
   spec: ManagedSpec,
   runtimeId: string,
+  modelDigest?: string,
 ): HostLocalInferenceReceipt {
   return normalizeHostLocalInferenceReceipt({
     schemaVersion: 2,
@@ -1338,12 +1728,22 @@ function receiptFor(
       probeImageRef: spec.probeImageRef,
       specSha256: spec.specSha256,
       launchSha256: spec.launchSha256,
+      ...(spec.service === "ollama"
+        ? {
+            modelDigest: exactText(
+              modelDigest,
+              SHA256_DIGEST,
+              "Podman managed Ollama model digest",
+            ),
+          }
+        : {}),
       gpu: { vendor: "nvidia", devices: spec.gpuDevices },
     },
   });
 }
 
 function runArguments(spec: ManagedSpec): readonly string[] {
+  const listenerIp = spec.endpoint.networkListenerIp ?? spec.endpoint.networkGatewayIp;
   const args = [
     "run",
     "--detach",
@@ -1374,10 +1774,13 @@ function runArguments(spec: ManagedSpec): readonly string[] {
     "--publish",
     `127.0.0.1:${String(spec.endpoint.port)}:${String(spec.containerPort)}`,
     "--publish",
-    `${spec.endpoint.networkGatewayIp}:${String(spec.endpoint.port)}:${String(spec.containerPort)}`,
+    `${listenerIp}:${String(spec.endpoint.port)}:${String(spec.containerPort)}`,
   ];
   for (const device of spec.gpuDevices) args.push("--device", device);
   for (const name of spec.environment) args.push("--env", name);
+  if (spec.ollamaContextLength !== null) {
+    args.push("--env", "OLLAMA_CONTEXT_LENGTH");
+  }
   args.push("--shm-size", spec.sharedMemory);
   args.push("--ipc", spec.ipc);
   args.push(spec.imageRef, ...spec.command);
@@ -1389,7 +1792,7 @@ function translatedRunArguments(
   authority: PodmanInferenceAuthorityReceipt,
 ): readonly string[] {
   return translatePodmanLocalInferenceArgs(runArguments(spec), authority, {
-    allowedPublishAddresses: [spec.endpoint.networkGatewayIp],
+    allowedPublishAddresses: [spec.endpoint.networkListenerIp ?? spec.endpoint.networkGatewayIp],
   });
 }
 
@@ -1439,11 +1842,18 @@ function requireLaunchIdentity(
     throw new Error("Podman inference runtime launch arguments drifted from durable authority.");
   }
   const publishes = repeatedOptionValues(container.createArguments, "--publish");
-  const expectedListeners = ["127.0.0.1", endpoint.networkGatewayIp].sort();
+  const expectedListeners = [
+    "127.0.0.1",
+    endpoint.networkListenerIp ?? endpoint.networkGatewayIp,
+  ].sort();
   const parsedPublishes = publishes.map((mapping) => {
     const fields = mapping.split(":");
     if (fields.length !== 3) throw new Error("Podman inference launch publish mapping is invalid.");
-    return { address: fields[0] ?? "", hostPort: fields[1] ?? "", containerPort: fields[2] ?? "" };
+    return {
+      address: fields[0] ?? "",
+      hostPort: fields[1] ?? "",
+      containerPort: fields[2] ?? "",
+    };
   });
   if (
     parsedPublishes.length !== 2 ||
@@ -1466,6 +1876,15 @@ function requireLaunchIdentity(
   const actualEnvironmentNames = container.environmentNames
     .filter((name) => controlledEnvironmentNames.has(name))
     .sort();
+  const ollamaContextArguments = repeatedOptionValues(container.createArguments, "--env").filter(
+    (name) => name === "OLLAMA_CONTEXT_LENGTH",
+  );
+  const expectedOllamaContextLength =
+    ollamaContextArguments.length === 0
+      ? null
+      : ollamaContextArguments.length === 1
+        ? 64_000
+        : Number.NaN;
   const sharedMemory = repeatedOptionValues(container.createArguments, "--shm-size");
   if (
     container.networkId !== endpoint.networkId ||
@@ -1474,6 +1893,7 @@ function requireLaunchIdentity(
     container.restartPolicy !== "unless-stopped" ||
     container.ipcMode !== "private" ||
     expectedEnvironmentNames.join("\n") !== actualEnvironmentNames.join("\n") ||
+    container.ollamaContextLength !== expectedOllamaContextLength ||
     sharedMemory.length !== 1 ||
     container.sharedMemoryBytes !== sharedMemoryBytes(sharedMemory[0] ?? "")
   ) {
@@ -1509,7 +1929,11 @@ function emitProviderFailure(
 ): void {
   try {
     onFailureEvidence(
-      Object.freeze({ providerId: PROVIDER_ID, phase, message: errorEvidence(redactor, message) }),
+      Object.freeze({
+        providerId: PROVIDER_ID,
+        phase,
+        message: errorEvidence(redactor, message),
+      }),
     );
   } catch (error) {
     throw new PodmanInferenceEvidenceCaptureError(errorEvidence(redactor, error));
@@ -1524,79 +1948,128 @@ function createProbeSpec(
   parent: ProbeParentAuthority,
   request: readonly string[],
   authority: PodmanInferenceAuthorityReceipt,
-): ProbeSpec {
+  legacyRequests: readonly (readonly string[])[] = [],
+): ProbeSpecSet {
+  const curlMaxTimeSeconds =
+    phase === "inference" ? INFERENCE_PROBE_CURL_MAX_TIME_SECONDS : PROBE_CURL_MAX_TIME_SECONDS;
   const normalizedImage = normalizeHostLocalInferenceImageRef(probeImageRef);
+  const normalizedRequest = normalizedArguments(request, "Podman inference probe request");
+  const transactionId = exactText(
+    parent.transactionId,
+    SHA256,
+    "Podman inference probe transaction",
+  );
+  const receiptTargetSha256 = exactText(
+    parent.receiptTargetSha256,
+    SHA256,
+    "Podman inference probe receipt target",
+  );
+  const parentAuthoritySha256 = exactText(
+    parent.parentAuthoritySha256,
+    SHA256,
+    "Podman inference probe parent authority",
+  );
+  // Temporary compatibility for retained probes from pre-fix PR #9906 qualification runs.
+  // Remove when no preserved qualification host can resume a pre-timeout probe.
+  const legacyCanonical = (legacyRequest: readonly string[]) =>
+    Object.freeze({
+      providerId: PROVIDER_ID,
+      service,
+      phase,
+      endpoint,
+      probeImageRef: normalizedImage,
+      transactionId,
+      receiptTargetSha256,
+      parentAuthoritySha256,
+      request: legacyRequest,
+    });
   const canonical = Object.freeze({
     providerId: PROVIDER_ID,
     service,
     phase,
     endpoint,
     probeImageRef: normalizedImage,
-    transactionId: exactText(parent.transactionId, SHA256, "Podman inference probe transaction"),
-    receiptTargetSha256: exactText(
-      parent.receiptTargetSha256,
-      SHA256,
-      "Podman inference probe receipt target",
-    ),
-    parentAuthoritySha256: exactText(
-      parent.parentAuthoritySha256,
-      SHA256,
-      "Podman inference probe parent authority",
-    ),
-    request: normalizedArguments(request, "Podman inference probe request"),
+    transactionId,
+    receiptTargetSha256,
+    parentAuthoritySha256,
+    curlMaxTimeSeconds,
+    request: normalizedRequest,
   });
-  const specSha256 = digest(canonical);
-  const name = `nemoclaw-inference-probe-${phase}-${specSha256.slice(0, 16)}`;
-  const source = Object.freeze([
-    "run",
-    "--detach",
-    "--pull=never",
-    "--name",
-    name,
-    "--label",
-    `${PODMAN_INFERENCE_PROBE_MANAGED_LABEL}=true`,
-    "--label",
-    `${PODMAN_INFERENCE_PROVIDER_LABEL}=${PROVIDER_ID}`,
-    "--label",
-    `${PODMAN_INFERENCE_SERVICE_LABEL}=${service}`,
-    "--label",
-    `${PODMAN_INFERENCE_AUTHORITY_LABEL}=${canonical.parentAuthoritySha256}`,
-    "--label",
-    `${PODMAN_INFERENCE_TRANSACTION_LABEL}=${canonical.transactionId}`,
-    "--label",
-    `${PODMAN_INFERENCE_RECEIPT_TARGET_LABEL}=${canonical.receiptTargetSha256}`,
-    "--label",
-    `${PODMAN_INFERENCE_PROBE_PHASE_LABEL}=${phase}`,
-    "--label",
-    `${PODMAN_INFERENCE_PROBE_SPEC_LABEL}=${specSha256}`,
-    "--network",
-    endpoint.networkName,
-    "--read-only",
-    "--ipc",
-    "private",
-    normalizedImage,
-    "--fail-with-body",
-    "--silent",
-    "--show-error",
-    "--connect-timeout",
-    "3",
-    "--max-time",
-    "20",
-    ...canonical.request,
-  ]);
-  const launchArguments = translatePodmanLocalInferenceArgs(source, authority);
+  const buildSpec = (
+    identity: typeof canonical | ReturnType<typeof legacyCanonical>,
+  ): ProbeSpec => {
+    const maxTimeSeconds =
+      "curlMaxTimeSeconds" in identity ? identity.curlMaxTimeSeconds : PROBE_CURL_MAX_TIME_SECONDS;
+    const specSha256 = digest(identity);
+    const name = `nemoclaw-inference-probe-${phase}-${specSha256.slice(0, 16)}`;
+    const source = Object.freeze([
+      "run",
+      "--detach",
+      "--pull=never",
+      "--name",
+      name,
+      "--label",
+      `${PODMAN_INFERENCE_PROBE_MANAGED_LABEL}=true`,
+      "--label",
+      `${PODMAN_INFERENCE_PROVIDER_LABEL}=${PROVIDER_ID}`,
+      "--label",
+      `${PODMAN_INFERENCE_SERVICE_LABEL}=${service}`,
+      "--label",
+      `${PODMAN_INFERENCE_AUTHORITY_LABEL}=${identity.parentAuthoritySha256}`,
+      "--label",
+      `${PODMAN_INFERENCE_TRANSACTION_LABEL}=${identity.transactionId}`,
+      "--label",
+      `${PODMAN_INFERENCE_RECEIPT_TARGET_LABEL}=${identity.receiptTargetSha256}`,
+      "--label",
+      `${PODMAN_INFERENCE_PROBE_PHASE_LABEL}=${phase}`,
+      "--label",
+      `${PODMAN_INFERENCE_PROBE_SPEC_LABEL}=${specSha256}`,
+      "--network",
+      endpoint.networkName,
+      "--read-only",
+      "--ipc",
+      "private",
+      normalizedImage,
+      "--fail-with-body",
+      "--silent",
+      "--show-error",
+      "--connect-timeout",
+      "3",
+      "--max-time",
+      String(maxTimeSeconds),
+      ...identity.request,
+    ]);
+    return Object.freeze({
+      service,
+      phase,
+      endpoint,
+      probeImageRef: normalizedImage,
+      transactionId: identity.transactionId,
+      receiptTargetSha256: identity.receiptTargetSha256,
+      parentAuthoritySha256: identity.parentAuthoritySha256,
+      request: identity.request,
+      name,
+      specSha256,
+      launchArguments: translatePodmanLocalInferenceArgs(source, authority),
+    });
+  };
+  const normalizedLegacyRequests = legacyRequests.map((legacyRequest) =>
+    normalizedArguments(legacyRequest, "Podman inference legacy probe request"),
+  );
+  const legacy = [
+    buildSpec(legacyCanonical(normalizedRequest)),
+    ...normalizedLegacyRequests.flatMap((legacyRequest) => [
+      buildSpec(Object.freeze({ ...canonical, request: legacyRequest })),
+      buildSpec(legacyCanonical(legacyRequest)),
+    ]),
+  ].filter(
+    (spec, index, specs) =>
+      spec.name !== buildSpec(canonical).name &&
+      specs.findIndex((candidate) => candidate.name === spec.name) === index,
+  );
   return Object.freeze({
-    service,
-    phase,
-    endpoint,
-    probeImageRef: normalizedImage,
-    transactionId: canonical.transactionId,
-    receiptTargetSha256: canonical.receiptTargetSha256,
-    parentAuthoritySha256: canonical.parentAuthoritySha256,
-    request: canonical.request,
-    name,
-    specSha256,
-    launchArguments,
+    current: buildSpec(canonical),
+    legacy: Object.freeze(legacy),
   });
 }
 
@@ -1613,7 +2086,16 @@ function probeLabels(spec: ProbeSpec): Readonly<Record<string, string>> {
   });
 }
 
-function requireProbeIdentity(container: ProbeContainer, spec: ProbeSpec): ProbeContainer {
+function requireProbeIdentity(
+  container: ProbeContainer,
+  spec: ProbeSpec,
+  expectedRuntimeId: string,
+): ProbeContainer {
+  if (container.runtimeId !== expectedRuntimeId) {
+    throw new Error(
+      "Podman inference probe inspect returned a container ID other than the queried full container ID.",
+    );
+  }
   const expectedLabels = probeLabels(spec);
   const actualControlledLabels = Object.fromEntries(
     Object.entries(container.labels).filter(([key]) =>
@@ -1643,17 +2125,157 @@ function requireProbeIdentity(container: ProbeContainer, spec: ProbeSpec): Probe
   return container;
 }
 
+type ProbeCleanupObservation =
+  | { readonly kind: "absent" }
+  | { readonly kind: "present"; readonly container: ProbeContainer }
+  | { readonly kind: "retry" };
+
+function defaultProbeCleanupSleep(milliseconds: number): void {
+  if (milliseconds > 0) {
+    Atomics.wait(PROBE_CLEANUP_SLEEP_BUFFER, 0, 0, milliseconds);
+  }
+}
+
+function monotonicProbeCleanupNow(): number {
+  return Number(process.hrtime.bigint() / 1_000_000n);
+}
+
+function probeCleanupClock(now: () => number): () => number {
+  let previous: number | undefined;
+  return () => {
+    const current = now();
+    if (
+      !Number.isFinite(current) ||
+      current < 0 ||
+      (previous !== undefined && current < previous)
+    ) {
+      throw new Error("Podman inference probe cleanup clock is invalid.");
+    }
+    previous = current;
+    return current;
+  };
+}
+
+function observeProbeCleanup(
+  engine: ContainerEngine,
+  runtimeId: string,
+  spec: ProbeSpec,
+  assertAuthority: () => void,
+  mode: "owned" | "retained-legacy",
+): ProbeCleanupObservation {
+  assertAuthority();
+  const exists = engine.capture(["container", "exists", runtimeId], PROBE_TIMEOUT_MS);
+  if (commandTimedOut(exists)) return Object.freeze({ kind: "retry" });
+  if (exists.error || (exists.status !== 0 && exists.status !== 1)) {
+    throw new Error(`Podman inference probe existence check failed: ${commandEvidence(exists)}`);
+  }
+
+  let current: ProbeContainer | null = null;
+  if (exists.status === 0) {
+    assertAuthority();
+    const inspection = engine.capture(["container", "inspect", runtimeId], PROBE_TIMEOUT_MS);
+    if (commandTimedOut(inspection)) return Object.freeze({ kind: "retry" });
+    current = requireProbeIdentity(
+      parseProbeContainerInspection(requireSuccess("probe container inspection", inspection)),
+      spec,
+      runtimeId,
+    );
+    if (current.running || !AT_REST_STATES.has(current.status)) {
+      throw new Error(
+        mode === "retained-legacy"
+          ? "retained legacy probe is not in an exact at-rest state"
+          : "Podman inference probe cleanup requires an exact at-rest identity.",
+      );
+    }
+  }
+
+  assertAuthority();
+  const lookup = engine.capture(containerLookupArgs(spec.name), PROBE_TIMEOUT_MS);
+  if (commandTimedOut(lookup)) return Object.freeze({ kind: "retry" });
+  const nameId = parseContainerLookup(requireSuccess("container lookup", lookup), spec.name);
+  if (current !== null) {
+    if (nameId !== null && nameId !== runtimeId) {
+      throw new Error("Podman inference probe name is owned by another container.");
+    }
+    return Object.freeze({ kind: "present", container: current });
+  }
+  if (nameId === null) return Object.freeze({ kind: "absent" });
+  if (nameId === runtimeId) return Object.freeze({ kind: "retry" });
+  throw new Error("Podman inference probe name was reused by another container.");
+}
+
+function settleProbeBeforeRemoval(
+  engine: ContainerEngine,
+  runtimeId: string,
+  spec: ProbeSpec,
+  assertAuthority: () => void,
+  mode: "owned" | "retained-legacy",
+): ProbeContainer | null {
+  for (let attempt = 0; attempt < POST_CREATE_PROBE_INSPECT_MAX_ATTEMPTS; attempt += 1) {
+    const observation = observeProbeCleanup(engine, runtimeId, spec, assertAuthority, mode);
+    if (observation.kind === "present") return observation.container;
+    if (observation.kind === "absent") {
+      assertAuthority();
+      return null;
+    }
+  }
+  throw new Error("Podman inference probe cleanup could not establish its pre-remove state.");
+}
+
+function settleProbeRemoval(
+  engine: ContainerEngine,
+  runtimeId: string,
+  spec: ProbeSpec,
+  assertAuthority: () => void,
+  mode: "owned" | "retained-legacy",
+  timing: PodmanProbeCleanupTiming,
+): void {
+  const now = probeCleanupClock(timing.now ?? monotonicProbeCleanupNow);
+  const sleep = timing.sleep ?? defaultProbeCleanupSleep;
+  const startedAt = now();
+  const deadline = startedAt + PROBE_CLEANUP_SETTLEMENT_TIMEOUT_MS;
+  if (!Number.isFinite(deadline)) {
+    throw new Error("Podman inference probe cleanup deadline is invalid.");
+  }
+  for (;;) {
+    const observation = observeProbeCleanup(engine, runtimeId, spec, assertAuthority, mode);
+    const observedAt = now();
+    if (observedAt > deadline) {
+      throw new Error("Podman inference probe removal exceeded its settlement deadline.");
+    }
+    if (observation.kind === "absent") {
+      assertAuthority();
+      if (now() > deadline) {
+        throw new Error("Podman inference probe removal exceeded its settlement deadline.");
+      }
+      return;
+    }
+    const remaining = deadline - observedAt;
+    if (remaining <= 0) {
+      throw new Error("Podman inference probe removal did not settle into exact absence.");
+    }
+    const delay = Math.min(PROBE_CLEANUP_SETTLEMENT_INTERVAL_MS, remaining);
+    sleep(delay);
+    if (now() <= observedAt) {
+      throw new Error("Podman inference probe cleanup clock did not advance.");
+    }
+  }
+}
+
 function cleanupExactProbe(
   engine: ContainerEngine,
-  container: ProbeContainer,
+  assertAuthority: () => void,
+  container: Pick<ProbeContainer, "runtimeId">,
   spec: ProbeSpec,
   phase: PodmanInferenceFailureEvidence["phase"],
   onFailureEvidence: (evidence: PodmanInferenceFailureEvidence) => void,
   redactor: PodmanInferenceRedactor,
+  timing: PodmanProbeCleanupTiming,
+  mode: "owned" | "retained-legacy" = "owned",
 ): void {
-  let current: ProbeContainer;
+  let current: ProbeContainer | null;
   try {
-    current = requireProbeIdentity(inspectProbeContainer(engine, container.runtimeId), spec);
+    current = settleProbeBeforeRemoval(engine, container.runtimeId, spec, assertAuthority, mode);
   } catch (error) {
     emitProviderFailure(
       phase,
@@ -1665,7 +2287,12 @@ function cleanupExactProbe(
       `Podman inference probe cleanup lost exact identity: ${errorEvidence(redactor, error)}`,
     );
   }
-  const removal = engine.capture(["rm", "--force", current.runtimeId], MUTATION_TIMEOUT_MS);
+  if (current === null) return;
+  assertAuthority();
+  const removal = engine.capture(
+    mode === "owned" ? ["rm", "--force", current.runtimeId] : ["rm", current.runtimeId],
+    MUTATION_TIMEOUT_MS,
+  );
   if (removal.status !== 0 || removal.error) {
     emitProviderFailure(
       phase,
@@ -1675,15 +2302,7 @@ function cleanupExactProbe(
     );
   }
   try {
-    const stillExists = exactContainerExists(engine, current.runtimeId);
-    const nameAfter = lookupContainerId(engine, current.name);
-    if (stillExists || nameAfter !== null) {
-      throw new Error(
-        stillExists
-          ? `exact probe '${current.runtimeId}' remains present`
-          : `probe name '${current.name}' was reused by '${String(nameAfter)}'`,
-      );
-    }
+    settleProbeRemoval(engine, current.runtimeId, spec, assertAuthority, mode, timing);
   } catch (error) {
     emitProviderFailure(
       phase,
@@ -1701,16 +2320,50 @@ function executeExactProbe(
   engine: ContainerEngine,
   authority: PodmanInferenceAuthorityReceipt,
   assertAuthority: () => void,
-  spec: ProbeSpec,
+  specs: ProbeSpecSet,
   timeoutMs: number,
   validateOutput: (output: string) => void,
   onFailureEvidence: (evidence: PodmanInferenceFailureEvidence) => void,
   redactor: PodmanInferenceRedactor,
+  timing: PodmanProbeCleanupTiming,
+  publishedResumeTiming?: PodmanPublishedResumeTimingRecorder,
 ): string {
+  const spec = specs.current;
   const phase = spec.phase;
+  const measureCleanupCurrentness = <T>(operation: () => T): T =>
+    publishedResumeTiming
+      ? publishedResumeTiming.measure("cleanupCurrentness", operation)
+      : operation();
   const captureFailure = (error: unknown) =>
     emitProviderFailure(phase, errorEvidence(redactor, error), onFailureEvidence, redactor);
-  assertAuthority();
+  measureCleanupCurrentness(assertAuthority);
+  for (const legacy of specs.legacy) {
+    let legacyId: string | null;
+    try {
+      legacyId = lookupContainerId(engine, legacy.name);
+    } catch (error) {
+      captureFailure(error);
+      throw new PodmanInferenceIndeterminateCleanupError(
+        "Podman inference legacy probe name lookup is indeterminate.",
+      );
+    }
+    if (legacyId !== null) {
+      measureCleanupCurrentness(() =>
+        cleanupExactProbe(
+          engine,
+          assertAuthority,
+          { runtimeId: legacyId },
+          legacy,
+          phase,
+          onFailureEvidence,
+          redactor,
+          timing,
+          "retained-legacy",
+        ),
+      );
+      measureCleanupCurrentness(assertAuthority);
+    }
+  }
   let existingId: string | null;
   try {
     existingId = lookupContainerId(engine, spec.name);
@@ -1722,7 +2375,7 @@ function executeExactProbe(
   }
   if (existingId !== null) {
     try {
-      requireProbeIdentity(inspectProbeContainer(engine, existingId), spec);
+      requireProbeIdentity(inspectProbeContainer(engine, existingId), spec, existingId);
     } catch (error) {
       captureFailure(error);
       throw new PodmanInferenceIndeterminateCleanupError(
@@ -1737,21 +2390,32 @@ function executeExactProbe(
     );
   }
 
-  assertAuthority();
+  measureCleanupCurrentness(assertAuthority);
   const run = engine.capture(spec.launchArguments, PROBE_TIMEOUT_MS);
   if (run.status !== 0 || run.error) {
     captureFailure(
       `Podman inference probe create returned exit ${String(run.status)}: ${redactedCommandEvidence(redactor, run)}`,
     );
   }
-  let runtimeId: string | null;
-  try {
-    runtimeId = lookupContainerId(engine, spec.name);
-  } catch (error) {
-    captureFailure(error);
-    throw new PodmanInferenceIndeterminateCleanupError(
-      "Podman inference probe identity lookup failed after create.",
-    );
+  let runtimeId: string | null = null;
+  let acknowledgementFailure: Error | null = null;
+  if (run.status === 0 && !run.error) {
+    try {
+      runtimeId = exactContainerId(run.stdout.trim());
+    } catch (error) {
+      acknowledgementFailure =
+        error instanceof Error ? error : new Error(errorEvidence(redactor, error));
+    }
+  }
+  if (runtimeId === null) {
+    try {
+      runtimeId = lookupContainerId(engine, spec.name);
+    } catch (error) {
+      captureFailure(error);
+      throw new PodmanInferenceIndeterminateCleanupError(
+        "Podman inference probe identity lookup failed after create.",
+      );
+    }
   }
   if (runtimeId === null) {
     throw new Error(
@@ -1760,42 +2424,23 @@ function executeExactProbe(
   }
   let container: ProbeContainer;
   try {
-    container = requireProbeIdentity(inspectProbeContainer(engine, runtimeId), spec);
+    container = requireProbeIdentity(
+      inspectProbeContainer(engine, runtimeId, POST_CREATE_PROBE_INSPECT_MAX_ATTEMPTS),
+      spec,
+      runtimeId,
+    );
   } catch (error) {
     captureFailure(error);
     throw new PodmanInferenceIndeterminateCleanupError(
       "Podman inference probe identity is indeterminate after create.",
     );
   }
-  if (run.status === 0 && !run.error) {
-    let acknowledgementFailure: Error | null = null;
-    try {
-      const reportedId = exactContainerId(run.stdout.trim());
-      if (reportedId !== container.runtimeId) {
-        throw new Error(
-          "Podman inference probe create identity disagrees with exact name inspection.",
-        );
-      }
-    } catch (error) {
-      acknowledgementFailure =
-        error instanceof Error ? error : new Error(errorEvidence(redactor, error));
-      captureFailure(acknowledgementFailure);
-    }
-    if (acknowledgementFailure !== null) {
-      cleanupExactProbe(engine, container, spec, phase, onFailureEvidence, redactor);
-      try {
-        assertAuthority();
-      } catch (error) {
-        captureFailure(error);
-        throw new PodmanInferenceCapturedFailureError(errorEvidence(redactor, error));
-      }
-      throw new PodmanInferenceCapturedFailureError(
-        errorEvidence(redactor, acknowledgementFailure),
-      );
-    }
+  let failure: Error | null = null;
+  if (acknowledgementFailure !== null) {
+    captureFailure(acknowledgementFailure);
+    failure = acknowledgementFailure;
   }
 
-  let failure: Error | null = null;
   const wait = engine.capture(["wait", container.runtimeId], timeoutMs);
   if (wait.status !== 0 || wait.error) {
     failure = new Error(
@@ -1803,7 +2448,11 @@ function executeExactProbe(
     );
     captureFailure(failure);
     try {
-      container = requireProbeIdentity(inspectProbeContainer(engine, container.runtimeId), spec);
+      container = requireProbeIdentity(
+        inspectProbeContainer(engine, container.runtimeId),
+        spec,
+        container.runtimeId,
+      );
       if (container.running) {
         const stop = engine.capture(
           ["stop", "--time", String(STOP_GRACE_SECONDS), container.runtimeId],
@@ -1814,7 +2463,11 @@ function executeExactProbe(
             `Podman inference probe stop returned exit ${String(stop.status)}: ${redactedCommandEvidence(redactor, stop)}`,
           );
         }
-        container = requireProbeIdentity(inspectProbeContainer(engine, container.runtimeId), spec);
+        container = requireProbeIdentity(
+          inspectProbeContainer(engine, container.runtimeId),
+          spec,
+          container.runtimeId,
+        );
         if (container.running || !AT_REST_STATES.has(container.status)) {
           throw new Error("probe stop did not prove an exact at-rest state");
         }
@@ -1832,7 +2485,11 @@ function executeExactProbe(
       captureFailure(failure);
     }
     try {
-      container = requireProbeIdentity(inspectProbeContainer(engine, container.runtimeId), spec);
+      container = requireProbeIdentity(
+        inspectProbeContainer(engine, container.runtimeId),
+        spec,
+        container.runtimeId,
+      );
       if (
         container.running ||
         !AT_REST_STATES.has(container.status) ||
@@ -1876,9 +2533,20 @@ function executeExactProbe(
       captureFailure(failure);
     }
   }
-  cleanupExactProbe(engine, container, spec, phase, onFailureEvidence, redactor);
+  measureCleanupCurrentness(() =>
+    cleanupExactProbe(
+      engine,
+      assertAuthority,
+      container,
+      spec,
+      phase,
+      onFailureEvidence,
+      redactor,
+      timing,
+    ),
+  );
   try {
-    assertAuthority();
+    measureCleanupCurrentness(assertAuthority);
   } catch (error) {
     captureFailure(error);
     throw new PodmanInferenceCapturedFailureError(errorEvidence(redactor, error));
@@ -1908,6 +2576,7 @@ function probeOllamaReady(
   parent: ProbeParentAuthority,
   onFailureEvidence: (evidence: PodmanInferenceFailureEvidence) => void,
   redactor: PodmanInferenceRedactor,
+  timing: PodmanProbeCleanupTiming,
 ): void {
   const spec = createProbeSpec(
     "ollama",
@@ -1915,7 +2584,9 @@ function probeOllamaReady(
     endpoint,
     probeImageRef,
     parent,
-    [`http://${endpoint.networkGatewayIp}:${String(endpoint.port)}/api/tags`],
+    [
+      `http://${endpoint.networkListenerIp ?? endpoint.networkGatewayIp}:${String(endpoint.port)}/api/tags`,
+    ],
     authorityReceipt,
   );
   executeExactProbe(
@@ -1932,6 +2603,7 @@ function probeOllamaReady(
     },
     onFailureEvidence,
     redactor,
+    timing,
   );
 }
 
@@ -1947,6 +2619,8 @@ function probeOllamaAcceleration(
   parent: ProbeParentAuthority,
   onFailureEvidence: (evidence: PodmanInferenceFailureEvidence) => void,
   redactor: PodmanInferenceRedactor,
+  timing: PodmanProbeCleanupTiming,
+  publishedResumeTiming?: PodmanPublishedResumeTimingRecorder,
 ): OllamaModelPlacementAuthority {
   const spec = createProbeSpec(
     "ollama",
@@ -1954,7 +2628,9 @@ function probeOllamaAcceleration(
     endpoint,
     probeImageRef,
     parent,
-    [`http://${endpoint.networkGatewayIp}:${String(endpoint.port)}/api/ps`],
+    [
+      `http://${endpoint.networkListenerIp ?? endpoint.networkGatewayIp}:${String(endpoint.port)}/api/ps`,
+    ],
     authorityReceipt,
   );
   let observed: OllamaModelPlacementAuthority | null = null;
@@ -2018,6 +2694,8 @@ function probeOllamaAcceleration(
     },
     onFailureEvidence,
     redactor,
+    timing,
+    publishedResumeTiming,
   );
   if (observed === null) {
     throw new Error("Ollama acceleration probe did not return placement authority.");
@@ -2033,8 +2711,15 @@ function probeManagedReady(
   parent: ProbeParentAuthority,
   onFailureEvidence: (evidence: PodmanInferenceFailureEvidence) => void,
   redactor: PodmanInferenceRedactor,
+  timing: PodmanProbeCleanupTiming,
+  publishedResumeTiming?: PodmanPublishedResumeTimingRecorder,
 ): void {
-  const healthPath = spec.service === "nim" ? "/v1/health/ready" : "/health";
+  const healthPath =
+    spec.service === "ollama"
+      ? "/api/tags"
+      : spec.service === "nim"
+        ? "/v1/health/ready"
+        : "/health";
   const probe = createProbeSpec(
     spec.service,
     "ready",
@@ -2049,7 +2734,7 @@ function probeManagedReady(
       "--retry-max-time",
       "220",
       "--retry-connrefused",
-      `http://${spec.endpoint.networkGatewayIp}:${String(spec.endpoint.port)}${healthPath}`,
+      `http://${spec.endpoint.networkListenerIp ?? spec.endpoint.networkGatewayIp}:${String(spec.endpoint.port)}${healthPath}`,
     ],
     authorityReceipt,
   );
@@ -2062,6 +2747,8 @@ function probeManagedReady(
     () => undefined,
     onFailureEvidence,
     redactor,
+    timing,
+    publishedResumeTiming,
   );
 }
 
@@ -2097,6 +2784,21 @@ function proveManagedGpu(
   }
 }
 
+function pullManagedOllamaModel(
+  engine: ContainerEngine,
+  authority: () => void,
+  runtimeId: string,
+  model: string,
+): void {
+  authority();
+  const result = engine.capture(
+    ["exec", runtimeId, "ollama", "pull", normalizeHostLocalOllamaModelRef(model)],
+    OLLAMA_MODEL_PULL_TIMEOUT_MS,
+  );
+  requireSuccess("managed Ollama model acquisition", result);
+  authority();
+}
+
 function probeOpenAiInference(
   engine: ContainerEngine,
   authorityReceipt: PodmanInferenceAuthorityReceipt,
@@ -2109,11 +2811,13 @@ function probeOpenAiInference(
   parent: ProbeParentAuthority,
   onFailureEvidence: (evidence: PodmanInferenceFailureEvidence) => void,
   redactor: PodmanInferenceRedactor,
+  timing: PodmanProbeCleanupTiming,
+  publishedResumeTiming?: PodmanPublishedResumeTimingRecorder,
 ): void {
-  const body = JSON.stringify({
+  const completionRequest = (maxTokens: number, deterministic: boolean) => ({
     model,
     messages: [{ role: "user", content: "Use the probe tool when it is available." }],
-    max_tokens: 512,
+    max_tokens: maxTokens,
     stream: false,
     ...(requireToolCalling
       ? {
@@ -2123,36 +2827,45 @@ function probeOpenAiInference(
               function: {
                 name: "nemoclaw_probe",
                 description: "Return one host-local inference proof.",
-                parameters: { type: "object", properties: {}, additionalProperties: false },
+                parameters: {
+                  type: "object",
+                  properties: {},
+                  additionalProperties: false,
+                },
               },
             },
           ],
           tool_choice: "required",
+          ...(deterministic ? { temperature: 0 } : {}),
         }
       : {}),
   });
+  const body = JSON.stringify(completionRequest(requireToolCalling ? 4096 : 512, true));
   const proofEndpoint = requireProofEndpoint(endpoint);
+  const requestEndpoint = `http://${proofEndpoint.networkListenerIp ?? proofEndpoint.networkGatewayIp}:${String(proofEndpoint.port)}/v1/chat/completions`;
+  const requestArguments = (payload: string) => [
+    "--header",
+    "Content-Type: application/json",
+    "--data-binary",
+    payload,
+    requestEndpoint,
+  ];
   const probe = createProbeSpec(
     service,
     "inference",
     proofEndpoint,
     probeImageRef,
     parent,
-    [
-      "--header",
-      "Content-Type: application/json",
-      "--data-binary",
-      body,
-      `http://${proofEndpoint.networkGatewayIp}:${String(proofEndpoint.port)}/v1/chat/completions`,
-    ],
+    requestArguments(body),
     authorityReceipt,
+    requireToolCalling ? [requestArguments(JSON.stringify(completionRequest(512, false)))] : [],
   );
   executeExactProbe(
     engine,
     authorityReceipt,
     assertAuthority,
     probe,
-    PROBE_TIMEOUT_MS,
+    INFERENCE_PROBE_TIMEOUT_MS,
     (output) => {
       const response = parseJsonResponse(output, `${service} inference proof`);
       if (response.model !== model) {
@@ -2219,6 +2932,8 @@ function probeOpenAiInference(
     },
     onFailureEvidence,
     redactor,
+    timing,
+    publishedResumeTiming,
   );
 }
 
@@ -2375,6 +3090,16 @@ function withRollback<T>(
   try {
     return action();
   } catch (error) {
+    if (error instanceof PublishedInferenceForwardAuthorityError) {
+      try {
+        rollback();
+      } catch (rollbackError) {
+        throw new Error(
+          `Published inference forward authority changed. Exact prior-runtime restoration also failed: ${errorEvidence(redactor, rollbackError)}`,
+        );
+      }
+      throw error;
+    }
     if (error instanceof PodmanInferenceIndeterminateCleanupError) {
       try {
         rollback();
@@ -2401,7 +3126,11 @@ function withRollback<T>(
     const failure = errorEvidence(redactor, error);
     try {
       onFailureEvidence(
-        Object.freeze({ providerId: PROVIDER_ID, phase: phase(), message: failure }),
+        Object.freeze({
+          providerId: PROVIDER_ID,
+          phase: phase(),
+          message: failure,
+        }),
       );
     } catch (captureError) {
       throw new Error(
@@ -2429,6 +3158,10 @@ function createPreparedStartup(options: {
   readonly onCommitValidationFailure: (error: unknown) => void;
   /** First external publication side effect; failures after entry are indeterminate. */
   readonly beforeWrite?: () => void;
+  /** The durable receipt already exists and must be verified, not written again. */
+  readonly publishedResume?: boolean;
+  /** Successful published-resume observation after the final authority assertion. */
+  readonly onPublishedResumeFinalized?: () => void;
   readonly rollback: () => "removed" | "restored" | "retained";
   readonly redactor: PodmanInferenceRedactor;
 }): HostLocalInferencePreparedStartup {
@@ -2484,6 +3217,11 @@ function createPreparedStartup(options: {
       }
     },
     commit() {
+      if (options.publishedResume) {
+        throw new Error(
+          "Podman inference startup must finalize a published resume without rewriting its receipt.",
+        );
+      }
       if (state !== "validated") {
         throw new Error(
           `Podman inference startup cannot commit without fresh validation from state '${state}'.`,
@@ -2520,13 +3258,44 @@ function createPreparedStartup(options: {
         throw error;
       }
     },
+    ...(options.publishedResume
+      ? {
+          finalizePublishedResume(assertPublishedAuthority: () => void) {
+            if (state !== "validated") {
+              throw new Error(
+                `Podman inference startup cannot finalize a published resume without fresh validation from state '${state}'.`,
+              );
+            }
+            try {
+              options.validatePublication?.();
+              assertPublishedAuthority();
+            } catch (error) {
+              try {
+                options.onCommitValidationFailure(error);
+              } catch (captureError) {
+                throw new Error(
+                  `${errorEvidence(options.redactor, error)} Published-resume failure evidence capture also failed: ${errorEvidence(options.redactor, captureError)}`,
+                );
+              }
+              throw error;
+            }
+            state = "committed";
+            options.onPublishedResumeFinalized?.();
+            return options.receipt;
+          },
+        }
+      : {}),
     rollback() {
       requireRollbackSafe("roll back");
       state = "rolling-back";
       try {
         const status = options.rollback();
         state = "rolled-back";
-        return Object.freeze({ status, priorState: options.priorState, receipt: options.receipt });
+        return Object.freeze({
+          status,
+          priorState: options.priorState,
+          receipt: options.receipt,
+        });
       } catch (error) {
         state = "indeterminate";
         throw error;
@@ -2555,7 +3324,51 @@ export function createPodmanHostLocalInferenceRuntime(
     operationEnv,
   );
   const engine = redactingEngine(options.engine, sensitiveRedactor);
-  const { authorityStore, routeAuthorityStore, authority, onFailureEvidence } = options;
+  const {
+    authorityStore,
+    routeAuthorityStore,
+    authority,
+    authorityQualification,
+    onFailureEvidence,
+  } = options;
+  const publishedEngineAuthority = options.hermesPortablePublishedEngineAuthority
+    ? Object.freeze({
+        intent: options.hermesPortablePublishedEngineAuthority.intent,
+        creationAuthority: normalizePersistedEngineAuthority(
+          options.hermesPortablePublishedEngineAuthority.creationAuthority,
+        ),
+        serializedReceipt: (() => {
+          const supplied = options.hermesPortablePublishedEngineAuthority!.serializedReceipt;
+          parseHostLocalInferenceReceipt(supplied);
+          return supplied;
+        })(),
+        assertForwardAuthority:
+          options.hermesPortablePublishedEngineAuthority.assertForwardAuthority,
+      })
+    : undefined;
+  const assertBoundEngineTransactionCurrent = (): void => {
+    const candidate = options.engine as PodmanContainerEngine & {
+      readonly assertAuthority?: () => void;
+    };
+    if (!publishedEngineAuthority || !candidate.assertAuthority) {
+      throw new Error("Podman published inference lacks bound executable and socket currentness.");
+    }
+    candidate.assertAuthority();
+  };
+  if (
+    publishedEngineAuthority &&
+    (publishedEngineAuthority.intent !== "connect-probe-only" ||
+      publishedEngineAuthority.creationAuthority.providerId !== PROVIDER_ID ||
+      publishedEngineAuthority.creationAuthority.operation !== "host-local-inference" ||
+      publishedEngineAuthority.creationAuthority.engineId !== PROVIDER_ID)
+  ) {
+    throw new Error("Podman published inference has invalid creation engine authority.");
+  }
+  const probeCleanupTiming = options.probeCleanupTiming ?? Object.freeze({});
+  const inspectNetwork = (
+    expected: Parameters<typeof inspectProviderNetwork>[2],
+  ): PodmanInferenceNetworkAuthority =>
+    inspectProviderNetwork(engine, authority, expected, options.externalNetwork);
   if (engine.operation !== "host-local-inference" || engine.engineId !== PROVIDER_ID) {
     throw new Error("Podman host-local inference requires an operation-scoped Podman engine.");
   }
@@ -2591,12 +3404,50 @@ export function createPodmanHostLocalInferenceRuntime(
   requireAccelerationAuthority(authority);
 
   const assertAuthority = () => {
-    requireAccelerationAuthority(revalidatePodmanInferenceAuthority(engine, authority));
+    requireAccelerationAuthority(
+      revalidatePodmanInferenceAuthority(engine, authority, authorityQualification),
+    );
   };
   const currentAuthority = () =>
     createPersistedEngineAuthority(PROVIDER_ID, engine, authority.receiptSha256);
-  const authorize = (recordIfMissing: boolean): PersistedEngineAuthority => {
+  type PublishedRecoveryAuthorityMode = "forward" | "rollback";
+  const authorize = (
+    recordIfMissing: boolean,
+    publishedMode: PublishedRecoveryAuthorityMode = "forward",
+  ): PersistedEngineAuthority => {
     assertAuthority();
+    if (publishedEngineAuthority) {
+      if (recordIfMissing) {
+        throw new Error(
+          "Podman published inference execution authority cannot create new durable state.",
+        );
+      }
+      if (publishedMode === "forward") {
+        try {
+          publishedEngineAuthority.assertForwardAuthority();
+        } catch {
+          throw new PublishedInferenceForwardAuthorityError();
+        }
+      }
+      const persisted = authorityStore.load("host-local-inference");
+      if (
+        persisted === null ||
+        serializePersistedEngineAuthority(persisted) !==
+          serializePersistedEngineAuthority(publishedEngineAuthority.creationAuthority)
+      ) {
+        throw new Error(
+          "Podman published inference creation authority differs from its persisted record.",
+        );
+      }
+      if (publishedMode === "forward") {
+        try {
+          publishedEngineAuthority.assertForwardAuthority();
+        } catch {
+          throw new PublishedInferenceForwardAuthorityError();
+        }
+      }
+      return persisted;
+    }
     const current = currentAuthority();
     const persisted = authorityStore.load("host-local-inference");
     if (persisted === null) {
@@ -2612,16 +3463,36 @@ export function createPodmanHostLocalInferenceRuntime(
     }
     return requirePersistedEngineAuthority(persisted, PROVIDER_ID, engine, authority.receiptSha256);
   };
+  const assertReceiptExecutionAuthority = (
+    publishedMode: PublishedRecoveryAuthorityMode = "forward",
+  ): void => {
+    if (publishedEngineAuthority) {
+      authorize(false, publishedMode);
+      return;
+    }
+    assertAuthority();
+  };
   const authorizeReceipt = (
     receipt: HostLocalInferenceReceipt,
     requireRouteAuthority = true,
+    publishedMode: PublishedRecoveryAuthorityMode = "forward",
   ): HostLocalInferenceReceipt => {
     const normalized = normalizeHostLocalInferenceReceipt(receipt);
+    if (
+      publishedEngineAuthority &&
+      (normalized.service !== "ollama" ||
+        serializeHostLocalInferenceReceipt(normalized) !==
+          publishedEngineAuthority.serializedReceipt)
+    ) {
+      throw new Error(
+        "Podman published inference operation differs from its exact recovery receipt.",
+      );
+    }
     if (normalized.providerId !== PROVIDER_ID) {
       throw new Error("Host-local inference receipt belongs to another runtime provider.");
     }
     if (normalized.runtime.kind === "container" && operationAcceleration !== "nvidia-gpu") {
-      throw new Error("Podman managed NIM and vLLM require NVIDIA GPU operation authority.");
+      throw new Error("Podman managed inference services require NVIDIA GPU operation authority.");
     }
     if (
       normalized.runtime.kind === "host" &&
@@ -2633,27 +3504,47 @@ export function createPodmanHostLocalInferenceRuntime(
       throw new Error("Host-local inference receipt does not use the provider's canonical host.");
     }
     const endpoint = requireProofEndpoint(normalized.endpoint);
-    authorize(false);
-    requirePersistedEngineAuthority(
-      normalized.engineAuthority,
-      PROVIDER_ID,
-      engine,
-      authority.receiptSha256,
-    );
-    if (normalized.service === "ollama" && requireRouteAuthority) {
+    const persisted = authorize(false, publishedMode);
+    if (publishedEngineAuthority) {
+      if (
+        serializePersistedEngineAuthority(normalized.engineAuthority) !==
+        serializePersistedEngineAuthority(persisted)
+      ) {
+        throw new Error(
+          "Podman published inference receipt differs from its immutable creation authority.",
+        );
+      }
+    } else {
+      requirePersistedEngineAuthority(
+        normalized.engineAuthority,
+        PROVIDER_ID,
+        engine,
+        authority.receiptSha256,
+      );
+    }
+    if (
+      normalized.service === "ollama" &&
+      normalized.runtime.kind === "host" &&
+      requireRouteAuthority
+    ) {
       requireOllamaRouteAuthority(
         routeAuthorityStore.load("ollama"),
         ollamaRouteAuthority(normalized),
       );
     }
-    inspectProviderNetwork(engine, authority, endpoint);
+    inspectNetwork(endpoint);
     return normalized;
   };
-  const inspectReceipt = (receipt: HostLocalInferenceReceipt) => {
-    const normalized = authorizeReceipt(receipt);
+  const inspectReceipt = (
+    receipt: HostLocalInferenceReceipt,
+    publishedMode: PublishedRecoveryAuthorityMode = "forward",
+  ) => {
+    const normalized = authorizeReceipt(receipt, true, publishedMode);
     if (
       normalized.runtime.kind !== "container" ||
-      (normalized.service !== "nim" && normalized.service !== "vllm") ||
+      (normalized.service !== "ollama" &&
+        normalized.service !== "nim" &&
+        normalized.service !== "vllm") ||
       normalized.inference === undefined ||
       normalized.publication === undefined ||
       !("devices" in normalized.runtime.gpu)
@@ -2666,15 +3557,100 @@ export function createPodmanHostLocalInferenceRuntime(
     );
     return { receipt: normalized as ManagedReceipt, container };
   };
+  const requirePublishedResumeTransactionCurrent = (
+    receipt: HostLocalInferenceReceipt,
+  ): ManagedReceipt => {
+    if (!publishedEngineAuthority) {
+      throw new Error("Podman published inference transaction authority is unavailable.");
+    }
+    const normalized = normalizeHostLocalInferenceReceipt(receipt);
+    if (
+      normalized.service !== "ollama" ||
+      normalized.runtime.kind !== "container" ||
+      normalized.inference === undefined ||
+      normalized.publication === undefined ||
+      !("devices" in normalized.runtime.gpu) ||
+      serializeHostLocalInferenceReceipt(normalized) !== publishedEngineAuthority.serializedReceipt
+    ) {
+      throw new Error("Podman published inference transaction differs from its exact receipt.");
+    }
+    try {
+      publishedEngineAuthority.assertForwardAuthority();
+    } catch {
+      throw new PublishedInferenceForwardAuthorityError();
+    }
+    assertBoundEngineTransactionCurrent();
+    const persisted = authorityStore.load("host-local-inference");
+    if (
+      persisted === null ||
+      serializePersistedEngineAuthority(persisted) !==
+        serializePersistedEngineAuthority(publishedEngineAuthority.creationAuthority) ||
+      serializePersistedEngineAuthority(normalized.engineAuthority) !==
+        serializePersistedEngineAuthority(persisted)
+    ) {
+      throw new Error(
+        "Podman published inference transaction differs from its persisted engine authority.",
+      );
+    }
+    return normalized as ManagedReceipt;
+  };
+  const inspectPublishedResumeTransaction = (
+    receipt: HostLocalInferenceReceipt,
+  ): {
+    readonly receipt: ManagedReceipt;
+    readonly container: ManagedContainer;
+  } => {
+    const normalized = requirePublishedResumeTransactionCurrent(receipt);
+    inspectNetwork(requireProofEndpoint(normalized.endpoint));
+    const container = requireReceiptIdentity(
+      inspectContainer(engine, normalized.runtime.runtimeId),
+      normalized,
+    );
+    requirePublishedResumeTransactionCurrent(normalized);
+    return Object.freeze({ receipt: normalized as ManagedReceipt, container });
+  };
+  const validatePublishedResumeReceipt = (
+    receipt: HostLocalInferenceReceipt,
+    timing: PodmanPublishedResumeTimingRecorder,
+  ): HostLocalInferenceReceipt => {
+    const inspected = inspectPublishedResumeTransaction(receipt);
+    if (!inspected.container.running) {
+      throw new Error("Podman published inference validation requires a running runtime.");
+    }
+    let gpuFailure: unknown;
+    try {
+      timing.measure("gpuIdentity", () =>
+        proveManagedGpu(
+          engine,
+          () => requirePublishedResumeTransactionCurrent(inspected.receipt),
+          inspected.container.runtimeId,
+          inspected.receipt.runtime.gpu.devices,
+        ),
+      );
+    } catch (error) {
+      gpuFailure = error;
+    }
+    timing.measure("cleanupCurrentness", () => {
+      const current = inspectPublishedResumeTransaction(inspected.receipt);
+      if (!current.container.running) {
+        throw new Error("Podman published inference runtime stopped before final currentness.");
+      }
+    });
+    if (gpuFailure !== undefined) {
+      throw gpuFailure;
+    }
+    return inspected.receipt;
+  };
   const validateReceipt = (
     receipt: HostLocalInferenceReceipt,
     requireRouteAuthority = true,
+    publishedResumeTiming?: PodmanPublishedResumeTimingRecorder,
   ): HostLocalInferenceReceipt => {
     const normalized = authorizeReceipt(receipt, requireRouteAuthority);
     const endpoint = requireProofEndpoint(normalized.endpoint);
     const assertReceiptAuthority = () => {
-      assertAuthority();
-      inspectProviderNetwork(engine, authority, endpoint);
+      assertReceiptExecutionAuthority();
+      inspectNetwork(endpoint);
     };
     if (normalized.inference === undefined) {
       throw new Error("Podman inference receipt lacks real-inference authority.");
@@ -2689,6 +3665,7 @@ export function createPodmanHostLocalInferenceRuntime(
         receiptProbeParent(normalized),
         onFailureEvidence,
         sensitiveRedactor,
+        probeCleanupTiming,
       );
       assertAuthority();
       probeOpenAiInference(
@@ -2703,6 +3680,7 @@ export function createPodmanHostLocalInferenceRuntime(
         receiptProbeParent(normalized),
         onFailureEvidence,
         sensitiveRedactor,
+        probeCleanupTiming,
       );
       probeOllamaAcceleration(
         engine,
@@ -2716,6 +3694,7 @@ export function createPodmanHostLocalInferenceRuntime(
         receiptProbeParent(normalized),
         onFailureEvidence,
         sensitiveRedactor,
+        probeCleanupTiming,
       );
       assertReceiptAuthority();
       return normalized;
@@ -2725,7 +3704,7 @@ export function createPodmanHostLocalInferenceRuntime(
       throw new Error("Podman managed inference validation requires a running runtime.");
     }
     const service = inspected.receipt.service;
-    if (service !== "nim" && service !== "vllm") {
+    if (service !== "ollama" && service !== "nim" && service !== "vllm") {
       throw new Error("Podman managed inference validation has an unsupported service.");
     }
     const spec = {
@@ -2735,38 +3714,75 @@ export function createPodmanHostLocalInferenceRuntime(
       model: normalized.inference.model,
       requireToolCalling: normalized.inference.toolCallingRequired,
     } as const;
-    probeManagedReady(
-      engine,
-      authority,
-      assertReceiptAuthority,
-      spec,
-      receiptProbeParent(inspected.receipt),
-      onFailureEvidence,
-      sensitiveRedactor,
+    const measurePublishedResumeStage = <T>(
+      stage: PodmanPublishedResumeTimingStage,
+      operation: () => T,
+    ): T => (publishedResumeTiming ? publishedResumeTiming.measure(stage, operation) : operation());
+    measurePublishedResumeStage("managedReady", () =>
+      probeManagedReady(
+        engine,
+        authority,
+        assertReceiptAuthority,
+        spec,
+        receiptProbeParent(inspected.receipt),
+        onFailureEvidence,
+        sensitiveRedactor,
+        probeCleanupTiming,
+        publishedResumeTiming,
+      ),
     );
     if (!("devices" in inspected.receipt.runtime.gpu)) {
       throw new Error("Podman managed inference receipt lacks exact CDI device authority.");
     }
-    proveManagedGpu(
-      engine,
-      assertReceiptAuthority,
-      inspected.container.runtimeId,
-      inspected.receipt.runtime.gpu.devices,
+    measurePublishedResumeStage("gpuIdentity", () =>
+      proveManagedGpu(
+        engine,
+        assertReceiptAuthority,
+        inspected.container.runtimeId,
+        inspected.receipt.runtime.gpu.devices,
+      ),
     );
-    probeOpenAiInference(
-      engine,
-      authority,
-      assertReceiptAuthority,
-      spec.endpoint,
-      spec.probeImageRef,
-      spec.model,
-      spec.requireToolCalling,
-      spec.service,
-      receiptProbeParent(inspected.receipt),
-      onFailureEvidence,
-      sensitiveRedactor,
+    // A published resume remains in flight until its caller proves the final
+    // route and dependent forwards, finalizes this prepared startup, and
+    // releases the registry transaction. Creation and explicit deep
+    // validation retain the generated/tool and model-placement attestation.
+    measurePublishedResumeStage("generatedProof", () =>
+      probeOpenAiInference(
+        engine,
+        authority,
+        assertReceiptAuthority,
+        spec.endpoint,
+        spec.probeImageRef,
+        spec.model,
+        spec.requireToolCalling,
+        spec.service,
+        receiptProbeParent(inspected.receipt),
+        onFailureEvidence,
+        sensitiveRedactor,
+        probeCleanupTiming,
+        publishedResumeTiming,
+      ),
     );
-    assertReceiptAuthority();
+    if (service === "ollama") {
+      measurePublishedResumeStage("modelPlacement", () =>
+        probeOllamaAcceleration(
+          engine,
+          authority,
+          assertReceiptAuthority,
+          spec.endpoint,
+          spec.probeImageRef,
+          spec.model,
+          "nvidia-gpu",
+          inspected.receipt.runtime.modelDigest ?? null,
+          receiptProbeParent(inspected.receipt),
+          onFailureEvidence,
+          sensitiveRedactor,
+          probeCleanupTiming,
+          publishedResumeTiming,
+        ),
+      );
+    }
+    measurePublishedResumeStage("cleanupCurrentness", assertReceiptAuthority);
     return normalized;
   };
 
@@ -2776,11 +3792,11 @@ export function createPodmanHostLocalInferenceRuntime(
     recoveryOnly: boolean,
   ): HostLocalInferencePreparedStartup => {
     if (operationAcceleration !== "nvidia-gpu") {
-      throw new Error("Podman managed NIM and vLLM require NVIDIA GPU operation authority.");
+      throw new Error("Podman managed inference services require NVIDIA GPU operation authority.");
     }
     const writer = requireWriter(writerValue);
     const persisted = authorize(true);
-    const network = inspectProviderNetwork(engine, authority, input);
+    const network = inspectNetwork(input);
     const containerName = exactText(input.containerName, SAFE_NAME, "Inference container name");
     const existingId = lookupContainerId(engine, containerName);
     if (existingId === null && recoveryOnly) {
@@ -2804,10 +3820,10 @@ export function createPodmanHostLocalInferenceRuntime(
     const spec = normalizeManagedSpec(input, writer, authority, network, priorState);
     const assertSpecAuthority = () => {
       assertAuthority();
-      inspectProviderNetwork(engine, authority, spec.endpoint);
+      inspectNetwork(spec.endpoint);
     };
-    const secretEnvironment = managedSecretEnvironment(spec, operationEnv);
-    requireSecretFreeCommand(spec.command, secretEnvironment, sensitiveRedactor);
+    const operationEnvironment = managedOperationEnvironment(spec, operationEnv);
+    requireSecretFreeCommand(spec.command, operationEnvironment, sensitiveRedactor);
     let phase: PodmanInferenceFailureEvidence["phase"] = "start";
     if (existingId !== null) {
       let container = requireSpecIdentity(inspectContainer(engine, existingId), spec);
@@ -2867,7 +3883,11 @@ export function createPodmanHostLocalInferenceRuntime(
             managedSpecProbeParent(spec),
             onFailureEvidence,
             sensitiveRedactor,
+            probeCleanupTiming,
           );
+          if (spec.service === "ollama") {
+            pullManagedOllamaModel(engine, assertSpecAuthority, container.runtimeId, spec.model);
+          }
           phase = "gpu";
           proveManagedGpu(engine, assertSpecAuthority, container.runtimeId, spec.gpuDevices);
           phase = "inference";
@@ -2883,9 +3903,27 @@ export function createPodmanHostLocalInferenceRuntime(
             managedSpecProbeParent(spec),
             onFailureEvidence,
             sensitiveRedactor,
+            probeCleanupTiming,
           );
+          const placement =
+            spec.service === "ollama"
+              ? probeOllamaAcceleration(
+                  engine,
+                  authority,
+                  assertSpecAuthority,
+                  spec.endpoint,
+                  spec.probeImageRef,
+                  spec.model,
+                  "nvidia-gpu",
+                  null,
+                  managedSpecProbeParent(spec),
+                  onFailureEvidence,
+                  sensitiveRedactor,
+                  probeCleanupTiming,
+                )
+              : null;
           assertSpecAuthority();
-          return receiptFor(persisted, spec, container.runtimeId);
+          return receiptFor(persisted, spec, container.runtimeId, placement?.modelDigest);
         },
         () => {
           rollbackExisting();
@@ -2918,17 +3956,26 @@ export function createPodmanHostLocalInferenceRuntime(
 
     let created: ManagedContainer | null = null;
     let acknowledgedCleanupCandidate: ManagedContainer | null = null;
+    const publishPreflightOptions = options.inspectPublishedPort
+      ? { inspect: options.inspectPublishedPort }
+      : {};
     const receipt = withRollback(
       () => {
         phase = "start";
         assertSpecAuthority();
+        assertInferencePublishPortsFree(
+          spec.endpoint.port,
+          spec.endpoint.networkListenerIp ?? spec.endpoint.networkGatewayIp,
+          spec.service,
+          publishPreflightOptions,
+        );
         const translatedArgs = translatedRunArguments(spec, authority);
         const result =
-          spec.environment.length === 0
+          spec.environment.length === 0 && spec.ollamaContextLength === null
             ? engine.capture(translatedArgs, MUTATION_TIMEOUT_MS)
             : (engine.captureWithEnvironment?.(
                 translatedArgs,
-                secretEnvironment,
+                operationEnvironment,
                 MUTATION_TIMEOUT_MS,
               ) ??
               (() => {
@@ -2938,6 +3985,14 @@ export function createPodmanHostLocalInferenceRuntime(
               })());
         const foundId = lookupContainerId(engine, spec.containerName);
         if (foundId === null) {
+          if (result.status !== 0 || result.error) {
+            assertInferencePublishPortsFree(
+              spec.endpoint.port,
+              spec.endpoint.networkListenerIp ?? spec.endpoint.networkGatewayIp,
+              spec.service,
+              publishPreflightOptions,
+            );
+          }
           throw new Error(
             `Podman host-local inference container start failed without an owned runtime: ${redactedCommandEvidence(sensitiveRedactor, result)}`,
           );
@@ -2948,6 +4003,14 @@ export function createPodmanHostLocalInferenceRuntime(
           spec,
           foundId,
         );
+        if (result.status !== 0 || result.error) {
+          assertInferencePublishPortsFree(
+            spec.endpoint.port,
+            spec.endpoint.networkListenerIp ?? spec.endpoint.networkGatewayIp,
+            spec.service,
+            publishPreflightOptions,
+          );
+        }
         if (result.status === 0 && !result.error) {
           const reportedId = exactContainerId(result.stdout.trim());
           if (reportedId !== foundId) {
@@ -2977,7 +4040,11 @@ export function createPodmanHostLocalInferenceRuntime(
           managedSpecProbeParent(spec),
           onFailureEvidence,
           sensitiveRedactor,
+          probeCleanupTiming,
         );
+        if (spec.service === "ollama") {
+          pullManagedOllamaModel(engine, assertSpecAuthority, created.runtimeId, spec.model);
+        }
         phase = "gpu";
         proveManagedGpu(engine, assertSpecAuthority, created.runtimeId, spec.gpuDevices);
         phase = "inference";
@@ -2993,9 +4060,27 @@ export function createPodmanHostLocalInferenceRuntime(
           managedSpecProbeParent(spec),
           onFailureEvidence,
           sensitiveRedactor,
+          probeCleanupTiming,
         );
+        const placement =
+          spec.service === "ollama"
+            ? probeOllamaAcceleration(
+                engine,
+                authority,
+                assertSpecAuthority,
+                spec.endpoint,
+                spec.probeImageRef,
+                spec.model,
+                "nvidia-gpu",
+                null,
+                managedSpecProbeParent(spec),
+                onFailureEvidence,
+                sensitiveRedactor,
+                probeCleanupTiming,
+              )
+            : null;
         assertSpecAuthority();
-        return receiptFor(persisted, spec, created.runtimeId);
+        return receiptFor(persisted, spec, created.runtimeId, placement?.modelDigest);
       },
       () => {
         if (created !== null) {
@@ -3073,7 +4158,9 @@ export function createPodmanHostLocalInferenceRuntime(
     const normalizedReceipt = authorizeReceipt(receiptValue);
     if (
       normalizedReceipt.runtime.kind !== "container" ||
-      (normalizedReceipt.service !== "nim" && normalizedReceipt.service !== "vllm") ||
+      (normalizedReceipt.service !== "ollama" &&
+        normalizedReceipt.service !== "nim" &&
+        normalizedReceipt.service !== "vllm") ||
       normalizedReceipt.inference === undefined ||
       normalizedReceipt.publication === undefined ||
       !("devices" in normalizedReceipt.runtime.gpu)
@@ -3082,7 +4169,7 @@ export function createPodmanHostLocalInferenceRuntime(
     }
     const receipt = normalizedReceipt as ManagedReceipt;
     const endpoint = requireProofEndpoint(receipt.endpoint);
-    const network = inspectProviderNetwork(engine, authority, input);
+    const network = inspectNetwork(input);
     const originalPriorState = receipt.publication.priorState;
     if (
       originalPriorState !== "absent" &&
@@ -3097,6 +4184,7 @@ export function createPodmanHostLocalInferenceRuntime(
       authority,
       network,
       originalPriorState,
+      publishedEngineAuthority?.creationAuthority.bindingSha256,
     );
     if (
       input.service !== receipt.service ||
@@ -3108,6 +4196,7 @@ export function createPodmanHostLocalInferenceRuntime(
       exactNetworkName(input.networkName, "Inference network name") !== endpoint.networkName ||
       input.networkId !== endpoint.networkId ||
       input.networkGatewayIp !== endpoint.networkGatewayIp ||
+      input.networkListenerIp !== endpoint.networkListenerIp ||
       network.authoritySha256 !== endpoint.networkAuthoritySha256 ||
       input.model !== receipt.inference.model ||
       input.requireToolCalling !== receipt.inference.toolCallingRequired ||
@@ -3132,15 +4221,33 @@ export function createPodmanHostLocalInferenceRuntime(
     }
     const priorState = wasRunning ? ("running" as const) : ("stopped" as const);
     const assertReceiptAuthority = () => {
-      assertAuthority();
-      inspectProviderNetwork(engine, authority, endpoint);
+      assertReceiptExecutionAuthority();
+      inspectNetwork(endpoint);
+      container = requireReceiptIdentity(
+        inspectContainer(engine, receipt.runtime.runtimeId),
+        receipt,
+      );
+    };
+    const assertReceiptTransactionAuthority = () => {
+      const current = inspectPublishedResumeTransaction(receipt);
+      container = current.container;
+    };
+    const assertPublishedResumeTransactionCurrent = () => {
+      requirePublishedResumeTransactionCurrent(receipt);
+    };
+    const assertResumeForwardAuthority = publishedEngineAuthority
+      ? assertPublishedResumeTransactionCurrent
+      : assertReceiptAuthority;
+    const assertRollbackReceiptAuthority = () => {
+      assertReceiptExecutionAuthority("rollback");
+      inspectNetwork(endpoint);
       container = requireReceiptIdentity(
         inspectContainer(engine, receipt.runtime.runtimeId),
         receipt,
       );
     };
     const rollback = () => {
-      assertReceiptAuthority();
+      assertRollbackReceiptAuthority();
       restoreExact(
         engine,
         container,
@@ -3149,68 +4256,106 @@ export function createPodmanHostLocalInferenceRuntime(
         onFailureEvidence,
         sensitiveRedactor,
       );
-      assertReceiptAuthority();
+      assertRollbackReceiptAuthority();
       return "restored" as const;
     };
+    const resumeTiming = createPodmanPublishedResumeTimingRecorder(options.publishedResumeTiming);
     let phase: PodmanInferenceFailureEvidence["phase"] = "start";
     withRollback(
       () => {
-        if (!container.running) {
-          assertReceiptAuthority();
-          const result = engine.capture(["start", container.runtimeId], MUTATION_TIMEOUT_MS);
-          container = requireReceiptIdentity(
-            inspectContainer(engine, container.runtimeId),
-            receipt,
-          );
+        resumeTiming.measure("start", () => {
           if (!container.running) {
-            throw new Error(
-              `Podman published resume did not leave the exact runtime running: ${redactedCommandEvidence(sensitiveRedactor, result)}`,
+            assertResumeForwardAuthority();
+            const result = engine.capture(["start", container.runtimeId], MUTATION_TIMEOUT_MS);
+            container = requireReceiptIdentity(
+              inspectContainer(engine, container.runtimeId),
+              receipt,
+            );
+            if (!container.running) {
+              throw new Error(
+                `Podman published resume did not leave the exact runtime running: ${redactedCommandEvidence(sensitiveRedactor, result)}`,
+              );
+            }
+            emitAcknowledgedCommandFailure(
+              "Podman published resume start",
+              "start",
+              result,
+              onFailureEvidence,
+              sensitiveRedactor,
+            );
+            assertResumeForwardAuthority();
+          }
+        });
+        if (!publishedEngineAuthority) {
+          phase = "ready";
+          resumeTiming.measure("managedReady", () =>
+            probeManagedReady(
+              engine,
+              authority,
+              assertReceiptAuthority,
+              {
+                endpoint,
+                probeImageRef: receipt.runtime.probeImageRef,
+                service: receipt.service,
+              },
+              receiptProbeParent(receipt),
+              onFailureEvidence,
+              sensitiveRedactor,
+              probeCleanupTiming,
+              resumeTiming,
+            ),
+          );
+          phase = "gpu";
+          resumeTiming.measure("gpuIdentity", () =>
+            proveManagedGpu(
+              engine,
+              assertReceiptAuthority,
+              container.runtimeId,
+              receipt.runtime.gpu.devices,
+            ),
+          );
+          phase = "inference";
+          resumeTiming.measure("generatedProof", () =>
+            probeOpenAiInference(
+              engine,
+              authority,
+              assertReceiptAuthority,
+              endpoint,
+              receipt.runtime.probeImageRef,
+              receipt.inference.model,
+              receipt.inference.toolCallingRequired,
+              receipt.service,
+              receiptProbeParent(receipt),
+              onFailureEvidence,
+              sensitiveRedactor,
+              probeCleanupTiming,
+              resumeTiming,
+            ),
+          );
+          if (receipt.service === "ollama") {
+            resumeTiming.measure("modelPlacement", () =>
+              probeOllamaAcceleration(
+                engine,
+                authority,
+                assertReceiptAuthority,
+                endpoint,
+                receipt.runtime.probeImageRef,
+                receipt.inference.model,
+                "nvidia-gpu",
+                receipt.runtime.modelDigest ?? null,
+                receiptProbeParent(receipt),
+                onFailureEvidence,
+                sensitiveRedactor,
+                probeCleanupTiming,
+                resumeTiming,
+              ),
             );
           }
-          emitAcknowledgedCommandFailure(
-            "Podman published resume start",
-            "start",
-            result,
-            onFailureEvidence,
-            sensitiveRedactor,
-          );
         }
-        phase = "ready";
-        probeManagedReady(
-          engine,
-          authority,
-          assertReceiptAuthority,
-          {
-            endpoint,
-            probeImageRef: receipt.runtime.probeImageRef,
-            service: receipt.service,
-          },
-          receiptProbeParent(receipt),
-          onFailureEvidence,
-          sensitiveRedactor,
+        resumeTiming.measure(
+          "cleanupCurrentness",
+          publishedEngineAuthority ? assertReceiptTransactionAuthority : assertReceiptAuthority,
         );
-        phase = "gpu";
-        proveManagedGpu(
-          engine,
-          assertReceiptAuthority,
-          container.runtimeId,
-          receipt.runtime.gpu.devices,
-        );
-        phase = "inference";
-        probeOpenAiInference(
-          engine,
-          authority,
-          assertReceiptAuthority,
-          endpoint,
-          receipt.runtime.probeImageRef,
-          receipt.inference.model,
-          receipt.inference.toolCallingRequired,
-          receipt.service,
-          receiptProbeParent(receipt),
-          onFailureEvidence,
-          sensitiveRedactor,
-        );
-        assertReceiptAuthority();
       },
       () => {
         rollback();
@@ -3224,9 +4369,19 @@ export function createPodmanHostLocalInferenceRuntime(
       writer,
       priorState,
       validate: () => {
-        validateReceipt(receipt);
+        if (publishedEngineAuthority) {
+          validatePublishedResumeReceipt(receipt, resumeTiming);
+        } else {
+          validateReceipt(receipt, true, resumeTiming);
+        }
       },
-      validatePublication: assertReceiptAuthority,
+      validatePublication: publishedEngineAuthority
+        ? assertPublishedResumeTransactionCurrent
+        : assertReceiptAuthority,
+      publishedResume: true,
+      onPublishedResumeFinalized: () => {
+        resumeTiming.finish(wasRunning ? "reused" : "started");
+      },
       onCommitValidationFailure: (error) => {
         onFailureEvidence(
           Object.freeze({
@@ -3244,11 +4399,15 @@ export function createPodmanHostLocalInferenceRuntime(
   return Object.freeze({
     providerId: PROVIDER_ID,
     authorityId: engine.authorityId,
-    services:
-      operationAcceleration === "nvidia-gpu"
+    services: publishedEngineAuthority
+      ? Object.freeze(["ollama"] as const)
+      : operationAcceleration === "nvidia-gpu"
         ? Object.freeze(["ollama", "nim", "vllm"] as const)
         : Object.freeze(["ollama"] as const),
     translateContainerArgs(args: readonly string[]) {
+      if (publishedEngineAuthority) {
+        throw new Error("Hermes Portable published recovery cannot translate new runtime input.");
+      }
       authorize(true);
       return translatePodmanLocalInferenceArgs(args, authority, {
         acceleration: operationAcceleration,
@@ -3258,6 +4417,9 @@ export function createPodmanHostLocalInferenceRuntime(
       input: HostLocalOllamaInferenceInput,
       writerValue: HostLocalInferenceReceiptWriter,
     ) {
+      if (publishedEngineAuthority) {
+        throw new Error("Hermes Portable published recovery cannot qualify a new Ollama runtime.");
+      }
       if (input.acceleration !== "cpu" && input.acceleration !== "nvidia-gpu") {
         throw new Error("Ollama acceleration selection is unsupported.");
       }
@@ -3266,7 +4428,7 @@ export function createPodmanHostLocalInferenceRuntime(
       }
       const writer = requireWriter(writerValue);
       const persisted = authorize(true);
-      const network = inspectProviderNetwork(engine, authority, input);
+      const network = inspectNetwork(input);
       if (typeof input.requireToolCalling !== "boolean") {
         throw new Error("Ollama tool-calling requirement must be a boolean.");
       }
@@ -3302,7 +4464,7 @@ export function createPodmanHostLocalInferenceRuntime(
       });
       const assertOllamaAuthority = () => {
         assertAuthority();
-        inspectProviderNetwork(engine, authority, endpoint);
+        inspectNetwork(endpoint);
       };
       let phase: PodmanInferenceFailureEvidence["phase"] = "ready";
       let placement: OllamaModelPlacementAuthority;
@@ -3316,6 +4478,7 @@ export function createPodmanHostLocalInferenceRuntime(
           qualificationParent,
           onFailureEvidence,
           sensitiveRedactor,
+          probeCleanupTiming,
         );
         phase = "inference";
         probeOpenAiInference(
@@ -3330,6 +4493,7 @@ export function createPodmanHostLocalInferenceRuntime(
           qualificationParent,
           onFailureEvidence,
           sensitiveRedactor,
+          probeCleanupTiming,
         );
         phase = "gpu";
         placement = probeOllamaAcceleration(
@@ -3344,6 +4508,7 @@ export function createPodmanHostLocalInferenceRuntime(
           qualificationParent,
           onFailureEvidence,
           sensitiveRedactor,
+          probeCleanupTiming,
         );
         assertOllamaAuthority();
       } catch (error) {
@@ -3400,17 +4565,81 @@ export function createPodmanHostLocalInferenceRuntime(
       });
     },
     startManaged(input: HostLocalManagedInferenceInput, writer: HostLocalInferenceReceiptWriter) {
+      if (publishedEngineAuthority) {
+        throw new Error("Hermes Portable published recovery cannot start a new managed runtime.");
+      }
       return start(input, writer, false);
     },
     recoverManaged(input: HostLocalManagedInferenceInput, writer: HostLocalInferenceReceiptWriter) {
+      if (publishedEngineAuthority) {
+        throw new Error(
+          "Hermes Portable published recovery cannot recover an unpublished runtime.",
+        );
+      }
       return start(input, writer, true);
     },
     resumeManaged: resumePublished,
+    ...(publishedEngineAuthority
+      ? {
+          preparePublishedRecoveryEntry(
+            receipt: HostLocalInferenceReceipt,
+          ): HostLocalManagedInferenceInspection {
+            const current = inspectPublishedResumeTransaction(receipt);
+            return Object.freeze({
+              running: current.container.running,
+              receipt: current.receipt,
+            });
+          },
+          inspectPublishedRecoveryCurrent(
+            receipt: HostLocalInferenceReceipt,
+          ): HostLocalManagedInferenceInspection {
+            const current = inspectPublishedResumeTransaction(receipt);
+            return Object.freeze({
+              running: current.container.running,
+              receipt: current.receipt,
+            });
+          },
+          inspectPublishedRecoveryRestoration(
+            receipt: HostLocalInferenceReceipt,
+          ): HostLocalManagedInferenceInspection {
+            const inspected = inspectReceipt(receipt, "rollback");
+            if (!inspected.container.running && !AT_REST_STATES.has(inspected.container.status)) {
+              throw new Error(
+                `Podman published inference restoration found indeterminate runtime state '${inspected.container.status}'.`,
+              );
+            }
+            return Object.freeze({
+              running: inspected.container.running,
+              receipt: inspected.receipt,
+            });
+          },
+        }
+      : {}),
     inspectManaged(receipt: HostLocalInferenceReceipt): HostLocalManagedInferenceInspection {
       const inspected = inspectReceipt(receipt);
-      return Object.freeze({ running: inspected.container.running, receipt: inspected.receipt });
+      return Object.freeze({
+        running: inspected.container.running,
+        receipt: inspected.receipt,
+      });
     },
+    ...(publishedEngineAuthority
+      ? {
+          validatePublishedResume(receipt: HostLocalInferenceReceipt): HostLocalInferenceReceipt {
+            const resumeTiming = createPodmanPublishedResumeTimingRecorder(
+              options.publishedResumeTiming,
+            );
+            const validated = validatePublishedResumeReceipt(receipt, resumeTiming);
+            resumeTiming.finish("reused");
+            return validated;
+          },
+        }
+      : {}),
     stopManaged(receipt: HostLocalInferenceReceipt): HostLocalManagedInferenceInspection {
+      if (publishedEngineAuthority) {
+        throw new Error(
+          "Hermes Portable published recovery cannot stop through a public lifecycle.",
+        );
+      }
       let inspected = inspectReceipt(receipt);
       if (!inspected.container.running) {
         if (!AT_REST_STATES.has(inspected.container.status)) {
@@ -3440,7 +4669,7 @@ export function createPodmanHostLocalInferenceRuntime(
       );
       return Object.freeze({ running: false, receipt: inspected.receipt });
     },
-    preserveForRebuild: validateReceipt,
+    preserveForRebuild: (receipt: HostLocalInferenceReceipt) => validateReceipt(receipt),
     validate: validateReceipt,
     prepareDestroy(receipt: HostLocalInferenceReceipt) {
       const normalized = authorizeReceipt(receipt);
@@ -3459,6 +4688,9 @@ export function createPodmanHostLocalInferenceRuntime(
       return normalized;
     },
     destroy(receipt: HostLocalInferenceReceipt) {
+      if (publishedEngineAuthority) {
+        throw new Error("Hermes Portable published recovery cannot destroy a published runtime.");
+      }
       const normalized = authorizeReceipt(receipt);
       if (normalized.runtime.kind === "host") {
         return Object.freeze({
@@ -3474,7 +4706,10 @@ export function createPodmanHostLocalInferenceRuntime(
             `Podman inference destroy found name '${normalized.runtime.name}' reused by '${name}'.`,
           );
         }
-        return Object.freeze({ status: "already-absent" as const, receipt: normalized });
+        return Object.freeze({
+          status: "already-absent" as const,
+          receipt: normalized,
+        });
       }
       const inspected = inspectReceipt(normalized);
       assertAuthority();
@@ -3486,18 +4721,21 @@ export function createPodmanHostLocalInferenceRuntime(
         onFailureEvidence,
         sensitiveRedactor,
       );
-      return Object.freeze({ status: "removed" as const, receipt: inspected.receipt });
+      return Object.freeze({
+        status: "removed" as const,
+        receipt: inspected.receipt,
+      });
     },
   });
 }
 
-export function createPodmanHostLocalInferenceOperation(
+function createPodmanHostLocalInferenceOperationFromAuthority(
   options: PodmanHostLocalInferenceOperationOptions,
+  qualifiedEngine: PodmanContainerEngine,
+  authority: PodmanInferenceAuthorityReceipt,
+  acceleration: HostLocalOllamaAccelerationAuthority,
 ): HostLocalInferenceOperation {
-  const acceleration = normalizeOperationAcceleration(options.acceleration);
   const redactor = requireRedactor(options.redactSensitive);
-  const qualifiedEngine = redactingEngine(options.engine, redactor);
-  const authority = qualifyPodmanInferenceAuthority(qualifiedEngine);
   const runtime = createPodmanHostLocalInferenceRuntime({
     ...options,
     engine: qualifiedEngine,
@@ -3505,6 +4743,15 @@ export function createPodmanHostLocalInferenceOperation(
     authority,
     operationAcceleration: acceleration,
   });
+  const assertTransactionCurrent = (): void => {
+    const candidate = options.engine as PodmanContainerEngine & {
+      readonly assertAuthority?: () => void;
+    };
+    if (!candidate.assertAuthority) {
+      throw new Error("Podman inference operation lacks bound executable and socket authority.");
+    }
+    candidate.assertAuthority();
+  };
   const denyGenericEngineCommand = () => {
     throw new Error(
       "Podman managed inference exposes commands only through its provider-owned lifecycle.",
@@ -3524,8 +4771,13 @@ export function createPodmanHostLocalInferenceOperation(
     providerId: PROVIDER_ID,
     engine: publicEngine,
     bindingSha256: authority.receiptSha256,
+    assertTransactionCurrent,
     assertAuthority: () => {
-      const refreshed = revalidatePodmanInferenceAuthority(qualifiedEngine, authority);
+      const refreshed = revalidatePodmanInferenceAuthority(
+        qualifiedEngine,
+        authority,
+        options.authorityQualification,
+      );
       if (acceleration === "nvidia-gpu" && refreshed.cdiDevices.length === 0) {
         throw new Error(
           "Podman NVIDIA GPU operation authority requires at least one discovered NVIDIA CDI device.",
@@ -3540,4 +4792,86 @@ export function createPodmanHostLocalInferenceOperation(
     },
     managedRuntime: runtime,
   });
+}
+
+/** Fully qualify one engine generation before a delayed, single operation construction. */
+export function preparePodmanHostLocalInferenceOperationAuthority(
+  options: Omit<
+    Pick<
+      PodmanHostLocalInferenceOperationOptions,
+      "acceleration" | "authority" | "authorityQualification" | "engine" | "env" | "redactSensitive"
+    >,
+    "engine"
+  > & { readonly engine: PodmanBoundContainerEngine },
+): PreparedPodmanHostLocalInferenceOperationAuthority {
+  const acceleration = normalizeOperationAcceleration(options.acceleration);
+  const redactor = requireRedactor(options.redactSensitive);
+  const qualifiedEngine = redactingEngine(options.engine, redactor);
+  const authority = options.authority
+    ? revalidatePodmanInferenceAuthority(
+        qualifiedEngine,
+        options.authority,
+        options.authorityQualification,
+      )
+    : qualifyPodmanInferenceAuthority(qualifiedEngine, options.authorityQualification);
+  let operationCreated = false;
+  const assertTransactionCurrent = (): void => {
+    options.engine.assertAuthority();
+  };
+  const assertCurrent = (): void => {
+    revalidatePodmanInferenceAuthority(qualifiedEngine, authority, options.authorityQualification);
+  };
+  return Object.freeze({
+    createOperation(
+      operationOptions: PodmanPreparedHostLocalInferenceOperationOptions,
+    ): HostLocalInferenceOperation {
+      if (operationCreated) {
+        throw new Error("Podman inference operation authority was already consumed.");
+      }
+      operationCreated = true;
+      assertTransactionCurrent();
+      const operation = createPodmanHostLocalInferenceOperationFromAuthority(
+        {
+          ...operationOptions,
+          engine: options.engine,
+          env: options.env,
+          acceleration,
+          authority,
+          authorityQualification: options.authorityQualification,
+          redactSensitive: options.redactSensitive,
+        },
+        qualifiedEngine,
+        authority,
+        acceleration,
+      );
+      assertTransactionCurrent();
+      return operation;
+    },
+    assertTransactionCurrent,
+    assertCurrent,
+  });
+}
+
+export function createPodmanHostLocalInferenceOperation(
+  options: PodmanHostLocalInferenceOperationOptions,
+): HostLocalInferenceOperation {
+  const acceleration = normalizeOperationAcceleration(options.acceleration);
+  const redactor = requireRedactor(options.redactSensitive);
+  const qualifiedEngine = redactingEngine(
+    deadlineBoundHostLocalInferenceEngine(options.engine, options.deadlineMs),
+    redactor,
+  );
+  const authority = options.authority
+    ? revalidatePodmanInferenceAuthority(
+        qualifiedEngine,
+        options.authority,
+        options.authorityQualification,
+      )
+    : qualifyPodmanInferenceAuthority(qualifiedEngine, options.authorityQualification);
+  return createPodmanHostLocalInferenceOperationFromAuthority(
+    options,
+    qualifiedEngine,
+    authority,
+    acceleration,
+  );
 }

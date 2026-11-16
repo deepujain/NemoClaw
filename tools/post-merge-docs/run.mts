@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   configureOpenShellInference,
+  credentialFreeEnvironment,
   createOpenShellSandbox,
   defaultOpenShellTools,
   deleteOpenShellSandbox,
@@ -22,10 +23,12 @@ import {
   RESOLVER_MODEL_ID,
   resolverModelConfiguration,
 } from "../pr-merge-conflict-fixer/resolve.mts";
-import { allowedDocumentationPath, readBoundedFile } from "./contract.mts";
+import { allowedDocumentationPath, nextPatchReleaseTag, readBoundedFile } from "./contract.mts";
 
 const PATCH_FILE = "docs.patch";
+const REVIEW_REPORT_FILE = "review-report.txt";
 const MAX_PATCH_BYTES = 5_242_880;
+const MAX_REVIEW_REPORT_BYTES = 65_536;
 const MAX_FILE_BYTES = 1_048_576;
 const SHA = /^[0-9a-f]{40}$/u;
 const AGENT_FLAGS =
@@ -56,12 +59,40 @@ function exactSha(value: string | undefined, name: string): string {
   return SHA.test(sha) ? sha : fail(`${name} must be a full commit SHA`);
 }
 
+function previousSha(env: NodeJS.ProcessEnv): string {
+  return env.POST_MERGE_DOCS_PREVIOUS_SHA
+    ? exactSha(env.POST_MERGE_DOCS_PREVIOUS_SHA, "POST_MERGE_DOCS_PREVIOUS_SHA")
+    : "";
+}
+
 function git(repository: string, args: readonly string[]): string {
   return execFileSync("git", ["-C", repository, ...args], {
     encoding: "utf8",
     env: GIT_ENV,
     stdio: ["ignore", "pipe", "inherit"],
   }).trim();
+}
+
+function mergeDraftTree(repository: string, main: string, previous: string): string {
+  const result = spawnSync(
+    "git",
+    ["-C", repository, "merge-tree", "--write-tree", "--name-only", main, previous],
+    { encoding: "utf8", env: GIT_ENV, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  if (result.error) throw result.error;
+  const [tree = "", ...rest] = result.stdout.trim().split("\n");
+  if (result.status === 0) return exactSha(tree, "merged draft tree");
+  if (result.status !== 1) fail(`git merge-tree failed: ${result.stderr.trim()}`);
+  const separator = rest.indexOf("");
+  const files = separator < 0 ? rest : rest.slice(0, separator);
+  const messages = separator < 0 ? [] : rest.slice(separator + 1);
+  return fail(
+    [
+      `The managed documentation draft ${previous} conflicts with main ${main} in: ${files.join(", ")}`,
+      ...messages,
+      "Follow the recovery procedure: https://github.com/NVIDIA/NemoClaw/blob/main/docs/AUTOMATION.md#resolve-a-draft-merge-conflict",
+    ].join("\n"),
+  );
 }
 
 function reset(directory: string): void {
@@ -132,13 +163,19 @@ function prompt(env: NodeJS.ProcessEnv, current: Phase): string {
   const main = exactSha(env.GITHUB_SHA, "GITHUB_SHA");
   const rules =
     "Read AGENTS.md, WRITING.md, docs/AGENTS.md, docs/CONTRIBUTING.md, .agents/skills/nemoclaw-contributor-update-docs/SKILL.md, and .agents/skills/_shared/documentation-writing-review.md.";
+  const previous = previousSha(env);
+  const continuity = previous
+    ? `The staged changes include the draft at ${previous} merged with main. Preserve its documentation. Check every revision or removal against current source and tests.`
+    : "";
   if (current === "review") {
     return [
       `Independently review documentation coverage for ${range}..${main}.`,
       rules,
+      continuity,
       "Inspect the committed range and staged candidate. Do not edit the repository.",
       "Approve only if it completely and accurately covers user-visible changes, follows DORI and writing rules, and makes no unsupported claim.",
       "An empty patch is valid only when no documentation update is needed.",
+      `If you reject the candidate, write a concise evidence-backed report to /sandbox/output/${REVIEW_REPORT_FILE}.`,
       'Write exactly {"outcome":"approved"} or {"outcome":"rejected"} to /sandbox/output/decision.json.',
     ].join("\n");
   }
@@ -146,6 +183,8 @@ function prompt(env: NodeJS.ProcessEnv, current: Phase): string {
   return [
     `Update NemoClaw documentation for committed changes from ${tag} (${range}) through ${main}.`,
     rules,
+    continuity,
+    "Extend the staged documentation changes. Do not regenerate the draft from scratch.",
     `Inspect git history and git diff ${range}..${main}, then verify behavior in source and tests.`,
     "Update only public docs/ files, fern/docs.yml, or files under fern/assets/.",
     "Do not change fern/fern.config.json, docs/_build, dependencies, or code.",
@@ -156,7 +195,16 @@ function prompt(env: NodeJS.ProcessEnv, current: Phase): string {
 function prepare(env: NodeJS.ProcessEnv): void {
   const current = phase(env);
   const repository = prepareRepository(env);
-  if (current === "review") applyPatch(repository, patchPath(env));
+  const main = exactSha(env.GITHUB_SHA, "GITHUB_SHA");
+  const previous = previousSha(env);
+  if (previous) {
+    git(repository, ["read-tree", "--reset", "-u", mergeDraftTree(repository, main, previous)]);
+    validateCandidate(repository);
+  }
+  if (current === "review") {
+    git(repository, ["read-tree", "--reset", "-u", main]);
+    applyPatch(repository, patchPath(env));
+  }
   const output = path.join(
     required(env.POST_MERGE_DOCS_WORKDIR, "POST_MERGE_DOCS_WORKDIR"),
     "output",
@@ -197,6 +245,16 @@ function create(env: NodeJS.ProcessEnv, tools: OpenShellTools): void {
   const work = required(env.POST_MERGE_DOCS_WORKDIR, "POST_MERGE_DOCS_WORKDIR");
   const config = required(env.POST_MERGE_DOCS_CONFIG_DIR, "POST_MERGE_DOCS_CONFIG_DIR");
   const review = current === "review";
+  const sandboxName = required(env.SANDBOX_NAME, "SANDBOX_NAME");
+  const startupCommand = review
+    ? [
+        "/usr/bin/git",
+        "--git-dir=/sandbox/repo/.git",
+        "--work-tree=/sandbox/repo",
+        "status",
+        "--short",
+      ]
+    : ["/usr/bin/git", "-C", "/sandbox/repo", "status", "--short"];
   const policy =
     current === "author"
       ? "pr-merge-conflict-fixer/policy.yaml"
@@ -204,17 +262,9 @@ function create(env: NodeJS.ProcessEnv, tools: OpenShellTools): void {
   createOpenShellSandbox(
     env,
     {
-      command: review
-        ? [
-            "/usr/bin/git",
-            "--git-dir=/sandbox/repo/.git",
-            "--work-tree=/sandbox/repo",
-            "status",
-            "--short",
-          ]
-        : ["/usr/bin/git", "-C", "/sandbox/repo", "status", "--short"],
+      command: [],
       image: required(env.PI_IMAGE, "PI_IMAGE"),
-      name: required(env.SANDBOX_NAME, "SANDBOX_NAME"),
+      name: sandboxName,
       policyPath: path.join(required(env.TRUSTED_CHECKOUT, "TRUSTED_CHECKOUT"), "tools", policy),
       driverConfig: review
         ? {
@@ -244,6 +294,11 @@ function create(env: NodeJS.ProcessEnv, tools: OpenShellTools): void {
             { destination: "/sandbox", source: path.join(work, "output") },
           ],
     },
+    tools,
+  );
+  execOpenShellSandbox(
+    credentialFreeEnvironment(env),
+    { command: startupCommand, name: sandboxName },
     tools,
   );
 }
@@ -286,11 +341,10 @@ function download(env: NodeJS.ProcessEnv, name: string, tools: OpenShellTools): 
     },
     tools,
   );
-  return readBoundedFile(
-    path.join(directory, name),
-    name === PATCH_FILE ? MAX_PATCH_BYTES : 1_024,
-    true,
-  );
+  let maximum = 1_024;
+  if (name === PATCH_FILE) maximum = MAX_PATCH_BYTES;
+  if (name === REVIEW_REPORT_FILE) maximum = MAX_REVIEW_REPORT_BYTES;
+  return readBoundedFile(path.join(directory, name), maximum, true);
 }
 
 function exportArtifact(env: NodeJS.ProcessEnv, tools: OpenShellTools): void {
@@ -314,13 +368,19 @@ function exportArtifact(env: NodeJS.ProcessEnv, tools: OpenShellTools): void {
     const patch = download(env, PATCH_FILE, tools);
     const file = path.join(artifact, PATCH_FILE);
     write(file, patch);
-    applyPatch(
-      path.join(required(env.POST_MERGE_DOCS_WORKDIR, "POST_MERGE_DOCS_WORKDIR"), "repo"),
-      file,
+    const repository = path.join(
+      required(env.POST_MERGE_DOCS_WORKDIR, "POST_MERGE_DOCS_WORKDIR"),
+      "repo",
     );
+    git(repository, ["read-tree", "--reset", "-u", exactSha(env.GITHUB_SHA, "GITHUB_SHA")]);
+    applyPatch(repository, file);
     return;
   }
-  if (download(env, "decision.json", tools).toString("utf8").trim() !== '{"outcome":"approved"}') {
+  const decision = download(env, "decision.json", tools).toString("utf8").trim();
+  if (decision !== '{"outcome":"approved"}') {
+    if (decision === '{"outcome":"rejected"}') {
+      write(path.join(artifact, REVIEW_REPORT_FILE), download(env, REVIEW_REPORT_FILE, tools));
+    }
     fail("Independent documentation review did not approve the candidate");
   }
   const patch = readBoundedFile(patchPath(env), MAX_PATCH_BYTES, true);
@@ -331,8 +391,14 @@ function exportArtifact(env: NodeJS.ProcessEnv, tools: OpenShellTools): void {
       mainSha: exactSha(env.GITHUB_SHA, "GITHUB_SHA"),
       outcome: "approved",
       patchSha256: createHash("sha256").update(patch).digest("hex"),
+      previousSha: previousSha(env),
+      rangeStartTag: required(env.RANGE_START_TAG, "RANGE_START_TAG"),
       repository: required(env.GITHUB_REPOSITORY, "GITHUB_REPOSITORY"),
-      version: 1,
+      targetReleaseTag: nextPatchReleaseTag(
+        required(env.RANGE_START_TAG, "RANGE_START_TAG"),
+        "RANGE_START_TAG cannot produce a release target",
+      ),
+      version: 3,
     })}\n`,
   );
 }
@@ -342,13 +408,24 @@ export function executePostMergeDocs(
   tools: OpenShellTools = defaultOpenShellTools,
 ): void {
   prepare(env);
+  const sandboxName = required(env.SANDBOX_NAME, "SANDBOX_NAME");
+  let primaryFailure: unknown;
+  let failed = false;
   try {
     create(env, tools);
     run(env, tools);
     exportArtifact(env, tools);
-  } finally {
-    deleteOpenShellSandbox(env, required(env.SANDBOX_NAME, "SANDBOX_NAME"), tools);
+  } catch (error) {
+    failed = true;
+    primaryFailure = error;
   }
+  try {
+    deleteOpenShellSandbox(env, sandboxName, tools);
+  } catch (error) {
+    if (!failed) throw error;
+    console.error(error instanceof Error ? error.message : String(error));
+  }
+  if (failed) throw primaryFailure;
 }
 
 export function configurePostMergeDocs(

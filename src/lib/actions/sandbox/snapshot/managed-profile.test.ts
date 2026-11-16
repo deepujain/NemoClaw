@@ -97,32 +97,35 @@ function provider(accepted = true, managedProfileRestore = true): RuntimeProvide
 }
 
 describe("managed snapshot profile restore", () => {
-  it.each([
-    "openclaw",
-    "hermes",
-    "langchain-deepagents-code",
-  ] as const)("validates exact secret-free %s profile authority", (agent) => {
-    const receipt = workload(agent);
-    const source = { sandboxName: "alpha", agentType: agent, workload: receipt };
+  it.each(["openclaw", "hermes", "langchain-deepagents-code"] as const)(
+    "validates exact secret-free %s profile authority",
+    (agent) => {
+      const receipt = workload(agent);
+      const source = { sandboxName: "alpha", agentType: agent, workload: receipt };
 
-    const plan = prepareManagedSnapshotProfileRestore(source, sandbox(agent, receipt), provider());
+      const plan = prepareManagedSnapshotProfileRestore(
+        source,
+        sandbox(agent, receipt),
+        provider(),
+      );
 
-    expect(plan).toMatchObject({
-      schemaVersion: 1,
-      providerId: "mxc",
-      sourceSandboxName: "alpha",
-      targetSandboxName: "alpha",
-      authority: {
-        agent,
-        receipt,
-        profile: { agent },
-      },
-      providerRestoreAuthority: {
-        agent,
-        profileFingerprint: fingerprintManagedStartupProfile(managedStartupE2eProfile(agent)),
-      },
-    });
-  });
+      expect(plan).toMatchObject({
+        schemaVersion: 1,
+        providerId: "mxc",
+        sourceSandboxName: "alpha",
+        targetSandboxName: "alpha",
+        authority: {
+          agent,
+          receipt,
+          profile: { agent },
+        },
+        providerRestoreAuthority: {
+          agent,
+          profileFingerprint: fingerprintManagedStartupProfile(managedStartupE2eProfile(agent)),
+        },
+      });
+    },
+  );
 
   it("returns null for legacy snapshots without managed workload authority", () => {
     expect(
@@ -147,16 +150,29 @@ describe("managed snapshot profile restore", () => {
     ).toThrow(/invalid managed workload authority/u);
   });
 
-  it("rejects target profile drift and provider refusal", () => {
+  it("rebinds a same-name rebuild to its accepted replacement profile", () => {
     const receipt = workload("openclaw");
     const source = { sandboxName: "alpha", agentType: "openclaw", workload: receipt };
-    expect(() =>
-      prepareManagedSnapshotProfileRestore(
-        source,
-        sandbox("openclaw", workload("openclaw", true)),
-        provider(),
+    const replacement = workload("openclaw", true);
+
+    const plan = prepareManagedSnapshotProfileRestore(
+      source,
+      sandbox("openclaw", replacement),
+      provider(),
+    );
+
+    expect(plan?.authority.receipt).toEqual(receipt);
+    expect(plan?.providerRestoreAuthority).toEqual({
+      agent: "openclaw",
+      profileFingerprint: fingerprintManagedStartupProfile(
+        managedStartupE2eProfile("openclaw", true),
       ),
-    ).toThrow(/requires a managed image or startup-profile rebind/u);
+    });
+  });
+
+  it("rejects provider refusal and cross-sandbox or cross-agent rebind", () => {
+    const receipt = workload("openclaw");
+    const source = { sandboxName: "alpha", agentType: "openclaw", workload: receipt };
     expect(() =>
       prepareManagedSnapshotProfileRestore(source, sandbox("openclaw", receipt), provider(false)),
     ).toThrow(/does not accept the snapshot workload receipt/u);
@@ -167,6 +183,16 @@ describe("managed snapshot profile restore", () => {
         provider(true, false),
       ),
     ).toThrow(/does not support managed-profile restore/u);
+    expect(() =>
+      prepareManagedSnapshotProfileRestore(
+        source,
+        { ...sandbox("openclaw", receipt), name: "beta" },
+        provider(),
+      ),
+    ).toThrow(/requires a managed image or startup-profile rebind/u);
+    expect(() =>
+      prepareManagedSnapshotProfileRestore(source, sandbox("hermes"), provider()),
+    ).toThrow(/requires a managed image or startup-profile rebind/u);
   });
 
   it("fails before a managed cross-sandbox clone can reach image-only creation", () => {
@@ -179,6 +205,6 @@ describe("managed snapshot profile restore", () => {
         },
         "beta",
       ),
-    ).toThrow(/requires managed-profile clone rebind/u);
+    ).toThrow(/uses a NemoClaw-managed image/u);
   });
 });

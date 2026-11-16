@@ -1,23 +1,29 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { validateSwitchyardBindingState } from "../../hermes-switchyard-routing";
+
+import {
+  normalizeNativeLocalProviderAttachment,
+  normalizeNativeLocalProviderAuthorities,
+} from "../../inference/native-local/contract";
+
 import path from "node:path";
+import { requireHostedProviderAttachment } from "../../inference/native-provider/hosted-attachment";
+import { normalizeNativeHostedProviderAuthorities } from "./native-provider-authority-state";
 import { isObjectRecord } from "../../core/json-types";
 import { GATEWAY_PORT } from "../../core/ports";
-import { isCuaQualificationEnabled } from "../../cua/feature";
-import { parseCuaRuntimeReadiness } from "../../cua/schema";
+import { isDeferredN1xManagedVllmAcceptanceRoute } from "../../domain/sandbox/n1x-managed-vllm-rebuild";
 import { parseServingProfileProvenance } from "../../inference/serving/profile-provenance";
 import { readConfigFile, writeConfigFile } from "../config-io";
 import { normalizeExtraProviders } from "../extra-providers";
-import { normalizeSandboxMcpState, serializeSandboxMcpStateForDisk } from "../registry-mcp";
+import { normalizeNativeNvidiaProviderAuthorities } from "./native-provider-authority-state";
 import {
   cloneSandboxMessagingState,
   serializeSandboxMessagingStateForDisk,
 } from "../registry-messaging";
 import {
-  normalizeBaselineExclusions,
-  normalizeBaselineExclusionTransition,
-  normalizeCustomPolicyEntries,
+  normalizeSandboxPolicyAttribution,
   parseSandboxRegistryEntries,
   retainedDefaultSandbox,
 } from "../registry-normalization";
@@ -31,24 +37,16 @@ import {
 import type { SandboxEntry, SandboxRegistry } from "./types";
 import { cloneSandboxWorkloadReceipt } from "./workload";
 
-const OPAQUE_CUA_RUNTIME_READINESS = Symbol("opaqueCuaRuntimeReadiness");
-
-type RegistryWithOpaqueCuaState = SandboxRegistry & {
-  [OPAQUE_CUA_RUNTIME_READINESS]?: Map<string, unknown>;
-};
-
-function opaqueCuaRuntimeReadiness(data: SandboxRegistry): Map<string, unknown> | undefined {
-  return (data as RegistryWithOpaqueCuaState)[OPAQUE_CUA_RUNTIME_READINESS];
-}
-
-/** True when deep-off persistence is carrying an unread CUA record for this row. */
-export function hasOpaqueCuaRuntimeReadiness(data: SandboxRegistry, name: string): boolean {
-  return opaqueCuaRuntimeReadiness(data)?.has(name) === true;
-}
-
-/** Revoke a deep-off opaque CUA record before an authority-changing write. */
-export function discardOpaqueCuaRuntimeReadiness(data: SandboxRegistry, name: string): void {
-  opaqueCuaRuntimeReadiness(data)?.delete(name);
+function requireValidSwitchyardState(entry: SandboxEntry, operation: "load" | "save"): void {
+  if (entry.hermesSwitchyard === undefined) return;
+  try {
+    validateSwitchyardBindingState(entry.hermesSwitchyard);
+  } catch (cause) {
+    throw new Error(
+      `Cannot ${operation} sandbox ${JSON.stringify(entry.name)}: invalid hermesSwitchyard state in sandboxes.json. Inspect and repair hermesSwitchyard before retrying.`,
+      { cause },
+    );
+  }
 }
 
 function cloneSandboxWorkloadReceiptOrThrow(
@@ -107,23 +105,52 @@ function cloneServingProfileProvenanceOrThrow(
   return provenance ?? undefined;
 }
 
-function normalizeCuaRuntimeReadiness(
-  value: SandboxEntry["cuaRuntimeReadiness"],
-): SandboxEntry["cuaRuntimeReadiness"] {
-  if (value === undefined) return undefined;
-  try {
-    return parseCuaRuntimeReadiness(value);
-  } catch {
-    // A legacy or malformed optional CUA record must fail closed without
-    // making unrelated sandbox rows or commands unloadable.
-    return undefined;
+function normalizeDeferredN1xManagedVllmAcceptance(
+  entry: SandboxEntry,
+  operation: "load" | "save",
+): SandboxEntry["deferredN1xManagedVllmAccepted"] {
+  const value = entry.deferredN1xManagedVllmAccepted;
+  if (value !== undefined && (value !== true || !isDeferredN1xManagedVllmAcceptanceRoute(entry))) {
+    throw new Error(`Cannot ${operation} a sandbox entry with invalid N1x preview acceptance`);
   }
+  return value;
+}
+
+function requireNativeLocalProviderAttachment(
+  entry: SandboxEntry,
+  operation: "load" | "save",
+): SandboxEntry["nativeLocalProviderAttachment"] {
+  if (entry.nativeLocalProviderAttachment === undefined) return undefined;
+  const attachment = normalizeNativeLocalProviderAttachment(entry.nativeLocalProviderAttachment);
+  if (
+    !attachment ||
+    attachment.sandboxName !== entry.name ||
+    attachment.gatewayName !== entry.gatewayName ||
+    attachment.provider !== entry.provider
+  ) {
+    throw new Error(
+      `Cannot ${operation} sandbox ${JSON.stringify(entry.name)}: invalid native local provider attachment in sandboxes.json. Inspect and repair nativeLocalProviderAttachment before retrying.`,
+    );
+  }
+  return attachment;
 }
 
 export const REGISTRY_FILE = path.join(
   nemoclawStateRoot(process.env.HOME || "/tmp", GATEWAY_PORT),
   "sandboxes.json",
 );
+
+/** Read the registry owned by an explicit process environment. */
+export function loadFromEnvironment(environment: NodeJS.ProcessEnv): SandboxRegistry {
+  const registryFile = path.join(
+    nemoclawStateRoot(environment.HOME || "/tmp", GATEWAY_PORT),
+    "sandboxes.json",
+  );
+  return normalizeRegistry(
+    readConfigFile<unknown>(registryFile, { sandboxes: {}, defaultSandbox: null }),
+  );
+}
+
 export function load(): SandboxRegistry {
   return normalizeRegistry(
     readConfigFile<unknown>(REGISTRY_FILE, { sandboxes: {}, defaultSandbox: null }),
@@ -131,26 +158,42 @@ export function load(): SandboxRegistry {
 }
 
 export function save(data: SandboxRegistry): void {
-  writeConfigFile(REGISTRY_FILE, serializeRegistryForDisk(data));
+  const serialized = serializeRegistryForDisk(data);
+  const previous = readConfigFile<unknown>(REGISTRY_FILE, {});
+  if (isObjectRecord(previous)) {
+    normalizeNativeLocalProviderAuthorities(previous.nativeLocalProviderAuthorities);
+    for (const [, entry] of parseSandboxRegistryEntries(previous.sandboxes)) {
+      requireNativeLocalProviderAttachment(entry, "save");
+    }
+  }
+  // Legacy MCP ownership is disk-only compatibility evidence, not runtime
+  // authority. Ordinary writes must retain it until an explicit migration or
+  // verified removal retires it. Never accept a caller-supplied replacement.
+  if (isObjectRecord(previous) && isObjectRecord(previous.sandboxes)) {
+    for (const [name, entry] of Object.entries(serialized.sandboxes)) {
+      const prior = previous.sandboxes[name];
+      if (isObjectRecord(prior) && Object.hasOwn(prior, "mcp")) {
+        Object.assign(entry, { mcp: prior.mcp });
+      }
+    }
+  }
+  writeConfigFile(REGISTRY_FILE, serialized);
 }
 
 function normalizeRegistry(value: unknown): SandboxRegistry {
   const data = isObjectRecord(value) ? value : {};
   const extraProviders = normalizeExtraProviders(data.extraProviders);
-  const cuaQualificationEnabled = isCuaQualificationEnabled();
-  const opaqueReadiness = new Map<string, unknown>();
+  const nativeLocalProviderAuthorities = normalizeNativeLocalProviderAuthorities(
+    data.nativeLocalProviderAuthorities,
+  );
+  const nativeNvidiaProviderAuthorities = normalizeNativeNvidiaProviderAuthorities(
+    data.nativeNvidiaProviderAuthorities,
+  );
   const sandboxes = Object.fromEntries(
-    parseSandboxRegistryEntries(data.sandboxes).map(([name, entry]) => {
-      if (
-        !cuaQualificationEnabled &&
-        Object.prototype.hasOwnProperty.call(entry, "cuaRuntimeReadiness")
-      ) {
-        // Preserve the raw JSON value only as private persistence metadata. It
-        // is neither parsed nor returned to runtime callers while CUA is off.
-        opaqueReadiness.set(name, entry.cuaRuntimeReadiness);
-      }
-      return [name, normalizeSandboxEntryForRuntime(entry, cuaQualificationEnabled)];
-    }),
+    parseSandboxRegistryEntries(data.sandboxes).map(([name, entry]) => [
+      name,
+      normalizeSandboxEntryForRuntime(entry),
+    ]),
   );
   const base: SandboxRegistry = {
     // Preserve a stale string pointer at read time so diagnostics can explain
@@ -162,28 +205,32 @@ function normalizeRegistry(value: unknown): SandboxRegistry {
     sandboxes,
   };
   if (extraProviders) base.extraProviders = extraProviders;
-  if (opaqueReadiness.size > 0) {
-    // Enumerable symbols survive the registry's immutable object spreads, but
-    // JSON serialization and public entry iteration cannot expose this map.
-    (base as RegistryWithOpaqueCuaState)[OPAQUE_CUA_RUNTIME_READINESS] = opaqueReadiness;
+  if (nativeLocalProviderAuthorities)
+    base.nativeLocalProviderAuthorities = nativeLocalProviderAuthorities;
+  const nativeHostedProviderAuthorities = normalizeNativeHostedProviderAuthorities(
+    data.nativeHostedProviderAuthorities,
+  );
+  if (nativeHostedProviderAuthorities)
+    base.nativeHostedProviderAuthorities = nativeHostedProviderAuthorities;
+  if (nativeNvidiaProviderAuthorities) {
+    base.nativeNvidiaProviderAuthorities = nativeNvidiaProviderAuthorities;
   }
   return base;
 }
 
 function serializeRegistryForDisk(data: SandboxRegistry): SandboxRegistry {
   const extraProviders = normalizeExtraProviders(data.extraProviders);
-  const cuaQualificationEnabled = isCuaQualificationEnabled();
-  const opaqueReadiness = opaqueCuaRuntimeReadiness(data);
+  const nativeLocalProviderAuthorities = normalizeNativeLocalProviderAuthorities(
+    data.nativeLocalProviderAuthorities,
+  );
+  const nativeNvidiaProviderAuthorities = normalizeNativeNvidiaProviderAuthorities(
+    data.nativeNvidiaProviderAuthorities,
+  );
   const sandboxes = Object.fromEntries(
-    Object.entries(data.sandboxes).map(([name, entry]) => {
-      const serialized = serializeSandboxEntryForDisk(entry, cuaQualificationEnabled);
-      if (!cuaQualificationEnabled && opaqueReadiness?.has(name)) {
-        serialized.cuaRuntimeReadiness = opaqueReadiness.get(name) as
-          | SandboxEntry["cuaRuntimeReadiness"]
-          | undefined;
-      }
-      return [name, serialized];
-    }),
+    Object.entries(data.sandboxes).map(([name, entry]) => [
+      name,
+      serializeSandboxEntryForDisk(entry),
+    ]),
   );
   const defaultSandbox = retainedDefaultSandbox(data.defaultSandbox, sandboxes);
   const currentDefaultSelectionRevision = reversibleRemoval.normalizeDefaultSelectionRevision(
@@ -198,13 +245,21 @@ function serializeRegistryForDisk(data: SandboxRegistry): SandboxRegistry {
     sandboxes,
   };
   if (extraProviders) base.extraProviders = extraProviders;
+  if (nativeLocalProviderAuthorities)
+    base.nativeLocalProviderAuthorities = nativeLocalProviderAuthorities;
+  const nativeHostedProviderAuthorities = normalizeNativeHostedProviderAuthorities(
+    data.nativeHostedProviderAuthorities,
+  );
+  if (nativeHostedProviderAuthorities)
+    base.nativeHostedProviderAuthorities = nativeHostedProviderAuthorities;
+  if (nativeNvidiaProviderAuthorities) {
+    base.nativeNvidiaProviderAuthorities = nativeNvidiaProviderAuthorities;
+  }
   return base;
 }
 
-function normalizeSandboxEntryForRuntime(
-  entry: SandboxEntry,
-  cuaQualificationEnabled: boolean,
-): SandboxEntry {
+function normalizeSandboxEntryForRuntime(entry: SandboxEntry): SandboxEntry {
+  requireValidSwitchyardState(entry, "load");
   const messaging = cloneSandboxMessagingState(entry.messaging);
   const workload = cloneSandboxWorkloadReceiptOrThrow(entry.workload, "load");
   const hostLocalInferenceReceipt = cloneHostLocalInferenceReceiptOrThrow(
@@ -220,40 +275,41 @@ function normalizeSandboxEntryForRuntime(
     entry.servingProfileProvenance,
     "load",
   );
-  const mcp = normalizeSandboxMcpState(entry.mcp);
-  const baselineExclusions = normalizeBaselineExclusions(entry.baselineExclusions);
-  const baselineExclusionTransition = normalizeBaselineExclusionTransition(
-    entry.baselineExclusionTransition,
-  );
-  const customPolicies = normalizeCustomPolicyEntries(entry.customPolicies);
-  const cuaRuntimeReadiness = cuaQualificationEnabled
-    ? normalizeCuaRuntimeReadiness(entry.cuaRuntimeReadiness)
-    : undefined;
+  const deferredN1xManagedVllmAccepted = normalizeDeferredN1xManagedVllmAcceptance(entry, "load");
+  const policyEntry = normalizeSandboxPolicyAttribution(entry);
+  const nativeLocalProviderAttachment = requireNativeLocalProviderAttachment(policyEntry, "load");
   const {
+    cuaRuntimeReadiness: _legacyCuaRuntimeReadiness,
     messaging: _messaging,
     workload: _workload,
     hostLocalInferenceReceipt: _hostLocalInferenceReceipt,
     hostLocalInferenceProvenance: _hostLocalInferenceProvenance,
     servingProfileProvenance: _servingProfileProvenance,
-    mcp: _mcp,
-    baselineExclusions: _baselineExclusions,
-    baselineExclusionTransition: _baselineExclusionTransition,
-    customPolicies: _customPolicies,
-    cuaRuntimeReadiness: _cuaRuntimeReadiness,
+    deferredN1xManagedVllmAccepted: _deferredN1xManagedVllmAccepted,
+    nativeLocalProviderAttachment: _nativeLocalProviderAttachment,
+    nativeHostedProviderAttachment: hostedAttachment,
+    nativeNvidiaProviderAuthority: _legacyNativeNvidiaProviderAuthority,
+    mcp: _legacyMcp,
     ...rest
-  } = entry;
+  } = policyEntry as SandboxEntry & {
+    cuaRuntimeReadiness?: unknown;
+    nativeNvidiaProviderAuthority?: unknown;
+    mcp?: unknown;
+  };
+  const nativeHostedProviderAttachment = requireHostedProviderAttachment(
+    hostedAttachment,
+    rest.provider,
+  );
   return {
     ...rest,
+    ...(nativeLocalProviderAttachment ? { nativeLocalProviderAttachment } : {}),
+    ...(nativeHostedProviderAttachment ? { nativeHostedProviderAttachment } : {}),
     ...(workload ? { workload } : {}),
     ...(hostLocalInferenceReceipt !== undefined ? { hostLocalInferenceReceipt } : {}),
     ...(hostLocalInferenceProvenance ? { hostLocalInferenceProvenance } : {}),
     ...(servingProfileProvenance ? { servingProfileProvenance } : {}),
+    ...(deferredN1xManagedVllmAccepted ? { deferredN1xManagedVllmAccepted } : {}),
     ...(messaging ? { messaging } : {}),
-    ...(mcp ? { mcp } : {}),
-    ...(baselineExclusions ? { baselineExclusions } : {}),
-    ...(baselineExclusionTransition ? { baselineExclusionTransition } : {}),
-    ...(customPolicies ? { customPolicies } : {}),
-    ...(cuaRuntimeReadiness ? { cuaRuntimeReadiness } : {}),
   };
 }
 
@@ -263,10 +319,8 @@ function normalizeSandboxEntryForRuntime(
  * markers plus legacy provider credential hashes that must never reach
  * sandboxes.json.
  */
-function serializeSandboxEntryForDisk(
-  entry: SandboxEntry,
-  cuaQualificationEnabled: boolean,
-): SandboxEntry {
+function serializeSandboxEntryForDisk(entry: SandboxEntry): SandboxEntry {
+  requireValidSwitchyardState(entry, "save");
   // Defensively drop non-durable recovery markers and legacy
   // providerCredentialHashes so they can never reach sandboxes.json even if a
   // caller force-passed them through updateSandbox().
@@ -295,40 +349,41 @@ function serializeSandboxEntryForDisk(
     durable.servingProfileProvenance,
     "save",
   );
-  const mcp = serializeSandboxMcpStateForDisk(durable.mcp);
-  const baselineExclusions = normalizeBaselineExclusions(durable.baselineExclusions);
-  const baselineExclusionTransition = normalizeBaselineExclusionTransition(
-    durable.baselineExclusionTransition,
-  );
-  const customPolicies = normalizeCustomPolicyEntries(durable.customPolicies);
-  const cuaRuntimeReadiness = cuaQualificationEnabled
-    ? normalizeCuaRuntimeReadiness(durable.cuaRuntimeReadiness)
-    : undefined;
+  const deferredN1xManagedVllmAccepted = normalizeDeferredN1xManagedVllmAcceptance(durable, "save");
+  const policyEntry = normalizeSandboxPolicyAttribution(durable);
+  const nativeLocalProviderAttachment = requireNativeLocalProviderAttachment(policyEntry, "save");
   const {
+    cuaRuntimeReadiness: _legacyCuaRuntimeReadiness,
     messaging: _messaging,
     workload: _workload,
     hostLocalInferenceReceipt: _hostLocalInferenceReceipt,
     hostLocalInferenceProvenance: _hostLocalInferenceProvenance,
     servingProfileProvenance: _servingProfileProvenance,
-    mcp: _mcp,
-    baselineExclusions: _baselineExclusions,
-    baselineExclusionTransition: _baselineExclusionTransition,
-    customPolicies: _customPolicies,
-    cuaRuntimeReadiness: _cuaRuntimeReadiness,
+    deferredN1xManagedVllmAccepted: _deferredN1xManagedVllmAccepted,
+    nativeLocalProviderAttachment: _nativeLocalProviderAttachment,
+    nativeHostedProviderAttachment: hostedAttachment,
+    nativeNvidiaProviderAuthority: _legacyNativeNvidiaProviderAuthority,
+    mcp: _legacyMcp,
     ...rest
-  } = durable;
+  } = policyEntry as SandboxEntry & {
+    cuaRuntimeReadiness?: unknown;
+    nativeNvidiaProviderAuthority?: unknown;
+    mcp?: unknown;
+  };
+  const nativeHostedProviderAttachment = requireHostedProviderAttachment(
+    hostedAttachment,
+    rest.provider,
+  );
   return {
     ...rest,
+    ...(nativeLocalProviderAttachment ? { nativeLocalProviderAttachment } : {}),
+    ...(nativeHostedProviderAttachment ? { nativeHostedProviderAttachment } : {}),
     ...(rest.dashboardPort === 0 ? { dashboardPort: null } : {}),
     ...(workload ? { workload } : {}),
     ...(hostLocalInferenceReceipt !== undefined ? { hostLocalInferenceReceipt } : {}),
     ...(hostLocalInferenceProvenance ? { hostLocalInferenceProvenance } : {}),
     ...(servingProfileProvenance ? { servingProfileProvenance } : {}),
+    ...(deferredN1xManagedVllmAccepted ? { deferredN1xManagedVllmAccepted } : {}),
     ...(messaging ? { messaging } : {}),
-    ...(mcp ? { mcp } : {}),
-    ...(baselineExclusions ? { baselineExclusions } : {}),
-    ...(baselineExclusionTransition ? { baselineExclusionTransition } : {}),
-    ...(customPolicies ? { customPolicies } : {}),
-    ...(cuaRuntimeReadiness ? { cuaRuntimeReadiness } : {}),
   };
 }

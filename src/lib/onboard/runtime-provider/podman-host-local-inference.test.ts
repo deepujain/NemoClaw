@@ -46,6 +46,7 @@ function operationAndRuntime(
     engine: harness.engine,
     env: harness.env,
     acceleration: harness.operationAcceleration,
+    probeCleanupTiming: harness.probeCleanupTiming,
     authorityStore: harness.authorityStore,
     routeAuthorityStore: harness.routeAuthorityStore,
     onFailureEvidence: harness.onFailureEvidence,
@@ -71,13 +72,13 @@ describe("Podman host-local inference lifecycle", () => {
     const operation = createPodmanHostLocalInferenceOperation({
       engine: harness.engine,
       env: harness.env,
+      probeCleanupTiming: harness.probeCleanupTiming,
       authorityStore: harness.authorityStore,
       routeAuthorityStore: harness.routeAuthorityStore,
       onFailureEvidence: harness.onFailureEvidence,
       redactSensitive: harness.redactSensitive,
     });
     harness.events.length = 0;
-
     expect(() => operation.engine.capture(["run", "--privileged"])).toThrow(
       "provider-owned lifecycle",
     );
@@ -190,7 +191,7 @@ describe("Podman host-local inference lifecycle", () => {
       expect(run).toContain("--detach");
       expect(run).toContain("--read-only");
       expect(run).toContain("--ipc private");
-      expect(run).toContain("--http-proxy false");
+      expect(run).toContain("--http-proxy=false");
       expect(run).not.toContain(" --rm");
       expect(run).not.toContain("--publish");
       expect(run).not.toContain("--device");
@@ -239,31 +240,46 @@ describe("Podman host-local inference lifecycle", () => {
     ).toBe(true);
   });
 
+  it("uses a valid full container ID when probe name lookup would time out (#9211)", () => {
+    const harness = createPodmanHostLocalInferenceTestHarness();
+    harness.state.probePostCreateNameLookupTimeout = true;
+    expect(() =>
+      operationRuntime(harness).startManaged(harness.input, harness.writer),
+    ).not.toThrow();
+  });
+
+  it("captures a malformed disposable-probe create acknowledgement and removes all residue", () => {
+    const harness = createPodmanHostLocalInferenceTestHarness();
+    harness.state.probeRunAcknowledgementText = "not-a-full-container-id";
+    const runtime = operationRuntime(harness);
+
+    expect(() => runtime.startManaged(harness.input, harness.writer)).toThrow(
+      "must be a full immutable ID",
+    );
+    expect(
+      harness.failures.some(
+        ({ phase, message }) =>
+          phase === "ready" && message.includes("must be a full immutable ID"),
+      ),
+    ).toBe(true);
+    expect(harness.failureProbeIds[0]).toBe("c".repeat(64));
+    expect(harness.probe()).toBeNull();
+    expect(harness.container()).toBeNull();
+  });
+
   it.each([
-    ["malformed", "not-a-full-container-id", "must be a full immutable ID"],
-    ["a different full ID", `${"d".repeat(64)}\n`, "disagrees with exact name inspection"],
+    ["after create", 1, ["wait", "logs", "rm"], "probe identity is indeterminate after create"],
+    ["during cleanup", 3, ["rm"], "probe cleanup lost exact identity"],
   ] as const)(
-    "captures %s successful disposable-probe create acknowledgement and removes all residue",
-    (_label, acknowledgement, expectedFailure) => {
+    "rejects a Podman inspect result whose container ID differs from the queried ID %s (#9211)",
+    (_stage, at, forbiddenActions, expectedFailure) => {
       const harness = createPodmanHostLocalInferenceTestHarness();
-      harness.state.probeRunAcknowledgementText = acknowledgement;
+      harness.state.probeInspectRuntimeIdMismatchAt = at;
+      harness.state.probeForbiddenActions = [...forbiddenActions];
       const runtime = operationRuntime(harness);
 
       expect(() => runtime.startManaged(harness.input, harness.writer)).toThrow(expectedFailure);
-      expect(
-        harness.failures.some(
-          ({ phase, message }) => phase === "ready" && message.includes(expectedFailure),
-        ),
-      ).toBe(true);
-      const evidenceIndex = harness.events.indexOf("evidence:ready");
-      const removeIndex = harness.events.findIndex((event) =>
-        event.includes(`podman:rm --force ${"c".repeat(64)}`),
-      );
-      expect(evidenceIndex).toBeGreaterThanOrEqual(0);
-      expect(removeIndex).toBeGreaterThan(evidenceIndex);
-      expect(harness.probe()).toBeNull();
-      expect(harness.container()).toBeNull();
-      expect(harness.written).toHaveLength(0);
+      expect(harness.probe()).toMatchObject({ id: "c".repeat(64) });
     },
   );
 
@@ -338,6 +354,7 @@ describe("Podman host-local inference lifecycle", () => {
       const operation = createPodmanHostLocalInferenceOperation({
         engine: harness.engine,
         env: harness.env,
+        probeCleanupTiming: harness.probeCleanupTiming,
         authorityStore: harness.authorityStore,
         routeAuthorityStore: harness.routeAuthorityStore,
         onFailureEvidence: harness.onFailureEvidence,
@@ -454,6 +471,8 @@ describe("Podman host-local inference lifecycle", () => {
     expect(inference).toBeGreaterThan(ready);
     expect(acceleration).toBeGreaterThan(inference);
     expect(harness.events[inference]).toContain('"tool_choice":"required"');
+    expect(harness.events[inference]).toContain('"max_tokens":4096');
+    expect(harness.events[inference]).toContain('"temperature":0');
 
     prepared.validateBeforeCommit();
     expect(harness.routeAuthorityStore.load("ollama")).toBeNull();
@@ -526,7 +545,9 @@ describe("Podman host-local inference lifecycle", () => {
 
     expect(PROVIDER_FAILURE_SECRETS.every((secret) => !thrown.includes(secret))).toBe(true);
     const failureEvidence = harness.failures.map(({ message }) => message).join("\n");
-    expect(PROVIDER_FAILURE_SECRETS.every((secret) => !failureEvidence.includes(secret))).toBe(true);
+    expect(PROVIDER_FAILURE_SECRETS.every((secret) => !failureEvidence.includes(secret))).toBe(
+      true,
+    );
 
     expect(harness.routeAuthorityStore.load("ollama")).toBeNull();
     expect(harness.written).toHaveLength(0);
@@ -658,7 +679,9 @@ describe("Podman host-local inference lifecycle", () => {
 
     expect(PROVIDER_FAILURE_SECRETS.every((secret) => !thrown.includes(secret))).toBe(true);
     const failureEvidence = harness.failures.map(({ message }) => message).join("\n");
-    expect(PROVIDER_FAILURE_SECRETS.every((secret) => !failureEvidence.includes(secret))).toBe(true);
+    expect(PROVIDER_FAILURE_SECRETS.every((secret) => !failureEvidence.includes(secret))).toBe(
+      true,
+    );
 
     expect(harness.probe()).toBeNull();
   });
@@ -775,6 +798,7 @@ describe("Podman host-local inference lifecycle", () => {
     const runtime = createPodmanHostLocalInferenceRuntime({
       engine: harness.engine,
       env: harness.env,
+      probeCleanupTiming: harness.probeCleanupTiming,
       authorityStore: harness.authorityStore,
       routeAuthorityStore: harness.routeAuthorityStore,
       authority,
@@ -836,6 +860,7 @@ describe("Podman host-local inference lifecycle", () => {
     const runtime = createPodmanHostLocalInferenceRuntime({
       engine: harness.engine,
       env: harness.env,
+      probeCleanupTiming: harness.probeCleanupTiming,
       authorityStore: harness.authorityStore,
       routeAuthorityStore: harness.routeAuthorityStore,
       authority,
@@ -867,7 +892,7 @@ describe("Podman host-local inference lifecycle", () => {
       message: expect.stringContaining("transport closed after create"),
     });
     const runIndex = harness.events.findIndex((event) =>
-      event.startsWith("podman:run --http-proxy false --detach"),
+      event.startsWith("podman:run --http-proxy=false --detach"),
     );
     const evidenceIndex = harness.events.indexOf("evidence:start");
     const readyIndex = harness.events.findIndex((event) => event.includes("/v1/health/ready"));
@@ -909,6 +934,7 @@ describe("Podman host-local inference lifecycle", () => {
     const operation = createPodmanHostLocalInferenceOperation({
       engine: harness.engine,
       env: harness.env,
+      probeCleanupTiming: harness.probeCleanupTiming,
       authorityStore: harness.authorityStore,
       routeAuthorityStore: harness.routeAuthorityStore,
       onFailureEvidence: harness.onFailureEvidence,
@@ -918,7 +944,6 @@ describe("Podman host-local inference lifecycle", () => {
     harness.seedManaged("stopped", false, operation.bindingSha256);
     harness.state.startLostAcknowledgement = true;
     harness.events.length = 0;
-
     const prepared = runtime.recoverManaged!(harness.input, harness.writer);
     expect(harness.failures.at(-1)).toMatchObject({ phase: "start" });
     const startIndex = harness.events.findIndex((event) => event.startsWith("podman:start "));
@@ -1252,6 +1277,7 @@ describe("Podman host-local inference lifecycle", () => {
     const operation = createPodmanHostLocalInferenceOperation({
       engine: harness.engine,
       env: harness.env,
+      probeCleanupTiming: harness.probeCleanupTiming,
       authorityStore: {
         load: () => null,
         record: (authority) => ({ ...authority, engineId: "docker" }),
@@ -1261,7 +1287,6 @@ describe("Podman host-local inference lifecycle", () => {
       redactSensitive: harness.redactSensitive,
     });
     harness.events.length = 0;
-
     expect(() => operation.managedRuntime?.startManaged(harness.input, harness.writer)).toThrow(
       "does not match persisted authority",
     );
@@ -1289,7 +1314,7 @@ describe("Podman host-local inference lifecycle", () => {
 
     const runEvents = harness.events.filter((event) => event.startsWith("podman:run "));
     expect(runEvents.length).toBeGreaterThan(2);
-    expect(runEvents.every((event) => event.startsWith("podman:run --http-proxy false "))).toBe(
+    expect(runEvents.every((event) => event.startsWith("podman:run --http-proxy=false "))).toBe(
       true,
     );
     expect(JSON.stringify(prepared.receipt)).not.toContain(proxySecret);
@@ -1437,6 +1462,7 @@ describe("Podman host-local inference lifecycle", () => {
     const missingRuntime = createPodmanHostLocalInferenceRuntime({
       engine: missing.engine,
       env: {},
+      probeCleanupTiming: missing.probeCleanupTiming,
       authorityStore: missing.authorityStore,
       routeAuthorityStore: missing.routeAuthorityStore,
       authority: qualifyPodmanInferenceAuthority(missing.engine),
@@ -1447,7 +1473,6 @@ describe("Podman host-local inference lifecycle", () => {
       "requires environment 'NGC_API_KEY'",
     );
     expect(missing.container()).toBeNull();
-
     const vllm = createPodmanHostLocalInferenceTestHarness({ service: "vllm" });
     const vllmRuntime = operationRuntime(vllm);
     expect(() =>
@@ -1458,11 +1483,11 @@ describe("Podman host-local inference lifecycle", () => {
 
   it("requires a qualified injected redactor before any provider call", () => {
     const harness = createPodmanHostLocalInferenceTestHarness();
-
     expect(() =>
       createPodmanHostLocalInferenceOperation({
         engine: harness.engine,
         env: harness.env,
+        probeCleanupTiming: harness.probeCleanupTiming,
         authorityStore: harness.authorityStore,
         routeAuthorityStore: harness.routeAuthorityStore,
         onFailureEvidence: harness.onFailureEvidence,

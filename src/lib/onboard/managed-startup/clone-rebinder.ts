@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { recordedNativeProviderAttachment } from "../../inference/native-provider/recorded-selection";
 import { createHash } from "node:crypto";
 
 import { cloneAndDeepFreeze } from "../../core/immutable";
+import { rebindLoopbackDashboardUrlPort } from "../../dashboard/url";
 import { resolveContextWindowForModel } from "../../inference/context-window";
 import { rebindSandboxMessagingPlanForClone } from "../../messaging/clone-rebind";
 import { isValidName } from "../../name-validation";
@@ -37,6 +39,8 @@ const MANAGED_INFERENCE_API_SET = new Set([
  * state before a clone handoff can be prepared.
  */
 export interface ManagedStartupCloneCurrentState {
+  readonly nativeNvidiaProviderAttachment?: unknown;
+  readonly nativeHostedProviderAttachment?: unknown;
   readonly provider?: string | null;
   readonly model?: string | null;
   readonly endpointUrl?: string | null;
@@ -60,6 +64,7 @@ export interface ManagedStartupCloneCurrentState {
 
 export interface ManagedStartupCloneRebindInput {
   readonly sourceSandboxName: string;
+  readonly sourceGatewayPort: number;
   readonly destinationSandboxName: string;
   readonly expectedAgent: ManagedStartupAgent;
   readonly destinationDashboardPort: number | null;
@@ -127,7 +132,7 @@ function optionalCurrentString(value: unknown, label: string): string | null {
 function currentInference(
   profile: ManagedStartupProfile,
   current: ManagedStartupCloneCurrentState,
-): ManagedStartupProfile["inference"] {
+): NonNullable<ManagedStartupProfile["inference"]> {
   const provider = requireCurrentString(current.provider, "inference provider");
   const model = requireCurrentString(current.model, "inference model");
   const preferredApi = optionalCurrentString(
@@ -137,11 +142,14 @@ function currentInference(
   if (preferredApi !== null && !MANAGED_INFERENCE_API_SET.has(preferredApi)) {
     fail("current source preferred inference API is unsupported");
   }
+  const nativeAttachment = recordedNativeProviderAttachment(current);
   const resolved = resolveManagedStartupInferenceRoute(
     profile.agent,
     provider,
     model,
     preferredApi,
+    Boolean(nativeAttachment),
+    nativeAttachment?.endpointUrl,
   );
   if (!MANAGED_INFERENCE_API_SET.has(resolved.inferenceApi)) {
     fail("current source inference route resolved an unsupported API");
@@ -153,16 +161,18 @@ function currentInference(
   return {
     routeProvider: resolved.providerKey,
     upstreamProvider: provider,
+    servingPreset: profile.inference?.servingPreset ?? null,
     model,
     routedBaseUrl: resolved.inferenceBaseUrl,
     upstreamEndpointUrl,
-    api: resolved.inferenceApi as ManagedStartupProfile["inference"]["api"],
+    api: resolved.inferenceApi as NonNullable<ManagedStartupProfile["inference"]>["api"],
     primaryModelRef: profile.agent === "openclaw" ? resolved.primaryModelRef : null,
     compatibility:
       profile.agent === "openclaw"
         ? (JSON.parse(JSON.stringify(resolved.inferenceCompat ?? {})) as ManagedStartupJsonObject)
         : null,
-    inputModalities: profile.agent === "openclaw" ? profile.inference.inputModalities : null,
+    inputModalities:
+      profile.agent === "openclaw" ? (profile.inference?.inputModalities ?? ["text"]) : null,
   };
 }
 
@@ -249,9 +259,14 @@ function currentSourceDashboard(
     };
   }
   if (profile.dashboard.agent === "hermes") {
+    if (current.hermesDashboardEnabled === true && profile.dashboard.browserUrl === undefined) {
+      fail(
+        "current source Hermes dashboard has no recorded browser URL; rerun onboarding before cloning the sandbox",
+      );
+    }
     if (current.hermesDashboardEnabled !== true) {
       return {
-        agent: "hermes",
+        ...profile.dashboard,
         mode: "disabled",
         url: profile.dashboard.url,
         publicPort: null,
@@ -268,9 +283,12 @@ function currentSourceDashboard(
       profile.agent,
     );
     return {
-      agent: "hermes",
+      ...profile.dashboard,
       mode: "loopback-forwarded",
       url: urlAtPort(profile.dashboard.url, publicPort),
+      ...(profile.dashboard.browserUrl === undefined
+        ? {}
+        : { browserUrl: rebindLoopbackDashboardUrlPort(profile.dashboard.browserUrl, publicPort) }),
       publicPort,
       internalPort,
       tuiEnabled: current.hermesDashboardTui === true,
@@ -290,6 +308,7 @@ function currentMessagingPlan(current: ManagedStartupCloneCurrentState): unknown
 function reconcileCurrentSourceProfile(
   profile: ManagedStartupProfile,
   current: ManagedStartupCloneCurrentState,
+  sourceGatewayPort: number,
 ): ManagedStartupProfile {
   const inference = currentInference(profile, current);
   const hermesToolGateways = current.hermesToolGateways ?? [];
@@ -328,12 +347,14 @@ function reconcileCurrentSourceProfile(
         ? (currentReasoningEffort ?? "default")
         : "default";
     if (
-      profile.inference.upstreamProvider !== current.provider ||
-      profile.inference.model !== current.model
+      profile.inference?.upstreamProvider !== current.provider ||
+      profile.inference?.model !== current.model
     ) {
+      const currentProvider = requireCurrentString(current.provider, "inference provider");
       contextWindow = managedStartupCloneRebinderDependencies.resolveContextWindowForModel(
-        requireCurrentString(current.provider, "inference provider"),
+        currentProvider,
         requireCurrentString(current.model, "inference model"),
+        sourceGatewayPort,
       );
       if (contextWindow === null) {
         fail("current OpenClaw inference route has no verifiable context window");
@@ -378,12 +399,23 @@ function destinationDashboard(
       return {
         ...dashboard,
         url: urlAtPort(dashboard.url, destinationDashboardPort),
+        ...(dashboard.browserUrl === undefined
+          ? {}
+          : {
+              browserUrl: rebindLoopbackDashboardUrlPort(
+                dashboard.browserUrl,
+                destinationDashboardPort,
+              ),
+            }),
       };
     }
     const port = requireDestinationPort(destinationDashboardPort, profile.agent);
     return {
       ...dashboard,
       url: urlAtPort(dashboard.url, port),
+      ...(dashboard.browserUrl === undefined
+        ? {}
+        : { browserUrl: rebindLoopbackDashboardUrlPort(dashboard.browserUrl, port) }),
       publicPort: port,
     };
   }
@@ -426,6 +458,7 @@ function destinationInference(
     input.destinationHermesInferenceProvider,
     "destination Hermes inference provider",
   );
+  if (profile.inference === null) fail("Hermes tool gateways require inference configuration");
   return {
     ...profile.inference,
     upstreamProvider: provider,
@@ -469,7 +502,11 @@ export function rebindManagedStartupProfileForClone(
 
   let profile: ManagedStartupProfile;
   try {
-    const currentSourceProfile = reconcileCurrentSourceProfile(sourceProfile, input.currentSource);
+    const currentSourceProfile = reconcileCurrentSourceProfile(
+      sourceProfile,
+      input.currentSource,
+      input.sourceGatewayPort,
+    );
     profile = validateManagedStartupProfile({
       ...currentSourceProfile,
       inference: destinationInference(currentSourceProfile, input),

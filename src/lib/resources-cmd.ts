@@ -18,6 +18,10 @@ import * as YAML from "yaml";
 import { dockerSpawnSync } from "./adapters/docker";
 
 const GATEWAY_NAME = "nemoclaw";
+const UNKNOWN_CPU_MODEL = "unknown";
+const MAX_CPU_MODEL_LENGTH = 256;
+const LSCPU_MAX_OUTPUT_BYTES = 1024 * 1024;
+const CPU_MODEL_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
 
 function getGatewayContainer(): string {
   return `openshell-cluster-${GATEWAY_NAME}`;
@@ -58,7 +62,93 @@ export interface HardwareResources {
   profiles: Record<string, ResourceProfile> | null;
 }
 
+interface CpuModelResolutionOptions {
+  platform?: NodeJS.Platform;
+  readLscpu?: () => string | null;
+}
+
+function normalizeCpuModel(value: unknown): string | null {
+  if (typeof value !== "string" || CPU_MODEL_CONTROL_CHARACTERS.test(value)) return null;
+
+  const model = value.trim();
+  if (
+    model.length === 0 ||
+    model.length > MAX_CPU_MODEL_LENGTH ||
+    model === "-" ||
+    model.toLowerCase() === UNKNOWN_CPU_MODEL
+  ) {
+    return null;
+  }
+  return model;
+}
+
+function distinctCpuModels(values: readonly unknown[]): string[] {
+  return [...new Set(values.map(normalizeCpuModel).filter((model) => model !== null))];
+}
+
+function parseLscpuCpuModels(output: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(output);
+    if (!parsed || typeof parsed !== "object") return [];
+
+    const cpus = (parsed as { cpus?: unknown }).cpus;
+    if (!Array.isArray(cpus)) return [];
+
+    return distinctCpuModels(
+      cpus.map((cpu) =>
+        cpu && typeof cpu === "object" ? (cpu as { modelname?: unknown }).modelname : undefined,
+      ),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function readLscpuJson(): string | null {
+  try {
+    const result = spawnSync("lscpu", ["--json", "--extended=CPU,MODELNAME"], {
+      encoding: "utf-8",
+      timeout: 3000,
+      maxBuffer: LSCPU_MAX_OUTPUT_BYTES,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return result.status === 0 && typeof result.stdout === "string" ? result.stdout : null;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveCpuModel(
+  cpus: readonly { model: string }[],
+  options: CpuModelResolutionOptions = {},
+): string {
+  const nodeModels = distinctCpuModels(cpus.map((cpu) => cpu.model));
+  const hasIncompleteNodeModel =
+    cpus.length === 0 || cpus.some((cpu) => normalizeCpuModel(cpu.model) === null);
+
+  if (!hasIncompleteNodeModel || (options.platform ?? process.platform) !== "linux") {
+    return nodeModels.join(" / ") || UNKNOWN_CPU_MODEL;
+  }
+
+  const lscpuOutput = (options.readLscpu ?? readLscpuJson)();
+  const lscpuModels = lscpuOutput === null ? [] : parseLscpuCpuModels(lscpuOutput);
+  const models = distinctCpuModels([...nodeModels, ...lscpuModels]);
+  return models.join(" / ") || UNKNOWN_CPU_MODEL;
+}
+
 // ── Implementation ───────────────────────────────────────────────
+
+const BINARY_MEMORY_UNITS = ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei"];
+
+/** Convert the kubelet's allocatable memory from bytes or binary units to MiB. */
+function parseAllocatableMemoryMB(quantity: string): number | undefined {
+  const match = /^(\d+)([A-Za-z]*)$/.exec(quantity);
+  if (!match) return undefined;
+  const unitPower = BINARY_MEMORY_UNITS.indexOf(match[2]);
+  if (unitPower < 0) return undefined;
+  const bytes = Number(match[1]) * 1024 ** unitPower;
+  return Number.isFinite(bytes) ? Math.round(bytes / 1024 ** 2) : undefined;
+}
 
 /**
  * Query system hardware resources. Returns CPU, memory, and GPU info.
@@ -67,7 +157,7 @@ export interface HardwareResources {
  */
 export function getHardwareResources(): HardwareResources {
   const cpus = os.cpus();
-  const cpuModel = cpus[0]?.model?.trim() || "unknown";
+  const cpuModel = resolveCpuModel(cpus);
 
   let totalMB = 0;
   let swapMB = 0;
@@ -101,9 +191,7 @@ export function getHardwareResources(): HardwareResources {
       const alloc = nodes.items?.[0]?.status?.allocatable;
       if (alloc) {
         allocatableCpu = alloc.cpu;
-        const memStr: string = alloc.memory || "";
-        const kiMatch = memStr.match(/^(\d+)Ki$/);
-        if (kiMatch) allocatableMemMB = Math.round(parseInt(kiMatch[1], 10) / 1024);
+        allocatableMemMB = parseAllocatableMemoryMB(alloc.memory ?? "");
       }
     }
   } catch {
@@ -194,18 +282,24 @@ export function printHardwareResources(json: boolean): HardwareResources {
   return hw;
 }
 
+/** Validate a CPU or memory resource value and throw when a percentage is not an integer from 1% to 100%. */
+export function validateResourceValue(value: string): void {
+  const trimmed = value.trim();
+  // Kubernetes quantities never contain "%", so a value with "%" must be a whole-number percentage.
+  if (trimmed.includes("%") && !/^(?:[1-9]\d?|100)%$/.test(trimmed)) {
+    throw new Error(`Invalid percentage '${trimmed}': must be an integer between 1% and 100%`);
+  }
+}
+
 /**
  * Resolve a resource value that may be a percentage or absolute quantity.
  * Throws on invalid percentages so callers can surface clear errors.
  */
 export function resolveResourceValue(value: string, total: number, unit: "cpu" | "memory"): string {
   if (!value) return "";
+  validateResourceValue(value);
   const trimmed = value.trim();
   if (trimmed.endsWith("%")) {
-    // Strict validation: only accept integers 1-100 followed by %
-    if (!/^(?:[1-9]\d?|100)%$/.test(trimmed)) {
-      throw new Error(`Invalid percentage '${trimmed}': must be an integer between 1% and 100%`);
-    }
     const pct = parseInt(trimmed.slice(0, -1), 10);
     if (unit === "cpu") {
       const milliCores = Math.max(1, Math.floor((total * 1000 * pct) / 100));
@@ -255,16 +349,17 @@ export function resolveProfile(profile: ResourceProfile, hw: HardwareResources):
 }
 
 /**
- * Append resource flags to an openshell sandbox create args array.
- * Resolves percentage values against detected hardware before passing.
- * Gracefully degrades: checks `openshell sandbox create --help` for flag
- * support and skips silently if the installed OpenShell doesn't have them.
+ * Append resolved --cpu and --memory flags to an `openshell sandbox create` args array.
+ * Throws on an invalid percentage before it checks OpenShell flag support.
+ * Returns false when `openshell sandbox create --help` fails or lacks --cpu or --memory.
  */
 export function appendResourceFlags(
   args: string[],
   profile: ResourceProfile,
   openshellBinary = "openshell",
 ): boolean {
+  validateResourceValue(profile.cpu);
+  validateResourceValue(profile.memory);
   try {
     const result = spawnSync(openshellBinary, ["sandbox", "create", "--help"], {
       encoding: "utf-8",
@@ -279,15 +374,11 @@ export function appendResourceFlags(
   } catch {
     return false;
   }
-  try {
-    const hw = getHardwareResources();
-    const resolved = resolveProfile(profile, hw);
-    if (resolved.cpu) args.push("--cpu", resolved.cpu);
-    if (resolved.memory) args.push("--memory", resolved.memory);
-    return true;
-  } catch {
-    return false;
-  }
+  const hw = getHardwareResources();
+  const resolved = resolveProfile(profile, hw);
+  if (resolved.cpu) args.push("--cpu", resolved.cpu);
+  if (resolved.memory) args.push("--memory", resolved.memory);
+  return true;
 }
 
 function normalizeResourceProfile(prof: Record<string, unknown>): ResourceProfile | null {

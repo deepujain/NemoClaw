@@ -2,23 +2,101 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import path from "node:path";
 
 import { resolveOpenshellBinary } from "../../../adapters/openshell/command-argv";
 import type { LaunchReadinessOpenClawSessionQualification } from "../../../state/launch-readiness-lease";
 import { ROOT } from "../../../state/paths";
-import { readAutoPairApprovalPolicyModule } from "../auto-pair-approval";
+import {
+  readSandboxAutoPairWatcherStatus,
+  WARMUP_TIMEOUT_MS,
+  WATCHER_STATUS_TIMEOUT_MS,
+} from "../auto-pair-warmup";
+import {
+  readAutoPairApprovalPolicyModule,
+  readOpenClawPairingStateModule,
+} from "../auto-pair-approval";
 
 const QUALIFICATION_MARKER = "__NEMOCLAW_OPENCLAW_PAIRING_QUALIFICATION__=";
 const SETTLEMENT_MARKER = "__NEMOCLAW_OPENCLAW_PAIRING_SETTLEMENT__=";
+const FAILURE_MARKER = "__NEMOCLAW_OPENCLAW_PAIRING_FAILURE__=";
+const OBSERVATION_FAILURE_REASONS = [
+  "state-read",
+  "identity",
+  "paired-device",
+  "paired-token",
+  "client-auth",
+  "pending-requests",
+  "scope-projection",
+  "state-changed",
+  "timeout",
+  "process-failed",
+  "invalid-output",
+] as const;
+export type OpenClawPairingObservationFailureReason = (typeof OBSERVATION_FAILURE_REASONS)[number];
+const MISMATCH_MARKER = "__NEMOCLAW_OPENCLAW_PAIRING_MISMATCH__=";
+const RETRYABLE_OBSERVATION_EXIT_STATUS = 3;
+const INCOMPATIBLE_OBSERVATION_EXIT_STATUS = 4;
 const SHA256_RE = /^[a-f0-9]{64}$/;
-const OBSERVATION_TIMEOUT_MS = 3_000;
+const OPENCLAW_VERSION_RE = /\bopenclaw\b[^\r\n0-9]*([0-9]+\.[0-9]+\.[0-9]+)(?![0-9.])/i;
+export const OPENCLAW_PAIRING_OBSERVATION_TIMEOUT_MS = 3_000;
+// Reuse one fixed pairing lifecycle across ordinary onboarding and Portable.
+// The watcher first waits up to 330 seconds for native /startupz so its CLI
+// cannot contend with gateway database migrations. /health is only liveness
+// and can pass before that wait finishes. Reserve that startup bound plus the
+// existing 60-second device-list window (#9817) before declaring pairing absent.
+// Canonical state remains the only success authority; already-settled devices
+// return immediately without spending either window.
+export const OPENCLAW_ONBOARDING_PAIRING_TIMEOUT_MS = 330_000 + 60_000;
+export const OPENCLAW_ONBOARDING_PAIRING_POLL_MS = 1_000;
+export const OPENCLAW_ONBOARDING_PAIRING_FINAL_OBSERVATION_TIMEOUT_MS = 30_000;
+// Reserve the bounded request producer and watcher-observation windows. The
+// host no longer owns an ordinary onboarding approval child (#10269).
+export const OPENCLAW_ONBOARDING_PAIRING_SETTLEMENT_TIMEOUT_MS =
+  OPENCLAW_PAIRING_OBSERVATION_TIMEOUT_MS +
+  OPENCLAW_ONBOARDING_PAIRING_TIMEOUT_MS +
+  WARMUP_TIMEOUT_MS +
+  OPENCLAW_ONBOARDING_PAIRING_FINAL_OBSERVATION_TIMEOUT_MS +
+  WATCHER_STATUS_TIMEOUT_MS;
 const OBSERVATION_MAX_OUTPUT_BYTES = 4 * 1_024;
+const MISMATCH_FIELDS = new Set([
+  "paired.cardinality",
+  "paired.mapKey",
+  "paired.deviceId",
+  "paired.publicKey",
+  "paired.clientId",
+  "paired.clientMode",
+  "paired.role",
+  "paired.roles",
+  "paired.requestedScopes",
+  "paired.publicKeyPem",
+  "paired.tokens",
+  "paired.tokens.operator.role",
+  "paired.tokens.operator.revokedAtMs",
+  "paired.tokens.operator.token",
+  "paired.tokens.operator.aliases",
+  "auth.version",
+  "auth.deviceId",
+  "auth.tokens",
+  "auth.tokens.operator.role",
+  "auth.tokens.operator.revokedAtMs",
+  "auth.tokens.operator.token",
+  "auth.tokens.operator.aliases",
+  "paired.scopes",
+  "paired.approvedScopes",
+  "paired.tokens.operator.scopes",
+  "auth.tokens.operator.scopes",
+  "scope.consistency",
+]);
+
+export function formatOpenClawPairingMismatchField(field: string | null | undefined): string {
+  return field && MISMATCH_FIELDS.has(field) ? ` (${field})` : "";
+}
 
 export const OPENCLAW_PAIRING_REQUIRED_ROLES = ["operator"] as const;
 // Canonical approval preserves the requested pairing/write view on the paired
-// record and adds the implied read scope only to credential-bearing token views.
+// record and adds implied read access to credential-bearing token views. A prior
+// explicit read grant also remains in the paired record after native approval.
 export const OPENCLAW_PAIRING_REQUEST_SCOPES = ["operator.pairing", "operator.write"] as const;
 export const OPENCLAW_PAIRING_REQUIRED_SCOPES = [
   "operator.pairing",
@@ -28,8 +106,26 @@ export const OPENCLAW_PAIRING_REQUIRED_SCOPES = [
 
 export type OpenClawPairingQualification = LaunchReadinessOpenClawSessionQualification;
 
+/** Diagnose native startup only; canonical pairing remains the success authority. */
+export function observeOpenClawStartupFailure(
+  sandboxName: string,
+  gatewayName: string,
+): "startup-timeout" | "startup-gateway-exited" | null {
+  const state = readSandboxAutoPairWatcherStatus(sandboxName, gatewayName)?.state;
+  return state === "startup-timeout" || state === "startup-gateway-exited" ? state : null;
+}
+
+export function parseOpenClawVersionFromText(value: string): string | null {
+  return value.match(OPENCLAW_VERSION_RE)?.[1] ?? null;
+}
+
 export type OpenClawPairingSettlementObservation = {
-  readonly state: "pairing-only" | "settled";
+  readonly state: "pairing-only" | "scope-upgrade-required" | "scope-upgrade-pending" | "settled";
+  readonly deviceIdentitySha256: string;
+};
+
+export type OpenClawPairingRepairObservation = {
+  readonly state: "pairing-only" | "pairing-pending" | "settled";
   readonly deviceIdentitySha256: string;
 };
 
@@ -47,14 +143,44 @@ interface OpenClawPairingQualificationDeps {
 }
 
 export class OpenClawPairingQualificationError extends Error {
-  constructor() {
+  constructor(readonly failureReason?: OpenClawPairingObservationFailureReason) {
     super("OpenClaw pairing qualification is unavailable.");
     this.name = "OpenClawPairingQualificationError";
   }
 }
 
-function sha256(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex");
+export class OpenClawPairingIncompatibleError extends OpenClawPairingQualificationError {
+  constructor(readonly field: string | null = null) {
+    super();
+    this.name = "OpenClawPairingIncompatibleError";
+  }
+}
+
+function parseOpenClawPairingMismatchField(output: unknown): string | null {
+  const lines = String(output ?? "")
+    .trimEnd()
+    .split(/\r?\n/);
+  if (lines.length !== 1 || !lines[0]!.startsWith(MISMATCH_MARKER)) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(lines[0]!.slice(MISMATCH_MARKER.length)) as unknown;
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  return hasExactKeys(record, ["field"]) &&
+    typeof record.field === "string" &&
+    MISMATCH_FIELDS.has(record.field)
+    ? record.field
+    : null;
+}
+
+export class OpenClawPairingObservationRetryableError extends OpenClawPairingQualificationError {
+  constructor() {
+    super("state-changed");
+    this.name = "OpenClawPairingObservationRetryableError";
+  }
 }
 
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -102,9 +228,7 @@ export function parseOpenClawPairingObservation(output: string): ObservationProj
   return record as unknown as ObservationProjection;
 }
 
-export function parseOpenClawPairingSettlementObservation(
-  output: string,
-): OpenClawPairingSettlementObservation | null {
+function parseOpenClawPairingSettlementRecord(output: string): Record<string, unknown> | null {
   const lines = output.trimEnd().split(/\r?\n/);
   const markerLines = lines.filter((line) => line.startsWith(SETTLEMENT_MARKER));
   if (markerLines.length !== 1 || lines.at(-1) !== markerLines[0]) return null;
@@ -120,18 +244,58 @@ export function parseOpenClawPairingSettlementObservation(
     !hasExactKeys(record, ["deviceIdentitySha256", "state"]) ||
     typeof record.deviceIdentitySha256 !== "string" ||
     !SHA256_RE.test(record.deviceIdentitySha256) ||
-    (record.state !== "pairing-only" && record.state !== "settled")
+    (record.state !== "pairing-only" &&
+      record.state !== "scope-upgrade-required" &&
+      record.state !== "scope-upgrade-pending" &&
+      record.state !== "pairing-pending" &&
+      record.state !== "settled")
+  ) {
+    return null;
+  }
+  return record;
+}
+
+export function parseOpenClawPairingSettlementObservation(
+  output: string,
+): OpenClawPairingSettlementObservation | null {
+  const record = parseOpenClawPairingSettlementRecord(output);
+  if (
+    !record ||
+    (record.state !== "pairing-only" &&
+      record.state !== "scope-upgrade-required" &&
+      record.state !== "scope-upgrade-pending" &&
+      record.state !== "settled")
   ) {
     return null;
   }
   return record as OpenClawPairingSettlementObservation;
 }
 
+export function parseOpenClawPairingRepairObservation(
+  output: string,
+): OpenClawPairingRepairObservation | null {
+  const record = parseOpenClawPairingSettlementRecord(output);
+  if (
+    !record ||
+    (record.state !== "pairing-only" &&
+      record.state !== "pairing-pending" &&
+      record.state !== "settled")
+  ) {
+    return null;
+  }
+  return record as OpenClawPairingRepairObservation;
+}
+
 export function buildOpenClawPairingObservationScript(
   approvalPolicyModuleB64: string,
   stateDirectory: string,
-  mode: "qualification" | "settlement" = "qualification",
+  mode:
+    | "ordinary-settlement"
+    | "qualification"
+    | "repair-settlement"
+    | "settlement" = "qualification",
 ): string {
+  const pairingStateModule = readOpenClawPairingStateModule();
   if (!path.posix.isAbsolute(stateDirectory)) {
     throw new OpenClawPairingQualificationError();
   }
@@ -141,8 +305,11 @@ export function buildOpenClawPairingObservationScript(
   ) {
     throw new OpenClawPairingQualificationError();
   }
+  if (!pairingStateModule) {
+    throw new OpenClawPairingQualificationError();
+  }
   const stateDirectoryB64 = Buffer.from(stateDirectory, "utf8").toString("base64");
-  const marker = mode === "settlement" ? SETTLEMENT_MARKER : QUALIFICATION_MARKER;
+  const marker = mode === "qualification" ? QUALIFICATION_MARKER : SETTLEMENT_MARKER;
   // OpenClaw owns these in-sandbox state files. This observer reads
   // descriptor-pinned state through the requested gateway and returns only
   // allowlisted fields and digests. Pairing changes remain owned by the
@@ -158,20 +325,50 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import stat
+import subprocess
 import sys
 
+${pairingStateModule}
+
 MARKER = ${JSON.stringify(marker)}
+MISMATCH_MARKER = ${JSON.stringify(MISMATCH_MARKER)}
 MAX_ENTRY_BYTES = 512 * 1024
+MAX_SAFE_INTEGER = 9007199254740991
 REQUIRED_ROLES = ['operator']
 PAIRING_ONLY_SCOPES = ['operator.pairing']
+PAIRING_READ_SCOPES = ['operator.pairing', 'operator.read']
 REQUEST_SCOPES = ['operator.pairing', 'operator.write']
 TOKEN_SCOPES = ['operator.pairing', 'operator.read', 'operator.write']
+ADMIN_REQUEST_SCOPES = ['operator.admin', 'operator.pairing', 'operator.write']
+ADMIN_PAIRED_TOKEN_SCOPES = ['operator.admin', 'operator.pairing', 'operator.read', 'operator.write']
+ADMIN_AUTH_TOKEN_SCOPES = ['operator.admin', 'operator.read', 'operator.write']
+TUI_SCOPES = ['operator.admin', 'operator.approvals', 'operator.read', 'operator.write']
+ALLOW_CANONICAL_PENDING = ${mode === "ordinary-settlement" || mode === "repair-settlement" ? "True" : "False"}
+ORDINARY_SETTLEMENT = ${mode === "ordinary-settlement" ? "True" : "False"}
+REPORT_CANONICAL_PENDING = ${mode === "repair-settlement" ? "True" : "False"}
+REQUIRE_REPAIR_PENDING = ${mode === "repair-settlement" ? "True" : "False"}
+STRICT_SETTLEMENT = ${mode === "settlement" ? "True" : "False"}
 ED25519_SPKI_PREFIX = bytes.fromhex('302a300506032b6570032100')
 RAW_PUBLIC_KEY_RE = re.compile(r'^[A-Za-z0-9_-]{43}$')
+failure_stage = 'state-read'
 
-def reject():
-    sys.exit(1)
+incompatible_pairing = False
+
+def reject(field=None):
+    if incompatible_pairing and ${mode === "ordinary-settlement" || mode === "qualification" ? "True" : "False"} and field:
+        print(MISMATCH_MARKER + json.dumps({'field': field}, separators=(',', ':')))
+    else:
+        # Fixed stage names only; never serialize state, exceptions, or credentials.
+        print(${JSON.stringify(FAILURE_MARKER)} + failure_stage)
+    sys.exit(${INCOMPATIBLE_OBSERVATION_EXIT_STATUS} if incompatible_pairing else 1)
+
+def retry_observation():
+    sys.exit(${RETRYABLE_OBSERVATION_EXIT_STATUS})
+
+class StateChangedError(Exception):
+    pass
 
 try:
     policy_source = base64.b64decode(
@@ -252,7 +449,7 @@ def open_state_root():
             root_fd = next_fd
         directory_metadata(root_fd)
         if not state_root_is_current(root_fd):
-            raise OSError('state root changed')
+            raise StateChangedError('state root changed')
         return root_fd
     except Exception:
         os.close(root_fd)
@@ -267,13 +464,13 @@ def directory_is_current(parent_fd, name, fd):
     )
 
 def open_directory(parent_fd, name):
-    if name not in ('devices', 'identity'):
+    if name not in ('devices', 'identity', 'state'):
         raise OSError('unsupported directory')
     fd = os.open(name, directory_flags, dir_fd=parent_fd)
     directory_metadata(fd)
     if not directory_is_current(parent_fd, name, fd):
         os.close(fd)
-        raise OSError('directory changed')
+        raise StateChangedError('directory changed')
     return fd
 
 def read_entry(directory_fd, name):
@@ -303,13 +500,35 @@ def read_entry(directory_fd, name):
             current.st_mtime_ns,
             current.st_mode & 0o7777,
         ) != after:
-            raise OSError('entry changed')
+            raise StateChangedError('entry changed')
         return b''.join(chunks), after
     finally:
         os.close(fd)
 
-def read_snapshot():
+def assert_sqlite_database_absent(state_fd):
+    sqlite_state_fd = -1
+    try:
+        try:
+            sqlite_state_fd = open_directory(state_fd, 'state')
+        except FileNotFoundError:
+            return
+        try:
+            os.stat('openclaw.sqlite', dir_fd=sqlite_state_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise StateChangedError('sqlite database appeared')
+    finally:
+        if sqlite_state_fd >= 0:
+            os.close(sqlite_state_fd)
+
+def assert_legacy_layout_current():
     state_fd = open_state_root()
+    try:
+        assert_sqlite_database_absent(state_fd)
+    finally:
+        os.close(state_fd)
+
+def read_legacy_snapshot(state_fd):
     devices_fd = -1
     identity_fd = -1
     try:
@@ -324,8 +543,10 @@ def read_snapshot():
             or not directory_is_current(state_fd, 'devices', devices_fd)
             or not directory_is_current(state_fd, 'identity', identity_fd)
         ):
-            raise OSError('state root changed')
+            raise StateChangedError('state root changed')
+        assert_sqlite_database_absent(state_fd)
         return {
+            'layout': 'legacy',
             'directories': [directory_metadata(state_fd), directory_metadata(devices_fd), directory_metadata(identity_fd)],
             'identity': (identity_raw, identity_metadata),
             'auth': (auth_raw, auth_metadata),
@@ -337,6 +558,107 @@ def read_snapshot():
             os.close(identity_fd)
         if devices_fd >= 0:
             os.close(devices_fd)
+
+def safe_timestamp(value):
+    return type(value) is int and 0 <= value <= MAX_SAFE_INTEGER
+
+def validate_identity_key_pair(public_key_pem, private_key_pem):
+    if not isinstance(public_key_pem, str) or not isinstance(private_key_pem, str):
+        raise ValueError('invalid identity key material')
+    openssl = '/usr/bin/openssl'
+    try:
+        openssl_metadata = os.stat(openssl, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise ValueError('openssl is unavailable') from error
+    if (
+        not stat.S_ISREG(openssl_metadata.st_mode)
+        or openssl_metadata.st_nlink != 1
+        or openssl_metadata.st_uid != 0
+        or openssl_metadata.st_mode & 0o022
+    ):
+        raise OSError('openssl is unsafe')
+    try:
+        derived_public_key = subprocess.run(
+            [openssl, 'pkey', '-pubout', '-outform', 'DER'],
+            input=private_key_pem.encode('utf-8'),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={
+                'LANG': 'C',
+                'OPENSSL_CONF': '/dev/null',
+                'PATH': '/usr/bin:/bin',
+            },
+            check=True,
+            timeout=2,
+        ).stdout
+    except FileNotFoundError as error:
+        raise ValueError('openssl is unavailable') from error
+    except (subprocess.SubprocessError, UnicodeError) as error:
+        raise ValueError('invalid identity private key') from error
+    match = re.fullmatch(
+        r'-----BEGIN PUBLIC KEY-----\\n([A-Za-z0-9+/]{59}=)\\n-----END PUBLIC KEY-----\\n',
+        public_key_pem,
+    )
+    if match is None:
+        raise ValueError('invalid identity public key')
+    expected_public_key = base64.b64decode(match.group(1), validate=True)
+    if derived_public_key != expected_public_key:
+        raise ValueError('identity key pair mismatch')
+
+def read_sqlite_snapshot(state_fd, sqlite_state_fd):
+    records, database_metadata = read_openclaw_pairing_state(
+        STATE_DIR,
+        timeout=0,
+        state_fd=state_fd,
+        sqlite_state_fd=sqlite_state_fd,
+    )
+    identity = records['identity']
+    identity_timestamps = records['identityTimestamps']
+    if (
+        not safe_timestamp(identity_timestamps['createdAtMs'])
+        or not safe_timestamp(identity_timestamps['updatedAtMs'])
+    ):
+        raise ValueError('invalid identity timestamps')
+    validate_identity_key_pair(
+        identity['publicKeyPem'], identity['privateKeyPem'],
+    )
+    device_id = identity['deviceId']
+    auth_tokens = records['authByDevice'].get(device_id, {})
+    return {
+        'layout': 'sqlite',
+        'directories': [directory_metadata(state_fd), directory_metadata(sqlite_state_fd)],
+        'identity': (json.dumps({
+            'deviceId': device_id,
+            'publicKeyPem': identity['publicKeyPem'],
+            'privateKeyPem': identity['privateKeyPem'],
+        }, sort_keys=True).encode('utf-8'), database_metadata),
+        'auth': (json.dumps({
+            'version': 1,
+            'deviceId': device_id,
+            'tokens': auth_tokens,
+        }, sort_keys=True).encode('utf-8'), database_metadata),
+        'paired': (json.dumps(records['paired'], sort_keys=True).encode('utf-8'), database_metadata),
+        'pending': (json.dumps(records['pending'], sort_keys=True).encode('utf-8'), database_metadata),
+    }
+
+def read_snapshot():
+    state_fd = open_state_root()
+    sqlite_state_fd = -1
+    try:
+        try:
+            sqlite_state_fd = open_directory(state_fd, 'state')
+        except FileNotFoundError:
+            return read_legacy_snapshot(state_fd)
+        try:
+            database_entry = os.stat('openclaw.sqlite', dir_fd=sqlite_state_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return read_legacy_snapshot(state_fd)
+        if not stat.S_ISREG(database_entry.st_mode):
+            raise OSError('unsafe sqlite database')
+        return read_sqlite_snapshot(state_fd, sqlite_state_fd)
+    finally:
+        if sqlite_state_fd >= 0:
+            os.close(sqlite_state_fd)
         os.close(state_fd)
 
 def parse_json(raw):
@@ -406,7 +728,10 @@ try:
     first = read_snapshot()
     second = read_snapshot()
     if first != second:
-        reject()
+        retry_observation()
+    if first.get('layout') == 'legacy':
+        assert_legacy_layout_current()
+    failure_stage = 'identity'
     identity = parse_json(first['identity'][0])
     auth = parse_json(first['auth'][0])
     paired = parse_json(first['paired'][0])
@@ -422,6 +747,7 @@ try:
     ):
         reject()
 
+    failure_stage = 'paired-device'
     local_paired = [
         (map_key, device) for map_key, device in paired.items()
         if map_key == device_id or (
@@ -431,58 +757,127 @@ try:
             )
         )
     ]
+    incompatible_pairing = bool(local_paired)
     if len(local_paired) != 1:
-        reject()
+        reject('paired.cardinality')
     map_key, paired_device = local_paired[0]
-    if (
-        map_key != device_id
-        or not isinstance(paired_device, dict)
-        or paired_device.get('deviceId') != device_id
-        or paired_device.get('publicKey') != device_public_key
-        or paired_device.get('clientId') != 'cli'
-        or paired_device.get('clientMode') != 'cli'
-        or paired_device.get('role') != 'operator'
-        or not exact_string_set(paired_device.get('roles'), REQUIRED_ROLES)
-        or 'requestedScopes' in paired_device
-        or 'publicKeyPem' in paired_device
-    ):
-        reject()
+    if not isinstance(paired_device, dict):
+        reject('paired.deviceId')
+    cli_client = paired_device.get('clientId') == 'cli'
+    tui_client = paired_device.get('clientId') == 'openclaw-tui'
+    paired_checks = (
+        ('paired.mapKey', map_key == device_id),
+        ('paired.deviceId', paired_device.get('deviceId') == device_id),
+        ('paired.publicKey', paired_device.get('publicKey') == device_public_key),
+        ('paired.clientId', cli_client or tui_client),
+        ('paired.clientMode', paired_device.get('clientMode') in ('cli', 'probe') if cli_client else paired_device.get('clientMode') == 'ui'),
+        ('paired.role', paired_device.get('role') == 'operator'),
+        ('paired.roles', exact_string_set(paired_device.get('roles'), REQUIRED_ROLES)),
+        ('paired.requestedScopes', 'requestedScopes' not in paired_device),
+        ('paired.publicKeyPem', 'publicKeyPem' not in paired_device),
+    )
+    for field, valid in paired_checks:
+        if not valid:
+            reject(field)
+    failure_stage = 'paired-token'
     paired_tokens = paired_device.get('tokens')
     paired_operator = paired_tokens.get('operator') if isinstance(paired_tokens, dict) and set(paired_tokens) == {'operator'} else None
-    if (
-        not isinstance(paired_operator, dict)
-        or paired_operator.get('role') != 'operator'
-        or paired_operator.get('revokedAtMs') is not None
-        or not isinstance(paired_operator.get('token'), str)
-        or not paired_operator.get('token')
-        or paired_operator.get('token').strip() != paired_operator.get('token')
-        or any(alias in paired_operator for alias in ('requestedScopes', 'approvedScopes', 'roles'))
-    ):
-        reject()
+    if not isinstance(paired_operator, dict):
+        reject('paired.tokens')
+    paired_token_checks = (
+        ('paired.tokens.operator.role', paired_operator.get('role') == 'operator'),
+        ('paired.tokens.operator.revokedAtMs', paired_operator.get('revokedAtMs') is None),
+        ('paired.tokens.operator.token', isinstance(paired_operator.get('token'), str)
+            and bool(paired_operator.get('token'))
+            and paired_operator.get('token').strip() == paired_operator.get('token')),
+        ('paired.tokens.operator.aliases', not any(alias in paired_operator
+            for alias in ('requestedScopes', 'approvedScopes', 'roles'))),
+    )
+    for field, valid in paired_token_checks:
+        if not valid:
+            reject(field)
+    failure_stage = 'client-auth'
     auth_tokens = auth.get('tokens')
-    auth_operator = auth_tokens.get('operator') if isinstance(auth_tokens, dict) and set(auth_tokens) == {'operator'} else None
+    # Native client token persistence follows the paired-device commit. Ordinary
+    # startup can observe that pairing-only intermediate state; wait within the
+    # existing observation budget without authorizing or producing a request.
     if (
-        type(auth.get('version')) is not int
-        or auth.get('version') != 1
-        or auth.get('deviceId') != device_id
-        or not isinstance(auth_operator, dict)
-        or auth_operator.get('role') != 'operator'
-        or auth_operator.get('revokedAtMs') is not None
-        or not isinstance(auth_operator.get('token'), str)
-        or auth_operator.get('token') != paired_operator.get('token')
-        or any(alias in auth_operator for alias in ('requestedScopes', 'approvedScopes', 'roles'))
+        ORDINARY_SETTLEMENT
+        and first.get('layout') == 'sqlite'
+        and type(auth.get('version')) is int and auth.get('version') == 1
+        and auth.get('deviceId') == device_id
+        and auth_tokens == {}
+        and all(exact_string_set(view, PAIRING_ONLY_SCOPES) for view in (
+            paired_device.get('scopes'), paired_device.get('approvedScopes'),
+            paired_operator.get('scopes'),
+        ))
     ):
-        reject()
+        retry_observation()
+    auth_operator = auth_tokens.get('operator') if isinstance(auth_tokens, dict) and set(auth_tokens) == {'operator'} else None
+    if type(auth.get('version')) is not int or auth.get('version') != 1:
+        reject('auth.version')
+    if auth.get('deviceId') != device_id:
+        reject('auth.deviceId')
+    if not isinstance(auth_operator, dict):
+        reject('auth.tokens')
+    auth_token_checks = (
+        ('auth.tokens.operator.role', auth_operator.get('role') == 'operator'),
+        ('auth.tokens.operator.revokedAtMs', auth_operator.get('revokedAtMs') is None),
+        ('auth.tokens.operator.token', isinstance(auth_operator.get('token'), str)
+            and auth_operator.get('token') == paired_operator.get('token')),
+        ('auth.tokens.operator.aliases', not any(alias in auth_operator
+            for alias in ('requestedScopes', 'approvedScopes', 'roles'))),
+    )
+    for field, valid in auth_token_checks:
+        if not valid:
+            reject(field)
 
-    ${mode === "settlement" ? "if pending:\n        reject()" : ""}
+    failure_stage = 'pending-requests'
+    incompatible_pairing = False
+    if (STRICT_SETTLEMENT or tui_client) and pending:
+        reject()
+    canonical_pending_count = 0
     for request_id, request in pending.items():
         if (
             not isinstance(request_id, str)
             or not request_id
             or not isinstance(request, dict)
-            or request.get('requestId') != request_id
         ):
             reject()
+        if ORDINARY_SETTLEMENT and request.get('deviceId') != device_id:
+            continue
+        if request.get('requestId') != request_id:
+            reject()
+        if ALLOW_CANONICAL_PENDING:
+            # The host warm-up or an earlier client command can publish the
+            # canonical write transition before finalization observes it.
+            # Admit only that exact intermediate state while the startup
+            # watcher remains the sole approval owner. Final observation still
+            # requires settled scopes and no same-device pending request.
+            decision = approval_request_decision(request)
+            request_scopes = request.get('scopes')
+            valid_write_scopes = (
+                exact_string_set(request_scopes, ['operator.write'])
+                or exact_string_set(request_scopes, REQUEST_SCOPES)
+            )
+            if (
+                request.get('deviceId') != device_id
+                or request.get('publicKey') != device_public_key
+                or request.get('clientId') != 'cli'
+                or request.get('clientMode') != 'cli'
+                or request.get('role') != 'operator'
+                or not exact_string_set(request.get('roles'), REQUIRED_ROLES)
+                or 'requestedScopes' in request
+                or 'publicKeyPem' in request
+                or type(request.get('isRepair')) is not bool
+                or (REQUIRE_REPAIR_PENDING and request.get('isRepair') is not True)
+                or not valid_write_scopes
+                or not isinstance(decision, dict)
+                or decision.get('allowed') is not True
+            ):
+                reject()
+            canonical_pending_count += 1
+            continue
         decision = approval_request_decision(request)
         if decision.get('reason') == 'malformed-scopes':
             reject()
@@ -497,31 +892,98 @@ try:
         if normalized_roles(device) is None:
             reject()
 
-    settled = (
-        exact_string_set(paired_device.get('scopes'), REQUEST_SCOPES)
-        and exact_string_set(paired_device.get('approvedScopes'), REQUEST_SCOPES)
+    failure_stage = 'scope-projection'
+    # Native approval merges an earlier explicit read grant into the write grant.
+    # Require the two device views to agree on one exact supported scope set.
+    explicit_read_grant = (
+        exact_string_set(paired_device.get('scopes'), TOKEN_SCOPES)
+        and exact_string_set(paired_device.get('approvedScopes'), TOKEN_SCOPES)
+    )
+    baseline_settled = (
+        cli_client
+        and (explicit_read_grant or (
+            exact_string_set(paired_device.get('scopes'), REQUEST_SCOPES)
+            and exact_string_set(paired_device.get('approvedScopes'), REQUEST_SCOPES)
+        ))
         and exact_string_set(paired_operator.get('scopes'), TOKEN_SCOPES)
         and exact_string_set(auth_operator.get('scopes'), TOKEN_SCOPES)
     )
+    # An explicitly approved operator.admin upgrade survives an OpenShell
+    # rebuild in the canonical OpenClaw state volume. Recognize that one exact,
+    # already-settled shape as healthy state. This observer never approves or
+    # expands scopes; pending admin requests remain rejected by the approval
+    # policy above.
+    admin_settled = (
+        cli_client
+        and exact_string_set(paired_device.get('scopes'), ADMIN_REQUEST_SCOPES)
+        and exact_string_set(paired_device.get('approvedScopes'), ADMIN_REQUEST_SCOPES)
+        and exact_string_set(paired_operator.get('scopes'), ADMIN_PAIRED_TOKEN_SCOPES)
+        and exact_string_set(auth_operator.get('scopes'), ADMIN_AUTH_TOKEN_SCOPES)
+    )
+    # The native TUI reuses the local device identity and records its own
+    # already-approved grants. Observe that exact settled profile without
+    # approving a pending request or changing either credential view.
+    tui_settled = tui_client and all(
+        exact_string_set(view, TUI_SCOPES) for view in (
+            paired_device.get('scopes'), paired_device.get('approvedScopes'),
+            paired_operator.get('scopes'), auth_operator.get('scopes'),
+        )
+    )
+    settled = baseline_settled or admin_settled or tui_settled
     pairing_only = (
-        exact_string_set(paired_device.get('scopes'), PAIRING_ONLY_SCOPES)
+        cli_client
+        and exact_string_set(paired_device.get('scopes'), PAIRING_ONLY_SCOPES)
         and exact_string_set(paired_device.get('approvedScopes'), PAIRING_ONLY_SCOPES)
         and exact_string_set(paired_operator.get('scopes'), PAIRING_ONLY_SCOPES)
         and exact_string_set(auth_operator.get('scopes'), PAIRING_ONLY_SCOPES)
     )
-    if not settled and not pairing_only:
-        reject()
+    # A probe changes connection metadata, not the local device identity. Only
+    # verified matching credentials may produce a canonical CLI write request.
+    read_baseline = cli_client and ORDINARY_SETTLEMENT and all(
+        exact_string_set(view, PAIRING_READ_SCOPES) for view in (
+            paired_device.get('scopes'), paired_device.get('approvedScopes'),
+            paired_operator.get('scopes'), auth_operator.get('scopes'),
+        )
+    )
+    upgrade_required = read_baseline
+    if ALLOW_CANONICAL_PENDING:
+        relevant_pending_count = canonical_pending_count if ORDINARY_SETTLEMENT else len(pending)
+        if relevant_pending_count and (relevant_pending_count != 1 or not (pairing_only or read_baseline)):
+            reject()
+    if not settled and not pairing_only and not upgrade_required:
+        incompatible_pairing = True
+        scope_checks = (
+            ('paired.scopes', paired_device.get('scopes'),
+             (PAIRING_ONLY_SCOPES, PAIRING_READ_SCOPES, REQUEST_SCOPES,
+              TOKEN_SCOPES, ADMIN_REQUEST_SCOPES)),
+            ('paired.approvedScopes', paired_device.get('approvedScopes'),
+             (PAIRING_ONLY_SCOPES, PAIRING_READ_SCOPES, REQUEST_SCOPES,
+              TOKEN_SCOPES, ADMIN_REQUEST_SCOPES)),
+            ('paired.tokens.operator.scopes', paired_operator.get('scopes'),
+             (PAIRING_ONLY_SCOPES, PAIRING_READ_SCOPES, TOKEN_SCOPES,
+              ADMIN_PAIRED_TOKEN_SCOPES)),
+            ('auth.tokens.operator.scopes', auth_operator.get('scopes'),
+             (PAIRING_ONLY_SCOPES, PAIRING_READ_SCOPES, TOKEN_SCOPES,
+              ADMIN_AUTH_TOKEN_SCOPES)),
+        )
+        for field, value, allowed_sets in scope_checks:
+            if not any(exact_string_set(value, allowed) for allowed in allowed_sets):
+                reject(field)
+        reject('scope.consistency')
 
     device_identity_sha256 = hashlib.sha256(json.dumps({
         'deviceId': device_id,
         'publicKey': device_public_key,
     }, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
     ${
-      mode === "settlement"
-        ? "print(MARKER + json.dumps({\n        'deviceIdentitySha256': device_identity_sha256,\n        'state': 'settled' if settled else 'pairing-only',\n    }, sort_keys=True, separators=(',', ':')))\n    sys.exit(0)"
+      mode !== "qualification"
+        ? "print(MARKER + json.dumps({\n        'deviceIdentitySha256': device_identity_sha256,\n        'state': ('settled' if settled else ('scope-upgrade-pending' if ORDINARY_SETTLEMENT and canonical_pending_count else ('pairing-pending' if REPORT_CANONICAL_PENDING and pending else ('scope-upgrade-required' if upgrade_required else 'pairing-only')))),\n    }, sort_keys=True, separators=(',', ':')))\n    sys.exit(0)"
         : "if not settled:\n        reject()"
     }
 
+    projected_request_scopes = TUI_SCOPES if tui_settled else ADMIN_REQUEST_SCOPES if admin_settled else (TOKEN_SCOPES if explicit_read_grant else REQUEST_SCOPES)
+    projected_paired_token_scopes = TUI_SCOPES if tui_settled else ADMIN_PAIRED_TOKEN_SCOPES if admin_settled else TOKEN_SCOPES
+    projected_auth_token_scopes = TUI_SCOPES if tui_settled else ADMIN_AUTH_TOKEN_SCOPES if admin_settled else TOKEN_SCOPES
     projection = {
         'deviceIdentitySha256': device_identity_sha256,
         # Bind only the allowlisted security projection. Token values, unknown
@@ -530,21 +992,23 @@ try:
         'pairingStateSha256': hashlib.sha256(json.dumps({
             'deviceId': device_id,
             'publicKey': device_public_key,
-            'clientId': 'cli',
-            'clientMode': 'cli',
+            'clientId': 'openclaw-tui' if tui_settled else 'cli',
+            # Authenticated probes refresh connection metadata only. Both
+            # validated modes represent the same canonical CLI authority.
+            'clientMode': 'ui' if tui_settled else 'cli',
             'roles': REQUIRED_ROLES,
-            'pairedRequestScopes': REQUEST_SCOPES,
-            'approvedRequestScopes': REQUEST_SCOPES,
+            'pairedRequestScopes': projected_request_scopes,
+            'approvedRequestScopes': projected_request_scopes,
             'pairedToken': {
                 'active': True,
                 'role': 'operator',
-                'scopes': TOKEN_SCOPES,
+                'scopes': projected_paired_token_scopes,
             },
             'clientAuth': {
                 'deviceId': device_id,
                 'matchesPairedToken': True,
                 'role': 'operator',
-                'scopes': TOKEN_SCOPES,
+                'scopes': projected_auth_token_scopes,
                 'version': 1,
             },
             'relevantPending': False,
@@ -553,7 +1017,9 @@ try:
         'requiredScopes': TOKEN_SCOPES,
     }
     print(MARKER + json.dumps(projection, sort_keys=True, separators=(',', ':')))
-except (OSError, ValueError, TypeError, KeyError, binascii.Error, UnicodeError):
+except (FileNotFoundError, StateChangedError, OpenClawPairingStateRetryableError):
+    retry_observation()
+except (OSError, ValueError, TypeError, KeyError, binascii.Error, UnicodeError, sqlite3.Error):
     reject()
 PYQUALIFY
 `;
@@ -575,12 +1041,16 @@ function runOpenClawPairingObservation(
   gatewayName: string,
   openclawVersion: string,
   stateDirectory: string,
-  mode: "qualification" | "settlement",
+  mode: "ordinary-settlement" | "qualification" | "repair-settlement" | "settlement",
   execDeps?: Partial<OpenClawPairingQualificationDeps>,
 ): { readonly output: string; readonly policy: string } {
   const approvalPolicy = (execDeps?.readApprovalPolicy ?? readAutoPairApprovalPolicyModule)();
   const normalizedVersion = openclawVersion.trim();
-  if (!approvalPolicy || !normalizedVersion || normalizedVersion.length > 128) {
+  if (
+    !approvalPolicy ||
+    normalizedVersion.length > 128 ||
+    (mode === "qualification" && !normalizedVersion)
+  ) {
     throw new OpenClawPairingQualificationError();
   }
   const approvalPolicyModuleB64 = Buffer.from(approvalPolicy, "utf8").toString("base64");
@@ -593,23 +1063,58 @@ function runOpenClawPairingObservation(
     getOpenshellBinary: execDeps?.getOpenshellBinary ?? resolveOpenshellBinary,
     spawnSync: execDeps?.spawnSync ?? spawnSync,
   };
-  const result = deps.spawnSync(
-    deps.getOpenshellBinary(),
-    ["sandbox", "exec", "--name", sandboxName, "-g", gatewayName, "--", "sh", "-s"],
-    {
-      cwd: ROOT,
-      env: process.env,
-      input: script,
-      encoding: "utf8",
-      maxBuffer: OBSERVATION_MAX_OUTPUT_BYTES,
-      stdio: ["pipe", "pipe", "ignore"],
-      timeout: OBSERVATION_TIMEOUT_MS,
-    },
-  );
-  if (result.error || result.signal || result.status !== 0) {
-    throw new OpenClawPairingQualificationError();
+  const observationStartedAt = performance.now();
+  for (let attempt = 0; ; attempt += 1) {
+    const timeoutMs =
+      attempt === 0
+        ? OPENCLAW_PAIRING_OBSERVATION_TIMEOUT_MS
+        : Math.floor(
+            OPENCLAW_PAIRING_OBSERVATION_TIMEOUT_MS - (performance.now() - observationStartedAt),
+          );
+    if (timeoutMs <= 0) throw new OpenClawPairingObservationRetryableError();
+    const result = deps.spawnSync(
+      deps.getOpenshellBinary(),
+      ["sandbox", "exec", "--name", sandboxName, "-g", gatewayName, "--", "sh", "-s"],
+      {
+        cwd: ROOT,
+        env: process.env,
+        input: script,
+        encoding: "utf8",
+        maxBuffer: OBSERVATION_MAX_OUTPUT_BYTES,
+        stdio: ["pipe", "pipe", "ignore"],
+        timeout: timeoutMs,
+      },
+    );
+    if (!result.error && !result.signal && result.status === RETRYABLE_OBSERVATION_EXIT_STATUS) {
+      // Native state may change during a descriptor-pinned read. Reobserve only
+      // that explicit retryable result, with fresh strict snapshots and the same
+      // total deadline. Authorization and malformed-state failures stay terminal.
+      if (attempt < 2) continue;
+      throw new OpenClawPairingObservationRetryableError();
+    }
+    if (!result.error && !result.signal && result.status === INCOMPATIBLE_OBSERVATION_EXIT_STATUS) {
+      throw new OpenClawPairingIncompatibleError(
+        mode === "ordinary-settlement" || mode === "qualification"
+          ? parseOpenClawPairingMismatchField(result.stdout)
+          : null,
+      );
+    }
+    if (result.error || result.signal || result.status !== 0) {
+      if (result.error && "code" in result.error && result.error.code === "ETIMEDOUT") {
+        throw new OpenClawPairingQualificationError("timeout");
+      }
+      const output = String(result.stdout ?? "").trim();
+      const reason = OBSERVATION_FAILURE_REASONS.find(
+        (value) => output === `${FAILURE_MARKER}${value}`,
+      );
+      throw new OpenClawPairingQualificationError(
+        !result.error && !result.signal && result.status === 1 && reason
+          ? reason
+          : "process-failed",
+      );
+    }
+    return { output: String(result.stdout ?? ""), policy: approvalPolicy };
   }
-  return { output: String(result.stdout ?? ""), policy: approvalPolicy };
 }
 
 export function observeOpenClawPairingSettlement(
@@ -629,7 +1134,57 @@ export function observeOpenClawPairingSettlement(
       execDeps,
     );
     const observation = parseOpenClawPairingSettlementObservation(executed.output);
-    if (!observation) throw new OpenClawPairingQualificationError();
+    if (!observation) throw new OpenClawPairingQualificationError("invalid-output");
+    return observation;
+  } catch (error) {
+    if (error instanceof OpenClawPairingQualificationError) throw error;
+    throw new OpenClawPairingQualificationError();
+  }
+}
+
+export function observeOpenClawPairingRepairSettlement(
+  sandboxName: string,
+  gatewayName: string,
+  openclawVersion: string,
+  stateDirectory: string,
+  execDeps?: Partial<OpenClawPairingQualificationDeps>,
+): OpenClawPairingRepairObservation {
+  try {
+    const executed = runOpenClawPairingObservation(
+      sandboxName,
+      gatewayName,
+      openclawVersion,
+      stateDirectory,
+      "repair-settlement",
+      execDeps,
+    );
+    const observation = parseOpenClawPairingRepairObservation(executed.output);
+    if (!observation) throw new OpenClawPairingQualificationError("invalid-output");
+    return observation;
+  } catch (error) {
+    if (error instanceof OpenClawPairingQualificationError) throw error;
+    throw new OpenClawPairingQualificationError();
+  }
+}
+
+export function observeOrdinaryOpenClawPairingSettlement(
+  sandboxName: string,
+  gatewayName: string,
+  openclawVersion: string,
+  stateDirectory: string,
+  execDeps?: Partial<OpenClawPairingQualificationDeps>,
+): OpenClawPairingSettlementObservation {
+  try {
+    const executed = runOpenClawPairingObservation(
+      sandboxName,
+      gatewayName,
+      openclawVersion,
+      stateDirectory,
+      "ordinary-settlement",
+      execDeps,
+    );
+    const observation = parseOpenClawPairingSettlementObservation(executed.output);
+    if (!observation) throw new OpenClawPairingQualificationError("invalid-output");
     return observation;
   } catch (error) {
     if (error instanceof OpenClawPairingQualificationError) throw error;
@@ -656,13 +1211,12 @@ export function observeOpenClawPairingQualification(
       execDeps,
     );
     const projection = parseOpenClawPairingObservation(executed.output);
-    if (!projection) throw new OpenClawPairingQualificationError();
+    if (!projection) throw new OpenClawPairingQualificationError("invalid-output");
     return {
       schemaVersion: 1,
       kind: "openclaw-pairing",
       openclawVersion: normalizedVersion,
       ...projection,
-      policySha256: sha256(executed.policy),
     };
   } catch (error) {
     if (error instanceof OpenClawPairingQualificationError) throw error;

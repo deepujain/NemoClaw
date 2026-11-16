@@ -7,6 +7,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import YAML from "yaml";
+import {
+  isReviewedOpenShellSdkInstallStep,
+  REVIEWED_OPEN_SHELL_SDK_INSTALL_STEP,
+} from "./reviewed-openshell-sdk-install-workflow-boundary.mts";
 import { SHARED_E2E_JOB_ID } from "./credential-free-tests.mts";
 import { E2E_ACTION_PROVENANCE, E2E_JOB_POLICY } from "./workflow-boundary-policy.mts";
 
@@ -17,13 +21,18 @@ const PREPARE_E2E_ACTION_PROVENANCE = E2E_ACTION_PROVENANCE.prepareWorkspace;
 
 export const PREPARE_E2E_ACTION = PREPARE_E2E_ACTION_PROVENANCE.reference;
 export const PREPARE_E2E_STEP = "Prepare E2E workspace";
+export const PREPARE_COMPILED_ARTIFACT_ACTION =
+  "./.trusted-ci-actions/.github/actions/ci-compile-artifacts";
 
 const CHECKOUT_LOCAL_PREPARE_E2E_ACTION = "./.github/actions/prepare-e2e";
 export const CLI_ARTIFACT_PRODUCER_JOB = E2E_JOB_POLICY.cliArtifactProducer;
-const PREINSTALLED_E2E_JOBS = new Set(["staging-brev-launchable"]);
+const PREINSTALLED_E2E_JOBS = new Set([
+  "dgx-station-express",
+  "staging-brev-launchable",
+  "staging-brev-launchable-identity",
+]);
 const NATIVE_RUNTIME_QUALIFICATION_PRODUCER_PREPARE_CONDITION =
-  "${{ inputs.checkout_sha == '' || inputs.jobs != 'native-runtime-qualification-producer' || inputs.targets != '' }}";
-const RETIRED_SELECTOR_COMPATIBILITY_JOB = "retired-selector-compatibility";
+  "${{ inputs.checkout_sha == '' || (inputs.jobs != 'native-runtime-qualification-producer' && inputs.jobs != 'llama-cpp-dgx-spark-qualification') || inputs.targets != '' }}";
 
 export const PREPARE_E2E_NO_BUILD_JOBS = new Set<string>(E2E_JOB_POLICY.prepareNoBuild);
 
@@ -64,20 +73,48 @@ export function validatePrepareE2eAction(actionPath = DEFAULT_ACTION_PATH): stri
   if (!isDeepStrictEqual(record(record(action.inputs)["build-cli"]), expectedInput)) {
     errors.push("prepare-e2e build-cli input must default to true");
   }
-  if (Object.keys(record(action.inputs)).length !== 1) {
-    errors.push("prepare-e2e must expose only the build-cli input");
+  if (
+    !isDeepStrictEqual(record(action.inputs)["install-dependencies"], {
+      description: "Install root dependencies before an optional CLI build.",
+      required: false,
+      default: "true",
+    }) ||
+    Object.keys(record(action.inputs)).length !== 2
+  ) {
+    errors.push(
+      "prepare-e2e must expose build-cli and install-dependencies with installation enabled by default",
+    );
   }
 
   const runs = record(action.runs);
   if (runs.using !== "composite") errors.push("prepare-e2e must be a composite action");
   const expectedSteps = [
     {
+      name: "Validate preparation inputs",
+      shell: "bash",
+      env: {
+        BUILD_CLI: "${{ inputs.build-cli }}",
+        INSTALL_DEPENDENCIES: "${{ inputs.install-dependencies }}",
+      },
+      run: `set -euo pipefail
+case "$BUILD_CLI:$INSTALL_DEPENDENCIES" in
+  true:true|false:true|false:false) ;;
+  *) echo "Invalid preparation inputs: building requires dependency installation." >&2; exit 1 ;;
+esac
+`,
+    },
+    {
       name: "Set up Node",
       uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
-      with: { "node-version": 22, cache: "npm" },
+      with: { "node-version": "24.22.1", cache: "npm" },
+    },
+    {
+      name: "Install reviewed npm",
+      uses: "NVIDIA/NemoClaw/.github/actions/setup-reviewed-npm@98669f24d35f18e49b6b2769cd68709509ea24f2",
     },
     {
       name: "Install root dependencies",
+      if: "${{ inputs.install-dependencies == 'true' }}",
       shell: "bash",
       run: "npm ci --ignore-scripts",
     },
@@ -89,24 +126,84 @@ export function validatePrepareE2eAction(actionPath = DEFAULT_ACTION_PATH): stri
     },
   ];
   if (!isDeepStrictEqual(runs.steps, expectedSteps)) {
-    errors.push("prepare-e2e must pin Node 22, run npm ci, and conditionally build the CLI");
+    errors.push(
+      "prepare-e2e must pin reviewed Node and npm, run npm ci, and conditionally build the CLI",
+    );
   }
   return errors;
+}
+
+function validateCompilerSdkPreparation(job: WorkflowRecord): string[] {
+  const jobSteps = steps(job.steps);
+  const download = jobSteps.find((step) => step.name === "Download reviewed OpenShell SDK archive");
+  const compileIndex = jobSteps.findIndex((step) => step.uses === PREPARE_COMPILED_ARTIFACT_ACTION);
+  if (
+    job.needs !== "package-openshell-sdk" ||
+    job.if !==
+      "${{ !cancelled() && (needs.package-openshell-sdk.result == 'success' || (needs.package-openshell-sdk.result == 'skipped' && inputs.checkout_sha != '' && (inputs.jobs == 'native-runtime-qualification-producer' || inputs.jobs == 'llama-cpp-dgx-spark-qualification') && inputs.targets == '')) }}" ||
+    !isDeepStrictEqual(download, {
+      name: "Download reviewed OpenShell SDK archive",
+      if: NATIVE_RUNTIME_QUALIFICATION_PRODUCER_PREPARE_CONDITION,
+      uses: "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+      with: {
+        name: "${{ needs.package-openshell-sdk.outputs.artifact_name }}",
+        path: "${{ runner.temp }}/openshell-sdk",
+      },
+    }) ||
+    jobSteps.indexOf(download!) >= compileIndex
+  ) {
+    return ["generate-matrix must download this run's reviewed SDK archives before compilation"];
+  }
+  return [];
+}
+
+function validateCandidateSdkPreparation(jobName: string, job: WorkflowRecord): string[] {
+  const jobSteps = steps(job.steps);
+  const downloads = jobSteps.filter(
+    (step) => step.name === "Download reviewed OpenShell SDK archive",
+  );
+  const installs = jobSteps.filter((step) => step.name === REVIEWED_OPEN_SHELL_SDK_INSTALL_STEP);
+  const prepareIndex = jobSteps.findIndex((step) => step.uses === PREPARE_E2E_ACTION);
+  const dependencies = Array.isArray(job.needs) ? job.needs : [job.needs];
+  if (
+    !dependencies.includes("package-openshell-sdk") ||
+    downloads.length !== 1 ||
+    installs.length !== 1 ||
+    !isDeepStrictEqual(downloads[0], {
+      name: "Download reviewed OpenShell SDK archive",
+      uses: "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+      with: {
+        name: "${{ needs.package-openshell-sdk.outputs.artifact_name }}",
+        path: "${{ runner.temp }}/openshell-sdk",
+      },
+    }) ||
+    !isReviewedOpenShellSdkInstallStep(installs[0]) ||
+    jobSteps.indexOf(downloads[0]) !== prepareIndex - 1 ||
+    jobSteps.indexOf(installs[0]) !== prepareIndex + 1
+  ) {
+    return [
+      `${jobName} must download its reviewed SDK before preparation and install it immediately afterward`,
+    ];
+  }
+  return [];
 }
 
 export function validatePrepareE2eInvocations(workflow: WorkflowRecord): string[] {
   const errors: string[] = [];
   const jobs = record(workflow.jobs);
+  if (
+    record(jobs["package-openshell-sdk"]).if !==
+    NATIVE_RUNTIME_QUALIFICATION_PRODUCER_PREPARE_CONDITION
+  ) {
+    errors.push("SDK packaging must follow candidate compilation selection");
+  }
   const expectedJobs = new Set(
     Object.entries(jobs)
       .filter(([jobName, value]) => {
         const job = record(value);
         return (
           !PREINSTALLED_E2E_JOBS.has(jobName) &&
-          (jobName === "generate-matrix" ||
-            jobName === "live" ||
-            jobName === RETIRED_SELECTOR_COMPATIBILITY_JOB ||
-            record(job.env).E2E_JOB === "1")
+          (jobName === "generate-matrix" || jobName === "live" || record(job.env).E2E_JOB === "1")
         );
       })
       .map(([jobName]) => jobName),
@@ -130,7 +227,35 @@ export function validatePrepareE2eInvocations(workflow: WorkflowRecord): string[
     if (jobSteps.some((step) => step.uses === CHECKOUT_LOCAL_PREPARE_E2E_ACTION)) {
       errors.push(`${jobName} must not load prepare-e2e from the target checkout`);
     }
-    const prepareSteps = jobSteps.filter((step) => step.uses === PREPARE_E2E_ACTION);
+    const expectedAction =
+      jobName === CLI_ARTIFACT_PRODUCER_JOB ? PREPARE_COMPILED_ARTIFACT_ACTION : PREPARE_E2E_ACTION;
+    const prepareSteps = jobSteps.filter((step) => step.uses === expectedAction);
+    if (jobName === CLI_ARTIFACT_PRODUCER_JOB) {
+      errors.push(...validateCompilerSdkPreparation(record(value)));
+      const trustedCheckoutIndex = jobSteps.findIndex(
+        (step) => step.name === "Check out trusted compiled artifact action",
+      );
+      const trustedCheckout = jobSteps[trustedCheckoutIndex];
+      const checkoutInputs = record(trustedCheckout?.with);
+      const candidateIndex = jobSteps.findIndex((step) => step.name === "Check out E2E candidate");
+      if (
+        trustedCheckout?.uses !== "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" ||
+        checkoutInputs.repository !== "${{ github.repository }}" ||
+        checkoutInputs.ref !== "${{ github.workflow_sha }}" ||
+        checkoutInputs.path !== ".trusted-ci-actions" ||
+        checkoutInputs["persist-credentials"] !== false ||
+        !String(checkoutInputs["sparse-checkout"])
+          .split("\n")
+          .includes(".github/actions/ci-compile-artifacts") ||
+        trustedCheckoutIndex <= candidateIndex ||
+        candidateIndex < 0 ||
+        trustedCheckoutIndex >= jobSteps.findIndex((step) => step.uses === expectedAction)
+      ) {
+        errors.push(
+          "generate-matrix must load the shared compiler from the trusted workflow checkout after candidate checkout",
+        );
+      }
+    }
     if (!expectedJobs.has(jobName)) {
       if (prepareSteps.length > 0) errors.push(`${jobName} must not use prepare-e2e`);
       continue;
@@ -147,15 +272,31 @@ export function validatePrepareE2eInvocations(workflow: WorkflowRecord): string[
     const withInputs = record(prepare.with);
     const shouldBuild =
       jobName === CLI_ARTIFACT_PRODUCER_JOB || PREPARE_E2E_TRUSTED_BUILD_JOBS.has(jobName);
-    if (shouldBuild && Object.keys(withInputs).length !== 0) {
+    if (
+      jobName === CLI_ARTIFACT_PRODUCER_JOB
+        ? !isDeepStrictEqual(withInputs, { "package-mode": "artifact" })
+        : shouldBuild && Object.keys(withInputs).length !== 0
+    ) {
       errors.push(
         jobName === CLI_ARTIFACT_PRODUCER_JOB
-          ? `${jobName} prepare-e2e must own the only default CLI build`
+          ? `${jobName} prepare-e2e must build with reviewed SDK artifacts`
           : `${jobName} prepare-e2e must use its default trusted CLI build`,
       );
     }
-    if (!shouldBuild && !isDeepStrictEqual(withInputs, { "build-cli": "false" })) {
+    const trustedController = jobName === "managed-image-protected-runtime";
+    if (
+      !shouldBuild &&
+      !isDeepStrictEqual(
+        withInputs,
+        trustedController
+          ? { "build-cli": "false" }
+          : { "build-cli": "false", "install-dependencies": "false" },
+      )
+    ) {
       errors.push(`${jobName} prepare-e2e must set build-cli to false`);
+    }
+    if (!shouldBuild && !trustedController) {
+      errors.push(...validateCandidateSdkPreparation(jobName, record(value)));
     }
     if (
       jobName === "generate-matrix" &&
@@ -167,14 +308,19 @@ export function validatePrepareE2eInvocations(workflow: WorkflowRecord): string[
     }
     const allowedKeys = shouldBuild
       ? jobName === "generate-matrix"
-        ? ["if", "name", "uses"]
+        ? ["if", "name", "uses", "with"]
         : ["name", "uses"]
       : ["name", "uses", "with"];
     if (!isDeepStrictEqual(Object.keys(prepare).sort(), allowedKeys.sort())) {
       errors.push(`${jobName} prepare-e2e invocation must not override its canonical contract`);
     }
 
-    for (const retiredStep of ["Set up Node", "Install root dependencies", "Build CLI"]) {
+    for (const retiredStep of [
+      "Set up Node",
+      "Install reviewed npm",
+      "Install root dependencies",
+      "Build CLI",
+    ]) {
       if (jobSteps.some((step) => step.name === retiredStep)) {
         errors.push(`${jobName} must not duplicate prepare-e2e step '${retiredStep}'`);
       }
@@ -185,7 +331,14 @@ export function validatePrepareE2eInvocations(workflow: WorkflowRecord): string[
       errors.push(`${jobName} must check out the repository before prepare-e2e`);
     }
     const authIndex = jobSteps.findIndex((step) => step.name === "Authenticate to Docker Hub");
-    if (authIndex >= 0 && prepareIndex <= authIndex) {
+    // The protected multiarch job intentionally installs with --ignore-scripts,
+    // builds its candidate boundary, and only then receives Docker credentials.
+    // Its exact post-build auth position is owned by the managed-image validator.
+    if (
+      jobName !== "managed-image-multiarch-startup" &&
+      authIndex >= 0 &&
+      prepareIndex <= authIndex
+    ) {
       errors.push(`${jobName} must authenticate to Docker Hub before prepare-e2e`);
     }
   }

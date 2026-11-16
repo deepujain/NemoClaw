@@ -32,7 +32,7 @@ export function prepareSandboxToolDisclosure(
   inspectSandboxForCreate: SandboxLifecycleHelpers["inspectSandboxForCreate"],
   desiredToolDisclosure: ToolDisclosure | null = null,
 ) {
-  const { existingEntry, preservedMcpState, liveExists } = inspectSandboxForCreate(sandboxName);
+  const { existingEntry, liveExists } = inspectSandboxForCreate(sandboxName);
   let mode: ToolDisclosure;
   try {
     mode = resolveSandboxToolDisclosure({
@@ -69,12 +69,38 @@ export function prepareSandboxToolDisclosure(
   );
   return {
     existingEntry,
-    preservedMcpState,
     liveExists,
     effectiveToolDisclosure: mode,
     toolDisclosureMigrationNeeded: migrationNeeded,
     toolDisclosureMigrationNote: migrationNeeded
       ? `  Sandbox '${sandboxName}' exists — recreating to apply ${mode} tool disclosure.`
       : null,
+  };
+}
+
+/** Resolve schema-5 tool disclosure without reading live state or writing session state. */
+export function prepareHermesPortableToolDisclosure(
+  desiredToolDisclosure: ToolDisclosure | null = null,
+) {
+  let mode: ToolDisclosure;
+  try {
+    mode = resolveSandboxToolDisclosure({
+      requested: desiredToolDisclosure ?? resolveToolDisclosureRequest(null, process.env),
+      recorded: undefined,
+      session: undefined,
+      sandboxExists: false,
+      recreate: false,
+    });
+  } catch (error) {
+    throw new Error(
+      `Hermes portable tool disclosure configuration is invalid: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  return {
+    existingEntry: null,
+    liveExists: false,
+    effectiveToolDisclosure: mode,
+    toolDisclosureMigrationNeeded: false,
+    toolDisclosureMigrationNote: null,
   };
 }

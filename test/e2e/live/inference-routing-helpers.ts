@@ -6,12 +6,14 @@ import os from "node:os";
 import path from "node:path";
 import type { ArtifactSink } from "../fixtures/artifacts.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
-import { resultText } from "../fixtures/clients/command.ts";
+import { outputContainsSandbox, resultText } from "../fixtures/clients/command.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
 import type { SandboxClient } from "../fixtures/clients/sandbox.ts";
 import { validateSandboxName } from "../fixtures/clients/sandbox.ts";
 import { expect } from "../fixtures/e2e-test.ts";
-import { CLI_DIST_ENTRYPOINT, CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
+import { captureIssue4462FailureDiagnostics } from "../fixtures/issue-4462-diagnostics.ts";
+import { CLI_ENTRYPOINT } from "../fixtures/paths.ts";
+import type { RuntimeProviderPrerequisite } from "../fixtures/runtime-provider.ts";
 import {
   type RawRunOptions,
   type RawRunResult,
@@ -22,7 +24,6 @@ import {
 // probes, with local helpers only where raw in-memory output is required to
 // prove credential non-exposure before redacted artifacts are written.
 
-const DIST_ENTRYPOINT = CLI_DIST_ENTRYPOINT;
 const NEMOCLAW_STATE_DIR = path.join(os.homedir(), ".nemoclaw");
 const ONBOARD_SESSION_FILE = path.join(NEMOCLAW_STATE_DIR, "onboard-session.json");
 const ONBOARD_LOCK_FILE = path.join(NEMOCLAW_STATE_DIR, "onboard.lock");
@@ -42,13 +43,12 @@ const CREDENTIAL_CLASSIFICATION_PATTERN =
 const TRANSPORT_CLASSIFICATION_PATTERN =
   /unreachable|timeout|connect|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|No route to host|transport|network|endpoint|dns/i;
 
-function shouldRunProviderSmoke(provider: "openai" | "anthropic"): boolean {
+function shouldRunProviderSmoke(provider: "openrouter"): boolean {
   // The former shell script auto-ran these smokes when provider secrets were
-  // present. This live migration requires an explicit opt-in so PR-safe jobs
-  // cannot spend third-party quota accidentally; any future secret-backed lane
-  // must set NEMOCLAW_INFERENCE_ROUTING_PROVIDER_SMOKE=all or a provider name.
+  // present. This live smoke requires explicit selection so PR-safe jobs do
+  // not spend third-party quota accidentally.
   const requested = process.env.NEMOCLAW_INFERENCE_ROUTING_PROVIDER_SMOKE?.trim().toLowerCase();
-  return requested === "1" || requested === "true" || requested === "all" || requested === provider;
+  return requested === provider;
 }
 
 type SkipFn = (note?: string) => void;
@@ -89,21 +89,6 @@ function clearOnboardState(): void {
   fs.rmSync(ONBOARD_SESSION_FILE, { force: true });
 }
 
-function writeFakeOpenShellForBlueprintFailClosed(binDir: string): string {
-  const commandLogPath = path.join(binDir, "openshell-commands.jsonl");
-  const scriptPath = path.join(binDir, "openshell");
-  fs.writeFileSync(
-    scriptPath,
-    `#!/usr/bin/env node
-const fs = require("node:fs");
-fs.appendFileSync(${JSON.stringify(commandLogPath)}, JSON.stringify({ args: process.argv.slice(2) }) + "\\n");
-process.exit(0);
-`,
-    { mode: 0o755 },
-  );
-  return commandLogPath;
-}
-
 async function runNemoclawCli(
   args: readonly string[],
   options: RawRunOptions,
@@ -129,22 +114,14 @@ async function runOpenShell(
   });
 }
 
-async function requireLivePrerequisites(host: HostCliClient, skip: SkipFn): Promise<void> {
-  expect(
-    fs.existsSync(DIST_ENTRYPOINT),
-    "run `npm run build:cli` before live inference-routing targets",
-  ).toBe(true);
-
-  const docker = await host.command("docker", ["info"], {
+async function requireLivePrerequisites(
+  host: HostCliClient,
+  runtimeProvider: RuntimeProviderPrerequisite,
+): Promise<void> {
+  await runtimeProvider.requireAvailable({
     artifactName: "prereq-docker-info-inference-routing",
-    env: buildAvailabilityProbeEnv(),
-    timeoutMs: 30_000,
+    scenarioLabel: "inference routing",
   });
-  if (docker.exitCode !== 0) {
-    const message = `Docker is required for live inference-routing coverage: ${resultText(docker)}`;
-    if (process.env.GITHUB_ACTIONS === "true") throw new Error(message);
-    skipLive(skip, message);
-  }
 
   try {
     const openshell = await host.command("openshell", ["--version"], {
@@ -224,6 +201,7 @@ async function cleanupSandbox(
   }
 
   const cleanupEvidence: string[] = [];
+  let deletionConfirmedAbsent = false;
   try {
     const destroy = await host.command(
       process.execPath,
@@ -248,6 +226,9 @@ async function cleanupSandbox(
       timeoutMs: 60_000,
     });
     cleanupEvidence.push(probeSummary("openshell sandbox delete", deletion));
+    deletionConfirmedAbsent =
+      deletion.exitCode !== 0 &&
+      /\bmessage:\s*["']sandbox not found["']/i.test(resultText(deletion));
   } catch (error) {
     cleanupEvidence.push(
       `openshell sandbox delete threw: ${error instanceof Error ? error.message : String(error)}`,
@@ -255,16 +236,17 @@ async function cleanupSandbox(
   }
 
   clearOnboardState();
+  if (deletionConfirmedAbsent) return;
 
-  const status = await sandbox.status(sandboxName, {
-    artifactName: `cleanup-openshell-sandbox-status-${sandboxName}`,
+  const inventory = await sandbox.list({
+    artifactName: `cleanup-openshell-sandbox-list-${sandboxName}`,
     env: buildAvailabilityProbeEnv(),
     timeoutMs: 30_000,
   });
-  cleanupEvidence.push(probeSummary("openshell sandbox status", status));
-  if (status.exitCode === 0) {
+  cleanupEvidence.push(probeSummary("openshell sandbox list", inventory));
+  if (inventory.exitCode !== 0 || outputContainsSandbox(inventory, sandboxName)) {
     throw new Error(
-      `sandbox '${sandboxName}' still exists after strict cleanup\n${cleanupEvidence.join("\n")}`,
+      `sandbox '${sandboxName}' absence is unverified after strict cleanup\n${cleanupEvidence.join("\n")}`,
     );
   }
 }
@@ -310,6 +292,20 @@ function expectOnboardSuccess(result: RawRunResult, label: string): void {
   const redacted = redactedResultText(result);
   expect(result.timedOut, `${label} timed out\n${redacted}`).toBe(false);
   expect(result.exitCode, `${label} failed\n${redacted}`).toBe(0);
+}
+
+export async function captureOpenClawPairingDiagnosticsAfterFailedOnboard(
+  result: RawRunResult,
+  sandbox: Pick<SandboxClient, "exec">,
+  sandboxName: string,
+  redactionValues: readonly string[],
+): Promise<void> {
+  if (result.exitCode === 0 && !result.timedOut) return;
+  await captureIssue4462FailureDiagnostics(sandbox, {
+    env: buildAvailabilityProbeEnv(),
+    redactionValues,
+    sandboxName,
+  });
 }
 
 function expectOnboardFailure(result: RawRunResult, label: string): void {
@@ -441,12 +437,12 @@ async function expectAnthropicMessageThroughSandbox(
   );
 }
 
-export function requireProviderSmokeSelected(provider: "openai" | "anthropic", skip: SkipFn): void {
+export function requireProviderSmokeSelected(provider: "openrouter", skip: SkipFn): void {
   if (!shouldRunProviderSmoke(provider)) {
-    const label = provider === "openai" ? "OpenAI" : "Anthropic";
+    const label = provider;
     skipLive(
       skip,
-      `set NEMOCLAW_INFERENCE_ROUTING_PROVIDER_SMOKE=${provider} or all to run ${label} smoke`,
+      `set NEMOCLAW_INFERENCE_ROUTING_PROVIDER_SMOKE=${provider} to run ${label} smoke`,
     );
   }
 }
@@ -500,5 +496,4 @@ export {
   runRawCommand,
   skipLive,
   TRANSPORT_CLASSIFICATION_PATTERN,
-  writeFakeOpenShellForBlueprintFailClosed,
 };

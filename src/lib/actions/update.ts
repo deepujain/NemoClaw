@@ -8,10 +8,23 @@ import path from "node:path";
 
 import { resolveAgentNameAlias } from "../agent/aliases";
 import { normalizeVersion } from "../domain/installer/version";
+import {
+  recordTelemetryTarget,
+  recordTelemetryVersions,
+  setTelemetryOutcome,
+} from "./telemetry/operation";
 
 export const NEMOCLAW_INSTALLER_URL = "https://www.nvidia.com/nemoclaw.sh";
 export const NEMOCLAW_REPO_URL = "https://github.com/NVIDIA/NemoClaw.git";
-export const NEMOCLAW_UPDATE_COMMAND = `curl -fsSL ${NEMOCLAW_INSTALLER_URL} | bash`;
+/**
+ * Pipeline `nemoclaw update` runs to install the maintained build.
+ * `--proto '=https'` and `--proto-redir '=https'` hold the transfer on HTTPS for
+ * the initial request and for every redirect, so a downgrade redirect fails
+ * closed instead of piping plaintext-fetched bytes into `bash`. Same fetch
+ * hardening as `src/lib/onboard/install-ollama-linux.ts`.
+ */
+const NEMOCLAW_UPDATE_FETCH_COMMAND = `curl -fsSL --proto '=https' --proto-redir '=https' ${NEMOCLAW_INSTALLER_URL}`;
+export const NEMOCLAW_UPDATE_COMMAND = `${NEMOCLAW_UPDATE_FETCH_COMMAND} | bash`;
 export const NEMOCLAW_MAINTAINED_INSTALL_TAG = "lkg";
 
 type LogFn = (message?: string) => void;
@@ -80,6 +93,11 @@ function trimOutput(value: string | Buffer | null | undefined): string {
 
 const UPDATE_BRANDING_AGENTS = ["openclaw", "hermes", "langchain-deepagents-code"] as const;
 
+function maintainedUpdateCommand(agent?: (typeof UPDATE_BRANDING_AGENTS)[number]): string {
+  const agentAssignment = agent ? `NEMOCLAW_AGENT=${agent} ` : "";
+  return `${NEMOCLAW_UPDATE_FETCH_COMMAND} | ${agentAssignment}bash`;
+}
+
 function updateBranding(env: NodeJS.ProcessEnv): UpdateBranding {
   const agent =
     resolveAgentNameAlias(env.NEMOCLAW_AGENT, UPDATE_BRANDING_AGENTS) ?? env.NEMOCLAW_AGENT;
@@ -87,20 +105,20 @@ function updateBranding(env: NodeJS.ProcessEnv): UpdateBranding {
     return {
       cliName: "nemohermes",
       displayName: "NemoHermes",
-      maintainedUpdateCommand: `curl -fsSL ${NEMOCLAW_INSTALLER_URL} | NEMOCLAW_AGENT=hermes bash`,
+      maintainedUpdateCommand: maintainedUpdateCommand("hermes"),
     };
   }
   if (agent === "langchain-deepagents-code") {
     return {
       cliName: "nemo-deepagents",
       displayName: "NemoDeepAgents",
-      maintainedUpdateCommand: `curl -fsSL ${NEMOCLAW_INSTALLER_URL} | NEMOCLAW_AGENT=langchain-deepagents-code bash`,
+      maintainedUpdateCommand: maintainedUpdateCommand("langchain-deepagents-code"),
     };
   }
   return {
     cliName: "nemoclaw",
     displayName: "NemoClaw",
-    maintainedUpdateCommand: NEMOCLAW_UPDATE_COMMAND,
+    maintainedUpdateCommand: maintainedUpdateCommand(),
   };
 }
 
@@ -363,7 +381,7 @@ function updateInstallerEnv(
   forceCliReinstall: boolean,
   maintainedRevision: string | null,
 ): NodeJS.ProcessEnv {
-  const next = { ...env };
+  const next: NodeJS.ProcessEnv = { ...env, NEMOCLAW_UPDATE_INVOKED: "1" };
   delete next.BASH_ENV;
   delete next.ENV;
   delete next.NEMOCLAW_FRESH;
@@ -396,6 +414,14 @@ export async function runUpdateAction(
     : detectInstallType(rootDir, env);
   const relation = maintainedVersionRelation(currentVersion, latestVersion);
   const available = updateAvailable(relation);
+  recordTelemetryVersions({
+    previous: currentVersion,
+    ...(latestVersion ? { target: latestVersion } : {}),
+  });
+  const recordResult = (outcome: Parameters<typeof recordTelemetryTarget>[0]["outcome"]) => {
+    recordTelemetryTarget({ scope: "cli", outcome, state: "unchanged" });
+    setTelemetryOutcome(outcome, "unchanged", "cli");
+  };
 
   printStatus({
     branding,
@@ -407,6 +433,7 @@ export async function runUpdateAction(
   });
 
   if (options.check) {
+    recordResult("checked");
     return {
       currentVersion,
       installType,
@@ -420,6 +447,7 @@ export async function runUpdateAction(
   if (installType === "source") {
     error("  This command is running from a source checkout.");
     error("  Update this checkout with git, or run the maintained installer outside the checkout.");
+    recordResult("failed");
     return {
       currentVersion,
       installType,
@@ -432,6 +460,7 @@ export async function runUpdateAction(
 
   if (available === false && !options.fresh) {
     log(`  ${branding.displayName} is already up to date.`);
+    recordResult("no_change");
     return {
       currentVersion,
       installType,
@@ -455,6 +484,7 @@ export async function runUpdateAction(
     error(
       `  Drop --fresh to keep ${currentVersion}, or rerun with --allow-downgrade to reinstall anyway.`,
     );
+    recordResult("failed");
     return {
       currentVersion,
       installType,
@@ -468,6 +498,7 @@ export async function runUpdateAction(
   if (!options.yes) {
     if (env.NEMOCLAW_NON_INTERACTIVE === "1") {
       error("  Refusing to prompt in non-interactive mode. Re-run with --yes to update.");
+      recordResult("failed");
       return {
         currentVersion,
         installType,
@@ -482,6 +513,7 @@ export async function runUpdateAction(
       error(
         "  Refusing to run the installer without confirmation. Re-run with --yes for non-interactive update.",
       );
+      recordResult("failed");
       return {
         currentVersion,
         installType,
@@ -498,6 +530,7 @@ export async function runUpdateAction(
       .toLowerCase();
     if (answer !== "y" && answer !== "yes") {
       log("  Update cancelled.");
+      recordResult("cancelled");
       return {
         currentVersion,
         installType,

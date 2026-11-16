@@ -74,4 +74,28 @@ describe("credential prompt navigation helpers", () => {
       vi.restoreAllMocks();
     }
   });
+
+  it("rechecks sandbox identity after the credential prompt before persistence (#9833)", async () => {
+    const prompt = vi
+      .spyOn(credentials, "readCredentialPrompt")
+      .mockResolvedValue({ kind: "credential", value: "new-secret" });
+    const saveCredential = vi.spyOn(credentials, "saveCredential");
+    delete process.env.NEMOCLAW_TEST_POLICY_CREDENTIAL;
+
+    await expect(
+      replaceNamedCredential({
+        envName: "NEMOCLAW_TEST_POLICY_CREDENTIAL",
+        label: "Policy credential",
+        exitOnboardFromPrompt: () => process.exit(1),
+        revalidateSandboxIdentity: () => {
+          throw new Error("Sandbox identity changed before the selected route");
+        },
+      }),
+    ).rejects.toThrow(/Sandbox identity changed before/u);
+
+    expect(prompt).toHaveBeenCalledOnce();
+    expect(saveCredential).not.toHaveBeenCalled();
+    expect(process.env.NEMOCLAW_TEST_POLICY_CREDENTIAL).toBeUndefined();
+    vi.restoreAllMocks();
+  });
 });

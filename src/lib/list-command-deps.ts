@@ -2,14 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as onboardSession from "./state/onboard-session";
+import {
+  getPersistedSandboxTargetGatewayName,
+  getSelectedGatewayName,
+} from "./actions/sandbox/gateway-target";
 import type { ListSandboxesCommandDeps, SandboxEntry } from "./inventory";
-import { getLiveGatewayInference } from "./inference/live";
-import { OPENSHELL_PROBE_TIMEOUT_MS } from "./adapters/openshell/timeouts";
-import { parseSshProcesses, createSystemDeps } from "./state/sandbox-session";
+import { createSynchronousCliOpenShellInferenceRouteObserver } from "./adapters/openshell/inference-route-cli";
+import { getActiveSandboxSessions, createSystemDeps } from "./state/sandbox-session";
 import { resolveOpenshell } from "./adapters/openshell/resolve";
 import { captureOpenshell } from "./adapters/openshell/runtime";
 import { recoverRegistryEntries } from "./registry-recovery-action";
 import * as registry from "./state/registry";
+import * as policy from "./policy";
 
 interface RecoveredRegistry {
   sandboxes: SandboxEntry[];
@@ -17,6 +21,8 @@ interface RecoveredRegistry {
   recoveredFromSession?: boolean;
   recoveredFromGateway?: number;
 }
+
+const INVENTORY_POLICY_PROBE_TIMEOUT_MS = 2_000;
 
 interface RegistryFallback {
   sandboxes: SandboxEntry[];
@@ -50,11 +56,8 @@ export function buildListCommandDeps(): ListSandboxesCommandDeps {
   // Cache the SSH process probe once for all sandboxes — avoids spawning ps
   // per sandbox row. The getSshProcesses() call is the expensive part (5s timeout).
   let cachedSshOutput: string | null | undefined;
-
-  // Resolving a sandbox ID costs one OpenShell call, so only pay it when the
-  // process list actually contains a proxied connection that needs one (#9316).
-  const resolveSandboxIdForSessions = (sshOutput: string, name: string): string | null =>
-    sshOutput.includes("--sandbox-id") ? (sessionDeps?.resolveSandboxId?.(name) ?? null) : null;
+  const inferenceRouteObserver =
+    createSynchronousCliOpenShellInferenceRouteObserver(captureOpenshell);
 
   const getCachedSshOutput = () => {
     if (cachedSshOutput === undefined && sessionDeps) {
@@ -77,23 +80,38 @@ export function buildListCommandDeps(): ListSandboxesCommandDeps {
         () => recoverRegistryEntries(),
         () => registry.listSandboxes(),
       ),
-    getLiveInference: () => {
+    getLiveInference: async () => {
       try {
-        return getLiveGatewayInference(captureOpenshell, {
-          timeout: OPENSHELL_PROBE_TIMEOUT_MS,
-        }).inference;
+        const result = await inferenceRouteObserver.observeInferenceRoute({
+          target: { kind: "named", gatewayName: getSelectedGatewayName() },
+        });
+        return result.ok && result.value.state === "configured" ? result.value.route : null;
       } catch {
         return null;
       }
     },
     loadLastSession: () => onboardSession.loadSession(),
+    getPolicyPresets: async (sandboxName) => {
+      try {
+        return await policy.getAppliedPresets(sandboxName, INVENTORY_POLICY_PROBE_TIMEOUT_MS);
+      } catch {
+        return [];
+      }
+    },
     getActiveSessionCount: sessionDeps
-      ? (name) => {
+      ? (sandbox) => {
           try {
             const sshOutput = getCachedSshOutput();
             if (sshOutput === null) return null;
-            return parseSshProcesses(sshOutput, name, resolveSandboxIdForSessions(sshOutput, name))
-              .length;
+            const gatewayName =
+              sandbox.gatewayName != null || sandbox.gatewayPort != null
+                ? getPersistedSandboxTargetGatewayName(sandbox)
+                : getSelectedGatewayName();
+            return getActiveSandboxSessions(
+              sandbox.name,
+              { ...sessionDeps, getSshProcesses: () => sshOutput },
+              gatewayName,
+            ).sessions.length;
           } catch {
             return null;
           }

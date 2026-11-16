@@ -6,12 +6,12 @@ import { assertCleanupSucceededOrAbsent } from "../fixtures/cleanup-resources.ts
 import { resultText } from "../fixtures/clients/command.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
 
-export type McpAdapter = "mcporter" | "hermes-config" | "deepagents-config";
+export type McpAdapter = "openclaw-config" | "hermes-config" | "deepagents-config";
 
 export const MCP_MUTATION_TIMEOUT_MS: Record<McpAdapter, number> = {
   "deepagents-config": 3 * 60_000,
   "hermes-config": 12 * 60_000,
-  mcporter: 3 * 60_000,
+  "openclaw-config": 3 * 60_000,
 };
 
 const MCP_BRIDGE_ALREADY_ABSENT =

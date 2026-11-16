@@ -40,12 +40,22 @@ function buildMenu(overrides: Partial<Parameters<typeof buildInferenceProviderMe
     winOllamaLoopbackOnly: false,
     ollamaInstallEntry: null,
     vllmEntries: [],
-    routedEnabled: false,
+
     ...overrides,
   });
 }
 
 describe("buildInferenceProviderMenu", () => {
+  it.each(["routed", "nvidia-router", "NVIDIA_ROUTER"])(
+    "rejects retired provider %s before host inspection or selection",
+    async (provider) => {
+      const deps = makeDeps({ getNonInteractiveProvider: () => provider });
+      await expect(createSetupNim(deps)(null)).rejects.toThrow("Model Router has been removed");
+      expect(deps.detectInferenceProviderHostState).not.toHaveBeenCalled();
+      expect(deps.handleRemoteProviderSelection).not.toHaveBeenCalled();
+    },
+  );
+
   it("returns the base remote providers in the existing prompt order", () => {
     const result = buildMenu();
 
@@ -62,7 +72,7 @@ describe("buildInferenceProviderMenu", () => {
     ]);
   });
 
-  it("adds local, routed, and agent-scoped providers after the base remote entries", () => {
+  it("adds local and agent-scoped providers after the base remote entries", () => {
     const result = buildMenu({
       agentProviderOptions: ["hermesProvider", "build"],
       experimental: true,
@@ -73,7 +83,6 @@ describe("buildInferenceProviderMenu", () => {
       isWsl: false,
       ollamaInstallEntry: { key: "install-ollama", label: "Install Ollama (Linux)" },
       vllmEntries: [{ key: "install-vllm", label: "Install vLLM (DGX Spark)" }],
-      routedEnabled: true,
     });
 
     expect(result.hermesProviderAvailable).toBe(true);
@@ -89,7 +98,6 @@ describe("buildInferenceProviderMenu", () => {
       "nim-local",
       "install-vllm",
       "install-ollama",
-      "routed",
       "hermesProvider",
       "llama-cpp",
     ]);
@@ -143,6 +151,7 @@ describe("buildInferenceProviderMenu", () => {
         hermesProviderAvailable: false,
         readRecordedProvider: () => null,
         readRecordedNimContainer: () => null,
+        readRecordedManagedLlamaCpp: () => false,
         readRecordedModel: () => null,
       }),
     ).toEqual({
@@ -159,6 +168,10 @@ describe("buildInferenceProviderMenu", () => {
         experimental: true,
         isNonInteractive: () => true,
         getNonInteractiveProvider: () => "nim-local",
+        discoverManagedLlamaCppSelections: () => ({
+          choices: [],
+          resolution: { kind: "rejected", reason: "No llama.cpp profile in this NIM fixture" },
+        }),
         detectInferenceProviderHostState: () =>
           makeHostState({
             gpuNimCapable: true,
@@ -192,7 +205,7 @@ describe("buildInferenceProviderMenu", () => {
     });
   });
 
-  it("offers Windows-host Ollama start when detected but not currently selected", () => {
+  it("offers Windows-host Ollama repair when a Docker-reachable route is unprotected", () => {
     const result = buildMenu({
       isWsl: true,
       hasWindowsOllama: true,
@@ -204,7 +217,7 @@ describe("buildInferenceProviderMenu", () => {
 
     expect(result.options.at(-2)).toEqual({
       key: "start-windows-ollama",
-      label: "Use Ollama on Windows host - running",
+      label: "Start Ollama on Windows host",
     });
   });
 
@@ -216,13 +229,29 @@ describe("buildInferenceProviderMenu", () => {
       ollamaHost: "host.docker.internal",
       hasWindowsOllama: true,
       isWindowsHostOllama: true,
+      windowsOllamaReachable: true,
     });
 
     expect(result.options.map((option) => option.key)).toContain("ollama");
     expect(result.options.map((option) => option.key)).not.toContain("start-windows-ollama");
   });
 
-  it("omits Windows-host install when Ollama is reachable but its executable is not detected (#7472)", () => {
+  it("offers a Windows-host restart when WSL reachability is not Docker reachability (#10100)", () => {
+    const result = buildMenu({
+      isWsl: true,
+      hasOllama: false,
+      ollamaRunning: true,
+      ollamaHost: "host.docker.internal",
+      hasWindowsOllama: true,
+      isWindowsHostOllama: true,
+      windowsOllamaReachable: false,
+      windowsHostStartLabel: () => "Restart Ollama on Windows host",
+    });
+
+    expect(result.options.map((option) => option.key)).toContain("start-windows-ollama");
+  });
+
+  it("offers restart without executable detection and omits Windows-host install (#7472)", () => {
     const result = buildMenu({
       isWsl: true,
       hasOllama: false,
@@ -233,6 +262,7 @@ describe("buildInferenceProviderMenu", () => {
     });
 
     expect(result.options.map((option) => option.key)).toContain("ollama");
+    expect(result.options.map((option) => option.key)).toContain("start-windows-ollama");
     expect(result.options.map((option) => option.key)).not.toContain("install-windows-ollama");
   });
 });

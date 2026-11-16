@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
+import type { ShippedManagedImageAgent } from "../../../src/lib/onboard/managed-image/contract.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
+import { assertManagedImageReceiptMatchesSelectedCohort } from "../fixtures/managed-image-receipt.ts";
 
 const EXACT_MAIN_OVERLAY_KEYS = new Set([
   "PATH",
@@ -10,10 +13,65 @@ const EXACT_MAIN_OVERLAY_KEYS = new Set([
   "NEMOCLAW_OPENSHELL_SANDBOX_BIN",
 ]);
 
+const MCP_BRIDGE_QUALIFICATION_ENV_KEYS = [
+  "E2E_MANAGED_IMAGE_REVISION",
+  "E2E_MANAGED_IMAGE_COHORT_RECEIPT",
+  "NEMOCLAW_E2E_EXPECTED_SHA",
+  "NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG",
+  "NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG_JSON",
+  "NEMOCLAW_E2E_MANAGED_IMAGE_REVISION",
+  "NEMOCLAW_RUN_LIVE_E2E",
+  "OPENSHELL_DOCKER_SUPERVISOR_IMAGE",
+] as const;
+
+const MCP_BRIDGE_ONBOARD_ARGS = [
+  "onboard",
+  "--non-interactive",
+  "--yes",
+  "--yes-i-accept-third-party-software",
+] as const;
+
+export function buildMcpBridgeOnboardArgs(environment: NodeJS.ProcessEnv = process.env): string[] {
+  const catalogPath = environment.NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG?.trim();
+  return catalogPath
+    ? [
+        "onboard",
+        "--temp-managed-runtime",
+        "--temp-managed-runtime-catalog",
+        catalogPath,
+        ...MCP_BRIDGE_ONBOARD_ARGS.slice(1),
+      ]
+    : [...MCP_BRIDGE_ONBOARD_ARGS];
+}
+
+export function assertMcpBridgeManagedImageReceipt(options: {
+  environment?: NodeJS.ProcessEnv;
+  expectedAgent: ShippedManagedImageAgent;
+  workload?: Record<string, unknown>;
+}): void {
+  const environment = options.environment ?? process.env;
+  const selectedRevision = environment.E2E_MANAGED_IMAGE_REVISION?.trim();
+  const exactCandidateCatalog =
+    environment.NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG?.trim() ||
+    environment.NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG_JSON?.trim();
+  if (!selectedRevision && !exactCandidateCatalog) return;
+
+  const expectedRevision = selectedRevision || environment.NEMOCLAW_E2E_EXPECTED_SHA?.trim() || "";
+  if (!/^[0-9a-f]{40}$/u.test(expectedRevision)) {
+    throw new Error("managed-image MCP qualification requires an exact cohort revision");
+  }
+  assertManagedImageReceiptMatchesSelectedCohort({
+    environment,
+    expectedAgent: options.expectedAgent,
+    workload: options.workload,
+  });
+}
+
 export function buildMcpBridgeExactMainEnv(options: {
   baseEnv?: NodeJS.ProcessEnv;
   envOverlay?: NodeJS.ProcessEnv;
 }): NodeJS.ProcessEnv {
+  const baseEnv = options.baseEnv ?? process.env;
   const envOverlay = options.envOverlay ?? {};
   for (const key of Object.keys(envOverlay)) {
     if (!EXACT_MAIN_OVERLAY_KEYS.has(key)) {
@@ -21,8 +79,14 @@ export function buildMcpBridgeExactMainEnv(options: {
     }
   }
 
+  const qualificationEnv = Object.fromEntries(
+    MCP_BRIDGE_QUALIFICATION_ENV_KEYS.flatMap((key) =>
+      baseEnv[key] === undefined ? [] : [[key, baseEnv[key]]],
+    ),
+  );
   return {
-    ...buildAvailabilityProbeEnv(options.baseEnv),
+    ...buildAvailabilityProbeEnv(baseEnv),
+    ...qualificationEnv,
     ...envOverlay,
   };
 }
@@ -52,6 +116,9 @@ export function buildMcpBridgeOnboardEnv(options: {
     NEMOCLAW_PROVIDER: "custom",
     NEMOCLAW_SANDBOX_NAME: options.sandboxName,
     NEMOCLAW_RECREATE_SANDBOX: "1",
+    ...(options.agent === "langchain-deepagents-code"
+      ? { NEMOCLAW_TOOL_DISCLOSURE: "direct" }
+      : {}),
   };
 }
 
@@ -61,4 +128,18 @@ export function requireMcpBridgeTlsCaCert(env: NodeJS.ProcessEnv = process.env):
     throw new Error("NEMOCLAW_MCP_TLS_CA_CERT is required for routed-private MCP validation");
   }
   return corporateCaBundle;
+}
+
+export function assertMcpBridgeManagedRegistryReceipt(
+  sandboxName: string,
+  agent: ShippedManagedImageAgent,
+  registryFile: string,
+): void {
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8")) as {
+    sandboxes?: Record<string, { workload?: Record<string, unknown> }>;
+  };
+  assertMcpBridgeManagedImageReceipt({
+    expectedAgent: agent,
+    workload: registry.sandboxes?.[sandboxName]?.workload,
+  });
 }

@@ -1,14 +1,245 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from "vitest";
+import { switchyardBindingFixture } from "../../../test/helpers/hermes-switchyard";
+
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const portableMocks = vi.hoisted(() => ({
+  assertUnavailable: vi.fn(),
+}));
+
+vi.mock("../onboard/experimental/portable-agent-lifecycle", async (importOriginal) => ({
+  ...(await importOriginal()),
+  assertHermesPortableCommandUnavailable: portableMocks.assertUnavailable,
+}));
 import { HERMES_PROXY_REWRITE_SENTINEL } from "../hermes-managed-route";
+import {
+  createHermesSwitchyardRoutingIntent,
+  HERMES_SWITCHYARD_ROUTE_ID,
+} from "../hermes-switchyard-routing";
+import { NVIDIA_HOSTED_NATIVE_PROVIDER } from "../inference/native-nvidia/contract";
+import {
+  encodeManagedStartupProfile,
+  type ManagedStartupHermesConfig,
+} from "../onboard/managed-startup/profile";
 import type { ConfigObject } from "../security/credential-filter";
 import { runInferenceSet } from "./inference-set";
-import { baseSession, createDeps, HERMES_TARGET } from "./inference-set.test-support";
+import { managedStartupE2eProfile } from "../../../scripts/checks/generate-managed-startup-profile-fixture.mts";
+import { baseSession, createDeps, HERMES_TARGET } from "../../../test/helpers/inference-set";
 
 describe("runInferenceSet Hermes routing", () => {
-  it("updates OpenShell, Hermes config.yaml, registry, and the matching onboard session", async () => {
+  beforeEach(() => {
+    portableMocks.assertUnavailable.mockReset();
+  });
+
+  it("rejects an unmatched model before a provider request while Switchyard is active (#13862)", async () => {
+    const baseProfile = managedStartupE2eProfile("hermes");
+    expect(baseProfile.agentConfig.agent).toBe("hermes");
+    const agentConfig = baseProfile.agentConfig as ManagedStartupHermesConfig;
+    const routing = createHermesSwitchyardRoutingIntent({
+      efficient: { provider: "nvidia-prod", model: "nvidia/efficient-model" },
+      capable: { provider: "openai-api", model: "openai/capable-model" },
+    });
+    const encodedProfile = encodeManagedStartupProfile({
+      ...baseProfile,
+      agentConfig: {
+        ...agentConfig,
+        switchyardRouting: routing,
+        switchyardBindings: switchyardBindingFixture(routing),
+      },
+    });
+    const config: ConfigObject = { model: { default: HERMES_SWITCHYARD_ROUTE_ID } };
+    const deps = createDeps({
+      config,
+      entry: {
+        name: "hermes",
+        agent: "hermes",
+        provider: "nvidia-prod",
+        model: HERMES_SWITCHYARD_ROUTE_ID,
+        workload: {
+          schemaVersion: 1,
+          kind: "managed-image",
+          reference: `ghcr.io/nvidia/nemoclaw/hermes-sandbox@sha256:${"1".repeat(64)}`,
+          release: "v0.1.0",
+          sourceRevision: "2".repeat(40),
+          sourceCohort: "ghrun-1-1",
+          capabilityContractVersion: 1,
+          startupProfileContractVersion: 1,
+          encodedProfile,
+          startupProfileSha256: "3".repeat(64),
+          credentialProxyReplayRequired: true,
+          shared: true,
+        },
+      },
+      defaultSandbox: "hermes",
+      target: HERMES_TARGET,
+    });
+    const getProvider = vi.spyOn(deps.providerAdapter, "getProvider");
+    const attachProvider = vi.spyOn(deps.providerAdapter, "attachProvider");
+
+    await expect(
+      runInferenceSet(
+        {
+          provider: "openai-api",
+          model: "unmatched-model",
+          sandboxName: "hermes",
+        },
+        deps,
+      ),
+    ).rejects.toThrow("adaptive Switchyard routing is enabled");
+
+    expect(config).toEqual({ model: { default: HERMES_SWITCHYARD_ROUTE_ID } });
+    expect(deps.calls.prepareRunOpenshell).not.toHaveBeenCalled();
+    expect(deps.calls.captureOpenshell).not.toHaveBeenCalled();
+    expect(getProvider).not.toHaveBeenCalled();
+    expect(attachProvider).not.toHaveBeenCalled();
+    expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
+    expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
+  });
+
+  it("reads the attached native handle before publishing a Hermes switch", async () => {
+    const config: ConfigObject = { model: { default: "local-model", provider: "custom" } };
+    const deps = createDeps({
+      config,
+      entry: { name: "hermes", agent: "hermes", provider: "vllm-local", model: "local-model" },
+      defaultSandbox: "hermes",
+      target: HERMES_TARGET,
+      session: baseSession({ agent: "hermes", sandboxName: "hermes" }),
+    });
+    await runInferenceSet(
+      {
+        provider: "nvidia-prod",
+        model: "nvidia/test-model",
+        sandboxName: "hermes",
+        noVerify: true,
+      },
+      deps,
+    );
+    expect(deps.calls.readNativeNvidiaCredentialHandle).toHaveBeenCalledWith("hermes", "nemoclaw");
+    expect(config.model).toMatchObject({
+      api_key: "openshell:resolve:env:v1_NVIDIA_INFERENCE_API_KEY",
+    });
+    expect(deps.calls.writeSandboxConfig).toHaveBeenCalledOnce();
+  });
+
+  it("leaves the Hermes config unchanged when the attached handle is unavailable", async () => {
+    const config: ConfigObject = { model: { default: "local-model", provider: "custom" } };
+    const deps = createDeps({
+      config,
+      entry: { name: "hermes", agent: "hermes", provider: "vllm-local", model: "local-model" },
+      defaultSandbox: "hermes",
+      target: HERMES_TARGET,
+      session: baseSession({ agent: "hermes", sandboxName: "hermes" }),
+      readNativeNvidiaCredentialHandle: async () => {
+        throw new Error("provider-bound handle unavailable");
+      },
+    });
+    const attachProvider = vi.spyOn(deps.providerAdapter, "attachProvider");
+    const detachProvider = vi.spyOn(deps.providerAdapter, "detachProvider");
+    await expect(
+      runInferenceSet(
+        {
+          provider: "nvidia-prod",
+          model: "nvidia/test-model",
+          sandboxName: "hermes",
+          noVerify: true,
+        },
+        deps,
+      ),
+    ).rejects.toThrow("provider-bound handle unavailable");
+    expect(config.model).toEqual({ default: "local-model", provider: "custom" });
+    expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
+    expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
+    expect(attachProvider).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sandboxName: "hermes",
+        providerName: NVIDIA_HOSTED_NATIVE_PROVIDER,
+      }),
+    );
+    expect(detachProvider).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sandboxName: "hermes",
+        providerName: NVIDIA_HOSTED_NATIVE_PROVIDER,
+      }),
+    );
+    await expect(
+      deps.providerAdapter.listProviderAttachments({
+        target: { kind: "named", gatewayName: "nemoclaw" },
+        sandboxName: "hermes",
+      }),
+    ).resolves.toEqual({ ok: true, value: { names: [] } });
+  });
+
+  it("rejects schema-5 before OpenShell or registry mutation (#9203)", async () => {
+    portableMocks.assertUnavailable.mockImplementation(() => {
+      throw new Error("schema-5 rejected");
+    });
+    const deps = createDeps({
+      config: {},
+      entry: {
+        name: "hermes",
+        agent: "hermes",
+        provider: "hermes-provider",
+        model: "moonshotai/kimi-k2.6",
+      },
+      defaultSandbox: "hermes",
+      target: HERMES_TARGET,
+    });
+
+    await expect(
+      runInferenceSet(
+        {
+          provider: "hermes-provider",
+          model: "openai/gpt-5.4-mini",
+          sandboxName: "hermes",
+          noVerify: true,
+        },
+        deps,
+      ),
+    ).rejects.toThrow("schema-5 rejected");
+
+    expect(deps.calls.prepareRunOpenshell).not.toHaveBeenCalled();
+    expect(deps.calls.captureOpenshell).not.toHaveBeenCalled();
+    expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
+  });
+
+  it("rechecks schema-5 after the lifecycle lock is acquired (#9203)", async () => {
+    portableMocks.assertUnavailable
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => {
+        throw new Error("schema-5 appeared");
+      });
+    const deps = createDeps({
+      config: {},
+      entry: {
+        name: "hermes",
+        agent: "hermes",
+        provider: "hermes-provider",
+        model: "moonshotai/kimi-k2.6",
+      },
+      defaultSandbox: "hermes",
+      target: HERMES_TARGET,
+    });
+
+    await expect(
+      runInferenceSet(
+        {
+          provider: "hermes-provider",
+          model: "openai/gpt-5.4-mini",
+          sandboxName: "hermes",
+          noVerify: true,
+        },
+        deps,
+      ),
+    ).rejects.toThrow("schema-5 appeared");
+
+    expect(deps.calls.prepareRunOpenshell).toHaveBeenCalledOnce();
+    expect(deps.calls.captureOpenshell).not.toHaveBeenCalled();
+    expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
+  });
+
+  it("updates OpenShell, Hermes config.yaml, and the registry without rewriting onboarding", async () => {
     const config: ConfigObject = {
       model: {
         default: "moonshotai/kimi-k2.6",
@@ -31,6 +262,7 @@ describe("runInferenceSet Hermes routing", () => {
       contextWindow: 128_000,
     });
 
+    vi.spyOn(deps.providerAdapter, "attachProvider");
     const result = await runInferenceSet(
       {
         provider: "hermes-provider",
@@ -41,19 +273,12 @@ describe("runInferenceSet Hermes routing", () => {
       deps,
     );
 
-    expect(deps.calls.captureOpenshell).toHaveBeenCalledWith(
-      [
-        "inference",
-        "set",
-        "-g",
-        "nemoclaw",
-        "--provider",
-        "hermes-provider",
-        "--model",
-        "openai/gpt-5.4-mini",
-        "--no-verify",
-      ],
-      { ignoreError: true, includeStreams: true, maxBuffer: 64 * 1024 },
+    expect(deps.calls.captureOpenshell).not.toHaveBeenCalled();
+    expect(deps.providerAdapter.attachProvider).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sandboxName: "hermes",
+        providerName: "nemoclaw-hermes-provider-v1",
+      }),
     );
     expect(config).toEqual({
       _nemoclaw_upstream: {
@@ -64,23 +289,23 @@ describe("runInferenceSet Hermes routing", () => {
       custom_providers: [
         {
           name: "hermes-provider",
-          base_url: "https://inference.local/v1",
-          api_key: HERMES_PROXY_REWRITE_SENTINEL,
+          base_url: "https://inference-api.nousresearch.com/v1",
+          api_key: "${OPENAI_API_KEY}",
           discover_models: true,
         },
       ],
       model: {
         default: "openai/gpt-5.4-mini",
         provider: "custom",
-        base_url: "https://inference.local/v1",
-        api_key: HERMES_PROXY_REWRITE_SENTINEL,
+        base_url: "https://inference-api.nousresearch.com/v1",
+        api_key: "${OPENAI_API_KEY}",
         context_length: 128_000,
       },
       providers: {
         "hermes-provider": {
           name: "hermes-provider",
-          api: "https://inference.local/v1",
-          api_key: HERMES_PROXY_REWRITE_SENTINEL,
+          api: "https://inference-api.nousresearch.com/v1",
+          api_key: "${OPENAI_API_KEY}",
           default_model: "openai/gpt-5.4-mini",
           discover_models: true,
         },
@@ -92,7 +317,6 @@ describe("runInferenceSet Hermes routing", () => {
     expect(deps.calls.writeSandboxConfig.mock.calls[0][1].configPath).toBe(
       "/sandbox/.hermes/config.yaml",
     );
-    expect(deps.calls.recomputeSandboxConfigHash).toHaveBeenCalledWith("hermes", HERMES_TARGET);
     expect(deps.calls.updateSandbox).toHaveBeenCalledWith(
       "hermes",
       expect.objectContaining({
@@ -101,16 +325,17 @@ describe("runInferenceSet Hermes routing", () => {
       }),
     );
     expect(deps.getSession()).toMatchObject({
-      provider: "hermes-provider",
-      model: "openai/gpt-5.4-mini",
+      provider: "nvidia-prod",
+      model: "moonshotai/kimi-k2.6",
       endpointUrl: "https://inference.local/v1",
-      preferredInferenceApi: "openai-completions",
+      preferredInferenceApi: null,
     });
     expect(deps.calls.appendAuditEntry).toHaveBeenCalledWith(
       expect.objectContaining({
         action: "inference_set",
         sandbox: "hermes",
-        reason: "inference set hermes:hermes-provider:openai/gpt-5.4-mini",
+        reason:
+          "inference set hermes:hermes-provider:openai/gpt-5.4-mini (gateway restart completed)",
       }),
     );
     expect(result).toMatchObject({
@@ -120,12 +345,12 @@ describe("runInferenceSet Hermes routing", () => {
       primaryModelRef: "inference/openai/gpt-5.4-mini",
       providerKey: "inference",
       configChanged: true,
-      sessionUpdated: true,
     });
-    expect(deps.calls.restartSandboxGateway).not.toHaveBeenCalled();
+    expect(deps.calls.restartSandboxGateway).toHaveBeenCalledExactlyOnceWith("hermes", "nemoclaw");
     expect(deps.calls.resolveContextWindowForModel).toHaveBeenCalledWith(
       "hermes-provider",
       "openai/gpt-5.4-mini",
+      8080,
     );
   });
 
@@ -167,46 +392,6 @@ describe("runInferenceSet Hermes routing", () => {
     expect(logs).toContain("omitting context_length so Hermes can discover it");
   });
 
-  it("re-seeds the isolated Hermes dashboard config after an in-place switch (#6893)", async () => {
-    const config: ConfigObject = {
-      model: {
-        default: "moonshotai/kimi-k2.6",
-        provider: "custom",
-        base_url: "https://inference.local/v1",
-      },
-    };
-    const deps = createDeps({
-      config,
-      entry: {
-        name: "hermes",
-        agent: "hermes",
-        provider: "hermes-provider",
-        model: "moonshotai/kimi-k2.6",
-      },
-      defaultSandbox: "hermes",
-      target: HERMES_TARGET,
-      session: baseSession({ agent: "hermes", sandboxName: "hermes" }),
-    });
-
-    await runInferenceSet(
-      {
-        provider: "hermes-provider",
-        model: "openai/gpt-5.4-mini",
-        sandboxName: "hermes",
-        noVerify: true,
-      },
-      deps,
-    );
-
-    // The dashboard-home config only re-mirrors the gateway model routing at
-    // startup, so the in-place switch must re-seed it or Dashboard Chat stays on
-    // the previous model. It must run after the gateway config was written.
-    expect(deps.calls.seedHermesDashboardConfig).toHaveBeenCalledWith("hermes", HERMES_TARGET);
-    const writeOrder = deps.calls.writeSandboxConfig.mock.invocationCallOrder[0];
-    const seedOrder = deps.calls.seedHermesDashboardConfig.mock.invocationCallOrder[0];
-    expect(seedOrder).toBeGreaterThan(writeOrder);
-  });
-
   it("fails after commit when the in-sandbox config write fails (#7083)", async () => {
     const config: ConfigObject = {
       model: { default: "moonshotai/kimi-k2.6", provider: "custom" },
@@ -240,12 +425,13 @@ describe("runInferenceSet Hermes routing", () => {
     ).rejects.toMatchObject({
       name: "InferenceSetError",
       exitCode: 1,
-      message: expect.stringMatching(/Hermes inference route synchronization did not complete/),
+      message: expect.stringMatching(
+        /Hermes inference route synchronization did not complete[\s\S]*preceding configuration warning[\s\S]*trusted backup[\s\S]*fresh Hermes sandbox[\s\S]*Rebuild preserves the native home and may retain the mismatch/u,
+      ),
     });
 
-    // A failed in-sandbox Hermes config write leaves the old config in place; re-seeding the
-    // dashboard from it would be pointless. The host route remains committed, but
-    // the command must fail so automation cannot accept a partial switch.
+    // The host route remains committed, but the command must fail so automation
+    // cannot accept a partial switch.
     expect(deps.calls.updateSandbox).toHaveBeenCalledWith(
       "hermes",
       expect.objectContaining({
@@ -253,7 +439,11 @@ describe("runInferenceSet Hermes routing", () => {
         model: "openai/gpt-5.4-mini",
       }),
     );
-    expect(deps.calls.seedHermesDashboardConfig).not.toHaveBeenCalled();
+    expect(
+      deps.calls.log.mock.calls.some((call) =>
+        String(call[0]).includes("Run 'nemoclaw hermes rebuild'"),
+      ),
+    ).toBe(false);
   });
 
   it("fails after commit when the config hash refresh fails (#7083)", async () => {
@@ -300,97 +490,10 @@ describe("runInferenceSet Hermes routing", () => {
         model: "openai/gpt-5.4-mini",
       }),
     );
-    expect(deps.calls.seedHermesDashboardConfig).not.toHaveBeenCalled();
     const logs = deps.calls.log.mock.calls.map((call) => String(call[0]));
     expect(logs.some((line) => line.includes("failed to refresh its integrity hash"))).toBe(true);
-    expect(logs.some((line) => line.includes("rebuild"))).toBe(true);
+    expect(logs.some((line) => line.includes("Run 'nemoclaw hermes rebuild'"))).toBe(false);
     expect(logs.some((line) => line.includes("Inference route synced"))).toBe(false);
-  });
-
-  it("fails after commit when the dashboard does not converge (#6893)", async () => {
-    const config: ConfigObject = {
-      model: {
-        default: "moonshotai/kimi-k2.6",
-        provider: "custom",
-        base_url: "https://inference.local/v1",
-      },
-    };
-    const deps = createDeps({
-      config,
-      entry: {
-        name: "hermes",
-        agent: "hermes",
-        provider: "hermes-provider",
-        model: "moonshotai/kimi-k2.6",
-      },
-      defaultSandbox: "hermes",
-      target: HERMES_TARGET,
-      session: baseSession({ agent: "hermes", sandboxName: "hermes" }),
-      seedHermesDashboardConfigResult: "failed",
-    });
-
-    await expect(
-      runInferenceSet(
-        {
-          provider: "hermes-provider",
-          model: "openai/gpt-5.4-mini",
-          sandboxName: "hermes",
-          noVerify: true,
-        },
-        deps,
-      ),
-    ).rejects.toMatchObject({
-      name: "InferenceSetError",
-      exitCode: 1,
-      message: expect.stringMatching(/committed route was not rolled back.*Restart the sandbox/u),
-    });
-
-    // The route, main config, durable session, and audit are already committed,
-    // but the command must fail instead of claiming complete convergence.
-    expect(deps.getSession()?.model).toBe("openai/gpt-5.4-mini");
-    expect(deps.calls.appendAuditEntry).toHaveBeenCalledOnce();
-    const logs = deps.calls.log.mock.calls.map((c) => String(c[0]));
-    expect(logs.some((l) => l.includes("Inference route synced"))).toBe(false);
-    expect(logs.some((l) => l.includes("could not refresh the dashboard"))).toBe(true);
-  });
-
-  it("still reports synced when the dashboard profile is absent (Dashboard disabled) (#6893)", async () => {
-    const config: ConfigObject = {
-      model: {
-        default: "moonshotai/kimi-k2.6",
-        provider: "custom",
-        base_url: "https://inference.local/v1",
-      },
-    };
-    const deps = createDeps({
-      config,
-      entry: {
-        name: "hermes",
-        agent: "hermes",
-        provider: "hermes-provider",
-        model: "moonshotai/kimi-k2.6",
-      },
-      defaultSandbox: "hermes",
-      target: HERMES_TARGET,
-      session: baseSession({ agent: "hermes", sandboxName: "hermes" }),
-      seedHermesDashboardConfigResult: "absent",
-    });
-
-    await runInferenceSet(
-      {
-        provider: "hermes-provider",
-        model: "openai/gpt-5.4-mini",
-        sandboxName: "hermes",
-        noVerify: true,
-      },
-      deps,
-    );
-
-    // Nothing to converge — the switch is fully applied, so it still reports synced
-    // and does not warn.
-    const logs = deps.calls.log.mock.calls.map((c) => String(c[0]));
-    expect(logs.some((l) => l.includes("Inference route synced"))).toBe(true);
-    expect(logs.some((l) => l.includes("could not refresh the dashboard"))).toBe(false);
   });
 
   it("keeps Hermes custom Anthropic switches off the managed Anthropic SSE frontend (#6289)", async () => {
@@ -466,11 +569,6 @@ describe("runInferenceSet Hermes routing", () => {
         preferredInferenceApi: "openai-completions",
       }),
     ]);
-    expect(deps.getSession()).toMatchObject({
-      provider: "compatible-anthropic-endpoint",
-      model: "claude-sonnet-proxy",
-      preferredInferenceApi: "openai-completions",
-    });
     expect(result).toMatchObject({
       providerKey: "inference",
       primaryModelRef: "inference/claude-sonnet-proxy",

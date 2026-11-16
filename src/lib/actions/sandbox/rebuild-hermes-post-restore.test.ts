@@ -1,14 +1,25 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as projection from "../../onboard/hermes/initial-inference-route";
+import { patchHermesInferenceConfig } from "../inference-set";
+import {
+  applyHermesManagedRoute,
+  refreshHermesNativeLocalCredential,
+} from "../../hermes-managed-route";
+import { NVIDIA_INFERENCE_PLACEHOLDER } from "../../inference-credential";
+import { NVIDIA_HOSTED_NATIVE_ENDPOINT } from "../../inference/native-nvidia/contract";
+import type { ConfigObject } from "../../security/credential-filter";
+import * as registry from "../../state/registry";
+import * as capture from "../../adapters/openshell/sanitized-capture";
+import { fingerprintOpenShellSandboxId } from "../../adapters/openshell/sandbox-identity";
 import {
   createRebuildFlowHarness,
   installRebuildFlowTestHooks,
-} from "../../../../test/helpers/rebuild-flow-dcode-harness";
+} from "../../../../test/helpers/rebuild-flow-generic-harness";
 import {
-  ensureHermesGatewayAfterStateRestore,
-  ensureHermesGatewayAfterStateRestoreForCronGate,
+  refreshRestoredHermesInferenceRoute,
   restartHermesGatewayAfterStateRestore,
   verifyHermesGatewayAfterStateRestore,
   verifyHermesGatewayAfterStateRestoreForCronGate,
@@ -20,80 +31,81 @@ const RESTART_SUCCEEDED = {
   healthPassed: true,
   forwardRecovered: false,
 } as const;
-const RESTART_FAILED = {
+
+const RESTART_REFUSED = {
+  ok: false,
+  failureLayer: "native agent command",
+  detail: "native Hermes restart failed",
+} as const;
+
+const RESTART_HEALTH_TIMEOUT = {
   ok: false,
   failureLayer: "health timeout",
-  detail: "gateway did not become healthy",
-} as const;
-const RESTARTED_WITH_MCP_MISMATCH = {
-  ok: false,
-  failureLayer: "MCP reconciliation refusal",
-  detail: "Hermes MCP config does not match persisted managed intent",
-  restarted: true,
-  healthPassed: true,
-} as const;
-const MCP_REFUSED_BEFORE_RESTART = {
-  ok: false,
-  failureLayer: "MCP reconciliation refusal",
-  detail: "supervisor refused the restart before replacing the gateway",
+  detail: "gateway process restarted but health did not pass before timeout",
 } as const;
 
 describe("binding the Hermes gateway to restored state", () => {
-  it("restarts the gateway before reading its health (#8184)", () => {
-    const order: string[] = [];
-    const state = ensureHermesGatewayAfterStateRestore("alpha", "hermes", {
-      restartSandboxGateway: () => {
-        order.push("restart");
-        return RESTART_SUCCEEDED;
-      },
-      checkAndRecoverSandboxProcesses: () => {
-        order.push("check");
-        return { checked: true, wasRunning: true, recovered: false };
-      },
+  it("keeps native restart and health operations pinned to the selected OpenShell runtime", async () => {
+    const runtimeSelection = {
+      gatewayName: "nemoclaw-19080",
+      workspace: "default",
+      localTlsDir: "/authority/tls",
+    };
+    const restartSandboxGateway = vi.fn(async () => RESTART_SUCCEEDED);
+    const checkAndRecoverSandboxProcesses = vi.fn(async () => ({
+      checked: true,
+      wasRunning: true,
+      recovered: false,
+    }));
+
+    const restartState = await restartHermesGatewayAfterStateRestore("alpha", "hermes", {
+      restartSandboxGateway,
+      runtimeSelection,
     });
-
-    expect(state).toBe("healthy");
-    expect(order).toEqual(["restart", "check"]);
-  });
-
-  // The bug this replaces: the gateway read its durable state at startup, the
-  // restore replaced that state afterwards, and a live process satisfied the
-  // old liveness check while still serving what it read before the restore.
-  it("refuses a gateway that stayed up through a failed restart (#8184)", () => {
-    const state = ensureHermesGatewayAfterStateRestore("alpha", "hermes", {
-      restartSandboxGateway: () => RESTART_FAILED,
-      checkAndRecoverSandboxProcesses: () => ({
-        checked: true,
-        wasRunning: true,
-        recovered: false,
-      }),
-    });
-
-    expect(state).toBe("unverified");
-  });
-
-  it("accepts a gateway the recovery check replaced after a failed restart (#8184)", () => {
-    const state = ensureHermesGatewayAfterStateRestore("alpha", "hermes", {
-      restartSandboxGateway: () => RESTART_FAILED,
-      checkAndRecoverSandboxProcesses: () => ({
-        checked: true,
-        wasRunning: false,
-        recovered: true,
-      }),
-    });
-
-    expect(state).toBe("recovered");
-  });
-
-  it("keeps restart evidence while rebuild restores the managed MCP projection (#8671)", () => {
-    const restartState = restartHermesGatewayAfterStateRestore("alpha", "hermes", {
-      restartSandboxGateway: () => RESTARTED_WITH_MCP_MISMATCH,
-    });
-
     expect(restartState).toBe("restarted");
+    expect(restartSandboxGateway).toHaveBeenCalledExactlyOnceWith("alpha", {
+      quiet: true,
+      runtimeSelection,
+    });
+
     expect(
-      verifyHermesGatewayAfterStateRestore("alpha", "hermes", restartState, {
-        checkAndRecoverSandboxProcesses: () => ({
+      await verifyHermesGatewayAfterStateRestore("alpha", "hermes", restartState, {
+        checkAndRecoverSandboxProcesses,
+        runtimeSelection,
+      }),
+    ).toBe("healthy");
+    expect(checkAndRecoverSandboxProcesses).toHaveBeenCalledExactlyOnceWith("alpha", {
+      quiet: true,
+      runtimeSelection,
+    });
+  });
+
+  it("preserves a config-integrity refusal before gateway replacement (#8671)", async () => {
+    const restartState = await restartHermesGatewayAfterStateRestore("alpha", "hermes", {
+      restartSandboxGateway: async () => RESTART_REFUSED,
+    });
+
+    expect(restartState).toBe("restart-failed");
+    expect(
+      await verifyHermesGatewayAfterStateRestore("alpha", "hermes", restartState, {
+        checkAndRecoverSandboxProcesses: async () => ({
+          checked: true,
+          wasRunning: true,
+          recovered: false,
+        }),
+      }),
+    ).toBe("unverified");
+  });
+
+  it("accepts a restarted Hermes gateway that becomes healthy just after the restart wait", async () => {
+    const restartState = await restartHermesGatewayAfterStateRestore("alpha", "hermes", {
+      restartSandboxGateway: async () => RESTART_HEALTH_TIMEOUT,
+    });
+
+    expect(restartState).toBe("restart-health-timeout");
+    expect(
+      await verifyHermesGatewayAfterStateRestore("alpha", "hermes", restartState, {
+        checkAndRecoverSandboxProcesses: async () => ({
           checked: true,
           wasRunning: true,
           recovered: false,
@@ -102,164 +114,70 @@ describe("binding the Hermes gateway to restored state", () => {
     ).toBe("healthy");
   });
 
-  it("rejects managed MCP drift that remains after rebuild restoration (#8671)", () => {
-    const restartState = restartHermesGatewayAfterStateRestore("alpha", "hermes", {
-      restartSandboxGateway: () => RESTARTED_WITH_MCP_MISMATCH,
+  it("does not accept a timed-out Hermes restart without a healthy replacement", async () => {
+    const restartState = await restartHermesGatewayAfterStateRestore("alpha", "hermes", {
+      restartSandboxGateway: async () => RESTART_HEALTH_TIMEOUT,
     });
 
     expect(
-      verifyHermesGatewayAfterStateRestore("alpha", "hermes", restartState, {
-        checkAndRecoverSandboxProcesses: () => ({
+      await verifyHermesGatewayAfterStateRestore("alpha", "hermes", restartState, {
+        checkAndRecoverSandboxProcesses: async () => ({
           checked: true,
-          wasRunning: true,
-          recovered: false,
-          mcpReconciliationRefused: true,
-        }),
-      }),
-    ).toBe("unverified");
-  });
-
-  it("preserves an MCP refusal before gateway replacement (#8671)", () => {
-    const restartState = restartHermesGatewayAfterStateRestore("alpha", "hermes", {
-      restartSandboxGateway: () => MCP_REFUSED_BEFORE_RESTART,
-    });
-
-    expect(restartState).toBe("restart-failed");
-    expect(
-      verifyHermesGatewayAfterStateRestore("alpha", "hermes", restartState, {
-        checkAndRecoverSandboxProcesses: () => ({
-          checked: true,
-          wasRunning: true,
+          wasRunning: false,
           recovered: false,
         }),
       }),
     ).toBe("unverified");
   });
 
-  it("leaves a non-Hermes rebuild without a gateway restart (#8184)", () => {
-    const restartSandboxGateway = vi.fn(() => RESTART_SUCCEEDED);
-    const checkAndRecoverSandboxProcesses = vi.fn(() => ({
-      checked: true,
-      wasRunning: true,
-      recovered: false,
-    }));
-
-    const state = ensureHermesGatewayAfterStateRestore("alpha", "openclaw", {
-      restartSandboxGateway,
-      checkAndRecoverSandboxProcesses,
-    });
-
-    expect(state).toBe("not-applicable");
-    expect(restartSandboxGateway).not.toHaveBeenCalled();
-    expect(checkAndRecoverSandboxProcesses).not.toHaveBeenCalled();
-  });
-
-  it("binds managed health to one observed replacement identity (#8472)", () => {
-    const order: string[] = [];
-    const replacement = { pid: 77, start_time: 903, drain_token: "restore-token" };
-    const verification = ensureHermesGatewayAfterStateRestoreForCronGate(
-      "alpha",
-      "hermes",
-      { pid: 41, start_time: 902, drain_token: "restore-token" },
-      {
-        restartSandboxGateway: () => {
-          order.push("restart");
-          return RESTART_SUCCEEDED;
-        },
-        observeHermesCronReplacement: () => {
-          order.push("observe");
-          return replacement;
-        },
-        checkAndRecoverSandboxProcesses: () => {
-          order.push("health");
-          return { checked: true, wasRunning: true, recovered: false };
-        },
-      },
-    );
-
-    expect(verification).toEqual({ state: "healthy", replacementIdentity: replacement });
-    expect(order).toEqual(["restart", "observe", "health", "observe"]);
-  });
-
-  it("binds a recovered cron-gated gateway to its observed replacement identity (#8472)", () => {
-    const replacement = { pid: 77, start_time: 903, drain_token: "restore-token" };
+  it("verifies the final cron-bound gateway without restarting after MCP restoration (#8472)", async () => {
+    const original = { pid: 41, start_time: 902, drain_token: "restore-token" };
+    const replacement = {
+      pid: 77,
+      start_time: 903,
+      drain_token: "restore-token",
+    };
+    const restartSandboxGateway = vi.fn(async () => RESTART_SUCCEEDED);
     const observeHermesCronReplacement = vi.fn(() => replacement);
-    const checkAndRecoverSandboxProcesses = vi
-      .fn()
-      .mockReturnValueOnce({ checked: true, wasRunning: false, recovered: true })
-      .mockReturnValueOnce({ checked: true, wasRunning: true, recovered: false });
 
     expect(
-      ensureHermesGatewayAfterStateRestoreForCronGate(
+      await verifyHermesGatewayAfterStateRestoreForCronGate(
         "alpha",
         "hermes",
-        { pid: 41, start_time: 902, drain_token: "restore-token" },
+        "restarted",
+        original,
         {
-          restartSandboxGateway: () => RESTART_FAILED,
+          restartSandboxGateway,
           observeHermesCronReplacement,
-          checkAndRecoverSandboxProcesses,
-        },
-      ),
-    ).toEqual({ state: "recovered", replacementIdentity: replacement });
-    expect(checkAndRecoverSandboxProcesses).toHaveBeenCalledTimes(2);
-    expect(observeHermesCronReplacement).toHaveBeenCalledTimes(3);
-  });
-
-  it("fails closed when another gateway replaces the process during health verification (#8472)", () => {
-    const observeHermesCronReplacement = vi
-      .fn()
-      .mockReturnValueOnce({ pid: 77, start_time: 903, drain_token: "restore-token" })
-      .mockReturnValueOnce({ pid: 88, start_time: 904, drain_token: "restore-token" });
-
-    expect(
-      ensureHermesGatewayAfterStateRestoreForCronGate(
-        "alpha",
-        "hermes",
-        { pid: 41, start_time: 902, drain_token: "restore-token" },
-        {
-          restartSandboxGateway: () => RESTART_SUCCEEDED,
-          observeHermesCronReplacement,
-          checkAndRecoverSandboxProcesses: () => ({
+          checkAndRecoverSandboxProcesses: async () => ({
             checked: true,
             wasRunning: true,
             recovered: false,
           }),
         },
       ),
-    ).toEqual({ state: "unverified" });
-    expect(observeHermesCronReplacement).toHaveBeenCalledTimes(2);
-  });
-
-  it("verifies the final cron-bound gateway without restarting after MCP restoration (#8472)", () => {
-    const original = { pid: 41, start_time: 902, drain_token: "restore-token" };
-    const replacement = { pid: 77, start_time: 903, drain_token: "restore-token" };
-    const restartSandboxGateway = vi.fn(() => RESTART_SUCCEEDED);
-    const observeHermesCronReplacement = vi.fn(() => replacement);
-
-    expect(
-      verifyHermesGatewayAfterStateRestoreForCronGate("alpha", "hermes", "restarted", original, {
-        restartSandboxGateway,
-        observeHermesCronReplacement,
-        checkAndRecoverSandboxProcesses: () => ({
-          checked: true,
-          wasRunning: true,
-          recovered: false,
-        }),
-      }),
     ).toEqual({ state: "healthy", replacementIdentity: replacement });
     expect(restartSandboxGateway).not.toHaveBeenCalled();
     expect(observeHermesCronReplacement).toHaveBeenCalledTimes(2);
   });
 
-  it("rejects unstable final cron identity without restarting after MCP restoration (#8472)", () => {
-    const restartSandboxGateway = vi.fn(() => RESTART_SUCCEEDED);
+  it("rejects unstable final cron identity without restarting after MCP restoration (#8472)", async () => {
+    const restartSandboxGateway = vi.fn(async () => RESTART_SUCCEEDED);
     const observeHermesCronReplacement = vi
       .fn()
-      .mockReturnValueOnce({ pid: 77, start_time: 903, drain_token: "restore-token" })
-      .mockReturnValueOnce({ pid: 88, start_time: 904, drain_token: "restore-token" });
+      .mockReturnValueOnce({
+        pid: 77,
+        start_time: 903,
+        drain_token: "restore-token",
+      })
+      .mockReturnValueOnce({
+        pid: 88,
+        start_time: 904,
+        drain_token: "restore-token",
+      });
 
     expect(
-      verifyHermesGatewayAfterStateRestoreForCronGate(
+      await verifyHermesGatewayAfterStateRestoreForCronGate(
         "alpha",
         "hermes",
         "restarted",
@@ -267,7 +185,7 @@ describe("binding the Hermes gateway to restored state", () => {
         {
           restartSandboxGateway,
           observeHermesCronReplacement,
-          checkAndRecoverSandboxProcesses: () => ({
+          checkAndRecoverSandboxProcesses: async () => ({
             checked: true,
             wasRunning: true,
             recovered: false,
@@ -277,126 +195,12 @@ describe("binding the Hermes gateway to restored state", () => {
     ).toEqual({ state: "unverified" });
     expect(restartSandboxGateway).not.toHaveBeenCalled();
   });
-
-  it("preserves MCP reconciliation refusal during restart-free final verification (#7084)", () => {
-    const restartSandboxGateway = vi.fn(() => RESTART_SUCCEEDED);
-
-    expect(
-      verifyHermesGatewayAfterStateRestore("alpha", "hermes", "restarted", {
-        restartSandboxGateway,
-        checkAndRecoverSandboxProcesses: () => ({
-          checked: true,
-          wasRunning: true,
-          recovered: false,
-          mcpReconciliationRefused: true,
-        }),
-      }),
-    ).toBe("unverified");
-    expect(restartSandboxGateway).not.toHaveBeenCalled();
-  });
-});
-
-describe("Hermes gateway post-restore recheck", () => {
-  it("accepts a gateway that becomes healthy after an inconclusive recovery check (#7084)", () => {
-    const checkAndRecoverSandboxProcesses = vi
-      .fn()
-      .mockReturnValueOnce({
-        checked: false,
-        wasRunning: null,
-        recovered: false,
-      })
-      .mockReturnValueOnce({
-        checked: true,
-        wasRunning: true,
-        recovered: false,
-      });
-
-    expect(
-      ensureHermesGatewayAfterStateRestore("alpha", "hermes", {
-        restartSandboxGateway: () => RESTART_SUCCEEDED,
-        checkAndRecoverSandboxProcesses,
-      }),
-    ).toBe("healthy");
-
-    expect(checkAndRecoverSandboxProcesses).toHaveBeenCalledTimes(2);
-  });
-
-  it.each([
-    "forwardRecoveryFailed",
-    "secretBoundaryRefused",
-    "mcpReconciliationRefused",
-  ] as const)("fails immediately when recovery reports %s (#7084)", (failureFlag) => {
-    const checkAndRecoverSandboxProcesses = vi.fn(() => ({
-      checked: true,
-      wasRunning: true,
-      recovered: false,
-      [failureFlag]: true,
-    }));
-
-    expect(
-      ensureHermesGatewayAfterStateRestore("alpha", "hermes", {
-        restartSandboxGateway: () => RESTART_SUCCEEDED,
-        checkAndRecoverSandboxProcesses,
-      }),
-    ).toBe("unverified");
-
-    expect(checkAndRecoverSandboxProcesses).toHaveBeenCalledOnce();
-  });
-
-  it("fails closed after the bounded gateway recheck remains inconclusive (#7084)", () => {
-    const checkAndRecoverSandboxProcesses = vi.fn(() => ({
-      checked: true,
-      wasRunning: false,
-      recovered: false,
-    }));
-
-    expect(
-      ensureHermesGatewayAfterStateRestore("alpha", "hermes", {
-        restartSandboxGateway: () => RESTART_SUCCEEDED,
-        checkAndRecoverSandboxProcesses,
-      }),
-    ).toBe("unverified");
-
-    expect(checkAndRecoverSandboxProcesses).toHaveBeenCalledTimes(2);
-  });
 });
 
 describe("Hermes rebuild post-restore verification", () => {
   installRebuildFlowTestHooks({ acceptThirdPartySoftware: true });
 
-  it("fails instead of reporting readiness when restored state leaves the gateway down (#7084)", async () => {
-    const mcpEntry = {
-      server: "blender",
-      providerName: "nemoclaw-mcp-alpha-blender",
-    };
-    const harness = createRebuildFlowHarness({
-      agentName: "hermes",
-      checkAndRecoverSandboxProcesses: () => ({
-        checked: true,
-        wasRunning: false,
-        recovered: false,
-        forwardRecovered: false,
-      }),
-      mcpPreparation: {
-        entries: [mcpEntry],
-        detachedProviderEntries: [mcpEntry],
-        scrubbedAdapterEntries: [mcpEntry],
-      },
-      sandboxEntry: { agent: "hermes" },
-    });
-    await expect(
-      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
-    ).rejects.toThrow("Hermes post-restore verification failed");
-
-    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
-    expect(output).toContain("rebuilt but some post-restore steps were incomplete");
-    expect(output).toContain("Hermes gateway health was not verified after state restore");
-    expect(output).not.toContain("MCP bridge definitions were preserved but not fully refreshed");
-    expect(output).not.toContain("rebuilt successfully");
-    expect(harness.restoreMcpBridgesAfterRebuildSpy).toHaveBeenCalledWith("alpha", [mcpEntry]);
-  });
-
-  it("restores MCP after gateway restart and before final health verification (#7084)", async () => {
+  it("rebinds restored Hermes state before restoring MCP", async () => {
     const mcpEntry = {
       server: "blender",
       providerName: "nemoclaw-mcp-alpha-blender",
@@ -414,23 +218,25 @@ describe("Hermes rebuild post-restore verification", () => {
         detachedProviderEntries: [mcpEntry],
         scrubbedAdapterEntries: [mcpEntry],
       },
-      sandboxEntry: { agent: "hermes" },
+      sandboxEntry: { agent: "hermes", provider: "build" },
     });
 
     await expect(
       harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
     ).resolves.toBeUndefined();
 
-    expect(harness.restoreMcpBridgesAfterRebuildSpy).toHaveBeenCalledWith("alpha", [mcpEntry]);
-    expect(harness.restartSandboxGatewaySpy.mock.invocationCallOrder[0]).toBeLessThan(
-      harness.restoreMcpBridgesAfterRebuildSpy.mock.invocationCallOrder[0],
-    );
-    expect(harness.restoreMcpBridgesAfterRebuildSpy.mock.invocationCallOrder[0]).toBeLessThan(
-      harness.checkAndRecoverSandboxProcessesSpy.mock.invocationCallOrder[0],
-    );
-    expect(harness.logSpy).toHaveBeenCalledWith(
-      expect.stringContaining("Hermes gateway restarted and verified after state restore"),
-    );
+    expect(harness.restoreMcpBridgesAfterRebuildSpy).toHaveBeenCalledWith("alpha", [mcpEntry], {
+      gatewayName: "nemoclaw",
+      workspace: "default",
+    });
+    expect(harness.restartSandboxGatewaySpy).toHaveBeenCalledExactlyOnceWith("alpha", {
+      quiet: true,
+      runtimeSelection: { gatewayName: "nemoclaw", workspace: "default" },
+    });
+    expect(harness.checkAndRecoverSandboxProcessesSpy).toHaveBeenCalledExactlyOnceWith("alpha", {
+      quiet: true,
+      runtimeSelection: { gatewayName: "nemoclaw", workspace: "default" },
+    });
   });
 
   it("returns a failed rebuild when managed Hermes MCP restoration is incomplete (#7084)", async () => {
@@ -445,7 +251,7 @@ describe("Hermes rebuild post-restore verification", () => {
         detachedProviderEntries: [mcpEntry],
         scrubbedAdapterEntries: [mcpEntry],
       },
-      sandboxEntry: { agent: "hermes" },
+      sandboxEntry: { agent: "hermes", provider: "build" },
     });
     harness.restoreMcpBridgesAfterRebuildSpy.mockRejectedValueOnce(new Error("reload failed"));
 
@@ -458,89 +264,11 @@ describe("Hermes rebuild post-restore verification", () => {
     expect(output).not.toContain("rebuilt successfully");
   });
 
-  it("fails when the final gateway check refuses MCP reconciliation (#7084)", async () => {
-    const mcpEntry = {
-      server: "blender",
-      providerName: "nemoclaw-mcp-alpha-blender",
-    };
-    const harness = createRebuildFlowHarness({
-      agentName: "hermes",
-      checkAndRecoverSandboxProcesses: () => ({
-        checked: true,
-        wasRunning: true,
-        recovered: false,
-        forwardRecovered: false,
-        mcpReconciliationRefused: true,
-      }),
-      mcpPreparation: {
-        entries: [mcpEntry],
-        detachedProviderEntries: [mcpEntry],
-        scrubbedAdapterEntries: [mcpEntry],
-      },
-      sandboxEntry: { agent: "hermes" },
-    });
-
-    await expect(
-      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
-    ).rejects.toThrow("Hermes post-restore verification failed");
-
-    expect(harness.restoreMcpBridgesAfterRebuildSpy).toHaveBeenCalledWith("alpha", [mcpEntry]);
-    expect(harness.logSpy).not.toHaveBeenCalledWith(
-      expect.stringContaining("rebuilt successfully"),
-    );
-  });
-
-  it.each([
-    "forwardRecoveryFailed",
-    "secretBoundaryRefused",
-  ] as const)("fails when the final gateway check reports %s (#7084)", async (failureFlag) => {
-    const harness = createRebuildFlowHarness({
-      agentName: "hermes",
-      checkAndRecoverSandboxProcesses: () => ({
-        checked: true,
-        wasRunning: true,
-        recovered: false,
-        forwardRecovered: false,
-        [failureFlag]: true,
-      }),
-      sandboxEntry: { agent: "hermes" },
-    });
-
-    await expect(
-      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
-    ).rejects.toThrow("Hermes post-restore verification failed");
-
-    expect(harness.logSpy).not.toHaveBeenCalledWith(
-      expect.stringContaining("rebuilt successfully"),
-    );
-  });
-
-  it("fails when the final gateway health probe is unavailable (#7084)", async () => {
-    const harness = createRebuildFlowHarness({
-      agentName: "hermes",
-      checkAndRecoverSandboxProcesses: () => ({
-        checked: false,
-        wasRunning: null,
-        recovered: false,
-        forwardRecovered: false,
-      }),
-      sandboxEntry: { agent: "hermes" },
-    });
-
-    await expect(
-      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
-    ).rejects.toThrow("Hermes post-restore verification failed");
-
-    expect(harness.logSpy).not.toHaveBeenCalledWith(
-      expect.stringContaining("rebuilt successfully"),
-    );
-  });
-
   it("fails before recovery when recreated Hermes identity is missing (#7084)", async () => {
     const harness = createRebuildFlowHarness({
       agentName: "hermes",
       sessionAgentName: null,
-      sandboxEntry: { agent: "hermes" },
+      sandboxEntry: { agent: "hermes", provider: "build" },
     });
 
     await expect(
@@ -556,33 +284,29 @@ describe("Hermes rebuild post-restore verification", () => {
     );
   });
 
-  it("restarts the gateway between the state restore and the health check (#8184)", async () => {
+  it("rebinds and verifies ordinary Hermes after restoring its durable state", async () => {
     const harness = createRebuildFlowHarness({
       agentName: "hermes",
-      sandboxEntry: { agent: "hermes" },
+      sandboxEntry: { agent: "hermes", provider: "build" },
     });
 
     await expect(
       harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
     ).resolves.toBeUndefined();
 
-    expect(harness.restartSandboxGatewaySpy).toHaveBeenCalledWith("alpha", { quiet: true });
-    expect(harness.restoreSandboxStateSpy.mock.invocationCallOrder[0]).toBeLessThan(
-      harness.restartSandboxGatewaySpy.mock.invocationCallOrder[0],
-    );
-    expect(harness.restartSandboxGatewaySpy.mock.invocationCallOrder[0]).toBeLessThan(
-      harness.checkAndRecoverSandboxProcessesSpy.mock.invocationCallOrder[0],
-    );
-    expect(harness.logSpy).toHaveBeenCalledWith(
-      expect.stringContaining("Hermes gateway restarted and verified after state restore"),
-    );
+    expect(harness.restartSandboxGatewaySpy).toHaveBeenCalledExactlyOnceWith("alpha", {
+      quiet: true,
+    });
+    expect(harness.checkAndRecoverSandboxProcessesSpy).toHaveBeenCalledExactlyOnceWith("alpha", {
+      quiet: true,
+    });
   });
 
   it("fails before recovery when recreated Hermes identity mismatches (#7084)", async () => {
     const harness = createRebuildFlowHarness({
       agentName: "hermes",
       sessionAgentName: "langchain-deepagents-code",
-      sandboxEntry: { agent: "hermes" },
+      sandboxEntry: { agent: "hermes", provider: "build" },
     });
 
     await expect(
@@ -596,5 +320,438 @@ describe("Hermes rebuild post-restore verification", () => {
     expect(harness.logSpy).not.toHaveBeenCalledWith(
       expect.stringContaining("rebuilt successfully"),
     );
+  });
+});
+
+describe("restored Hermes NVIDIA credential handoff", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  function fixture(discord: boolean) {
+    const runtime = { gatewayName: "selected-gateway", workspace: "default" };
+    const entry: registry.SandboxEntry = {
+      name: "alpha",
+      agent: "hermes",
+      gatewayName: runtime.gatewayName,
+      model: "nvidia/nemotron-3-ultra-550b-a55b",
+      provider: "nvidia-prod",
+      lifecycleGeneration: "replacement-generation",
+      lifecycleLiveIdentityFingerprint: fingerprintOpenShellSandboxId("replacement-id")!,
+      nativeNvidiaProviderAttachment: {
+        schemaVersion: 1,
+        profileId: "nemoclaw-nvidia-inference-v1",
+        providerName: "nemoclaw-nvidia-prod-v1",
+        providerId: "nvidia-provider-id",
+      },
+    };
+    const config: ConfigObject = {
+      display: { show_reasoning: false },
+      mcp_servers: { example: { command: "example-mcp" } },
+      ...(discord ? { discord: { require_mention: true, allowed_users: ["123"] } } : {}),
+    };
+    applyHermesManagedRoute(config, {
+      upstreamProvider: entry.provider!,
+      model: entry.model!,
+      baseUrl: NVIDIA_HOSTED_NATIVE_ENDPOINT,
+      inferenceApi: "openai-completions",
+      contextWindow: 131072,
+    });
+    Object.assign(config.model, { temperature: 0.25 });
+    const target = {
+      agentName: "hermes",
+      configPath: "/sandbox/.hermes/config.yaml",
+      configDir: "/sandbox/.hermes",
+      configFile: "config.yaml",
+      format: "yaml" as const,
+      sensitiveFiles: [],
+    };
+    const handle = "openshell:resolve:env:v8_NVIDIA_INFERENCE_API_KEY";
+    const io = {
+      withSandboxMutationLock: async <T>(_name: string, action: () => Promise<T>) => action(),
+      readNvidiaCredentialHandle: vi.fn(async () => handle),
+      readCredentialHandle: vi.fn(async () => {
+        throw new Error("NVIDIA restore must not read local-provider credentials");
+      }),
+      resolveAgentConfig: vi.fn(() => target),
+      readSandboxConfig: vi.fn(() => config),
+      writeSandboxConfig: vi.fn(),
+      restartGateway: vi.fn(async () => ({ ok: true })),
+    } satisfies Omit<
+      projection.InitialHermesInferenceRouteDeps,
+      "getSandbox" | "patchHermesInferenceConfig"
+    >;
+    const createRoute = projection.createInitialHermesInferenceRoute;
+    // Inject I/O through the existing seam; execute the real factory with the caller's options.
+    vi.spyOn(projection, "createInitialHermesInferenceRoute").mockImplementation(
+      (overrides, options) =>
+        createRoute({ ...io, patchHermesInferenceConfig, ...overrides }, options),
+    );
+    vi.spyOn(capture, "captureSanitizedResolvedOpenshell").mockReturnValue({
+      status: 0,
+      output: "Id: replacement-id",
+      stdout: "Id: replacement-id",
+      stderr: "",
+    });
+    const run = () => refreshRestoredHermesInferenceRoute("alpha", runtime, () => entry, {});
+    return { config, entry, handle, io, run, runtime, target };
+  }
+
+  it.each([false, true])(
+    "writes fresh NVIDIA references with Discord enrolled: %s (#14020)",
+    async (discord) => {
+      const f = fixture(discord);
+      expect(f.config.model.api_key).toBe(NVIDIA_INFERENCE_PLACEHOLDER);
+      expect(f.config.providers["nvidia-prod"]!.api_key).toBe(NVIDIA_INFERENCE_PLACEHOLDER);
+      expect(f.config.custom_providers[0]!.api_key).toBe(NVIDIA_INFERENCE_PLACEHOLDER);
+      const expected = structuredClone(f.config);
+
+      await f.run();
+
+      expected.model.api_key = f.handle;
+      expected.providers["nvidia-prod"]!.api_key = f.handle;
+      expected.custom_providers[0]!.api_key = f.handle;
+      expect(f.config).toEqual(expected);
+      expect(f.io.readNvidiaCredentialHandle).toHaveBeenCalledExactlyOnceWith(
+        "alpha",
+        f.runtime.gatewayName,
+        f.entry.nativeNvidiaProviderAttachment,
+      );
+      expect(f.io.readCredentialHandle).not.toHaveBeenCalled();
+      expect(f.io.writeSandboxConfig).toHaveBeenCalledExactlyOnceWith("alpha", f.target, expected, {
+        restoreNativeLocalCredential: true,
+      });
+      expect(f.io.writeSandboxConfig.mock.calls[0]![2]).toBe(f.config);
+      expect(f.io.restartGateway).not.toHaveBeenCalled();
+    },
+  );
+
+  function strippedFixture() {
+    const f = fixture(true);
+    f.config.model.api_key = "[STRIPPED_BY_MIGRATION]";
+    f.config.providers["nvidia-prod"]!.api_key = "[STRIPPED_BY_MIGRATION]";
+    f.config.custom_providers[0]!.api_key = "[STRIPPED_BY_MIGRATION]";
+    return f;
+  }
+
+  it.each([false, true])(
+    "recovers three stripped NVIDIA slots with Discord enrolled: %s (#14094)",
+    async (discord) => {
+      const f = fixture(discord);
+      f.config.model.api_key = "[STRIPPED_BY_MIGRATION]";
+      f.config.providers["nvidia-prod"]!.api_key = "[STRIPPED_BY_MIGRATION]";
+      f.config.custom_providers[0]!.api_key = "[STRIPPED_BY_MIGRATION]";
+      const expected = structuredClone(f.config);
+
+      await f.run();
+
+      expected.model.api_key = f.handle;
+      expected.providers["nvidia-prod"]!.api_key = f.handle;
+      expected.custom_providers[0]!.api_key = f.handle;
+      expect(f.config).toEqual(expected);
+      expect(f.io.readNvidiaCredentialHandle).toHaveBeenCalledExactlyOnceWith(
+        "alpha",
+        f.runtime.gatewayName,
+        f.entry.nativeNvidiaProviderAttachment,
+      );
+      expect(f.io.readCredentialHandle).not.toHaveBeenCalled();
+      expect(f.io.writeSandboxConfig).toHaveBeenCalledExactlyOnceWith("alpha", f.target, expected, {
+        restoreNativeLocalCredential: true,
+      });
+      expect(f.io.restartGateway).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    {
+      name: "model",
+      change: (f: ReturnType<typeof fixture>) => {
+        f.config.model.default = "foreign";
+      },
+    },
+    {
+      name: "endpoint",
+      change: (f: ReturnType<typeof fixture>) => {
+        f.config.model.base_url = "https://other.example/v1";
+      },
+    },
+    {
+      name: "upstream metadata",
+      change: (f: ReturnType<typeof fixture>) => {
+        Reflect.deleteProperty(f.config, "_nemoclaw_upstream");
+      },
+    },
+    {
+      name: "duplicate custom provider",
+      change: (f: ReturnType<typeof fixture>) => {
+        f.config.custom_providers.push({ ...f.config.custom_providers[0] });
+      },
+    },
+    {
+      name: "registered gateway",
+      change: (f: ReturnType<typeof fixture>) => {
+        f.entry.gatewayName = "foreign";
+      },
+    },
+    {
+      name: "provider receipt",
+      change: (f: ReturnType<typeof fixture>) => {
+        Object.assign(f.entry.nativeNvidiaProviderAttachment!, { providerName: "foreign" });
+      },
+    },
+  ])("rejects stripped state with invalid $name (#14094)", async ({ change }) => {
+    const f = strippedFixture();
+    change(f);
+    const before = structuredClone(f.config);
+    await expect(f.run()).rejects.toThrow();
+    expect(f.config).toEqual(before);
+    expect(f.io.writeSandboxConfig).not.toHaveBeenCalled();
+    expect(f.io.restartGateway).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { intact: [0] },
+    { intact: [1] },
+    { intact: [2] },
+    { intact: [0, 1] },
+    { intact: [0, 2] },
+    { intact: [1, 2] },
+  ])("rejects partial stripped state with intact slots $intact (#14094)", async ({ intact }) => {
+    const f = strippedFixture();
+    const slots = [
+      f.config.model,
+      f.config.providers["nvidia-prod"]!,
+      f.config.custom_providers[0]!,
+    ];
+    intact.forEach((index) => {
+      slots[index]!.api_key = NVIDIA_INFERENCE_PLACEHOLDER;
+    });
+    const before = structuredClone(f.config);
+    await expect(f.run()).rejects.toThrow("does not match its registered route");
+    expect(f.config).toEqual(before);
+    expect(f.io.writeSandboxConfig).not.toHaveBeenCalled();
+  });
+
+  it("does not reconstruct a missing NVIDIA attachment from stripped config (#14094)", async () => {
+    const f = strippedFixture();
+    delete f.entry.nativeNvidiaProviderAttachment;
+    const before = structuredClone(f.config);
+    await f.run();
+    expect(f.config).toEqual(before);
+    expect(f.io.readNvidiaCredentialHandle).not.toHaveBeenCalled();
+    expect(f.io.writeSandboxConfig).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "unavailable binding",
+      acquire: async (_f: ReturnType<typeof fixture>): Promise<string> => {
+        throw new Error("attachment verification failed");
+      },
+    },
+    {
+      name: "changed binding",
+      acquire: async (f: ReturnType<typeof fixture>) => {
+        f.entry.nativeNvidiaProviderAttachment = {
+          ...f.entry.nativeNvidiaProviderAttachment!,
+          providerId: "foreign",
+        };
+        return f.handle;
+      },
+    },
+    {
+      name: "changed identity",
+      acquire: async (f: ReturnType<typeof fixture>) => {
+        f.entry.lifecycleLiveIdentityFingerprint = fingerprintOpenShellSandboxId("foreign")!;
+        return f.handle;
+      },
+    },
+  ])(
+    "stops stripped recovery after $name during credential acquisition (#14094)",
+    async ({ acquire }) => {
+      const f = strippedFixture();
+      f.io.readNvidiaCredentialHandle.mockImplementation(() => acquire(f));
+      const before = structuredClone(f.config);
+      await expect(f.run()).rejects.toThrow();
+      expect(f.config).toEqual(before);
+      expect(f.io.readSandboxConfig).not.toHaveBeenCalled();
+      expect(f.io.writeSandboxConfig).not.toHaveBeenCalled();
+      expect(f.io.restartGateway).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps default credential validation strict for stripped NVIDIA state (#14094)", () => {
+    const f = strippedFixture();
+    const before = structuredClone(f.config);
+    expect(() =>
+      refreshHermesNativeLocalCredential(f.config, {
+        upstreamProvider: "nvidia-prod",
+        model: f.entry.model!,
+        baseUrl: NVIDIA_HOSTED_NATIVE_ENDPOINT,
+        inferenceApi: "openai-completions",
+        nativeCredentialHandle: f.handle,
+      }),
+    ).toThrow("does not match its registered route");
+    expect(f.config).toEqual(before);
+  });
+
+  it("preserves aliased user settings while replacing stripped slots (#14094)", async () => {
+    const f = strippedFixture();
+    f.config.user_model_options = f.config.model;
+    const userSettings = structuredClone(f.config.model);
+    await f.run();
+    expect(f.config.user_model_options).toEqual(userSettings);
+    expect(f.config.model.api_key).toBe(f.handle);
+    expect(f.config.model).toEqual({ ...userSettings, api_key: f.handle });
+  });
+
+  it("does not retry or activate after an uncertain recovery write (#14094)", async () => {
+    const f = strippedFixture();
+    let committed: ConfigObject | undefined;
+    f.io.writeSandboxConfig.mockImplementation((_name, _target, config) => {
+      committed = structuredClone(config);
+      throw new Error("write response lost");
+    });
+    await expect(f.run()).rejects.toThrow("write response lost");
+    expect(committed).toMatchObject({ model: { api_key: f.handle } });
+    expect(f.io.writeSandboxConfig).toHaveBeenCalledOnce();
+    expect(f.io.restartGateway).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid restored NVIDIA route before writing (#14020)", async () => {
+    const f = fixture(true);
+    f.config.model.base_url = "https://other.example/v1";
+    const before = structuredClone(f.config);
+
+    await expect(f.run()).rejects.toThrow();
+
+    expect(f.io.readSandboxConfig).toHaveBeenCalledExactlyOnceWith(
+      "alpha",
+      f.target,
+      f.runtime.gatewayName,
+    );
+    expect(f.config).toEqual(before);
+    expect(f.io.writeSandboxConfig).not.toHaveBeenCalled();
+    expect(f.io.restartGateway).not.toHaveBeenCalled();
+  });
+});
+
+describe("restored Hermes route identity", () => {
+  const runtime = {
+    gatewayName: "selected-gateway",
+    workspace: "selected-workspace",
+    localTlsDir: "/selected/tls",
+  };
+  const commandEnvironment = {
+    OPENSHELL_GATEWAY: runtime.gatewayName,
+    OPENSHELL_WORKSPACE: runtime.workspace,
+    OPENSHELL_LOCAL_TLS_DIR: runtime.localTlsDir,
+    ABSENT: undefined,
+  };
+  function fixture() {
+    const entry = {
+      name: "alpha",
+      agent: "hermes",
+      gatewayName: runtime.gatewayName,
+      model: "selected-model",
+      provider: "compatible-endpoint",
+      lifecycleGeneration: "replacement-generation",
+      lifecycleLiveIdentityFingerprint: fingerprintOpenShellSandboxId("replacement-id"),
+    } as registry.SandboxEntry;
+    vi.spyOn(registry, "getSandbox").mockImplementation(() => entry);
+    const observe = vi.spyOn(capture, "captureSanitizedResolvedOpenshell").mockReturnValue({
+      status: 0,
+      output: "Id: replacement-id",
+      stdout: "Id: replacement-id",
+      stderr: "",
+    });
+    const write = vi.fn();
+    const project = vi.fn<projection.InitializeHermesInferenceRoute>(
+      async (_name, _model, _provider, _gateway, revalidate) => {
+        revalidate?.("write restored config");
+        write();
+      },
+    );
+    const factory = vi
+      .spyOn(projection, "createInitialHermesInferenceRoute")
+      .mockReturnValue(project);
+    return { entry, observe, write, project, factory };
+  }
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("pins the replacement live identity and selected runtime before deferred projection", async () => {
+    const f = fixture();
+    await refreshRestoredHermesInferenceRoute(
+      "alpha",
+      runtime,
+      registry.getSandbox,
+      commandEnvironment,
+    );
+    expect(f.factory).toHaveBeenCalledWith(
+      expect.objectContaining({ getSandbox: expect.any(Function) }),
+      { activation: "deferred", workload: "registered", projection: "credential" },
+    );
+    expect(f.project).toHaveBeenCalledWith(
+      "alpha",
+      "selected-model",
+      "compatible-endpoint",
+      runtime.gatewayName,
+      expect.any(Function),
+    );
+    expect(f.observe).toHaveBeenCalledWith(
+      ["sandbox", "get", "-g", runtime.gatewayName, "alpha"],
+      expect.objectContaining({
+        env: expect.objectContaining({
+          OPENSHELL_GATEWAY: runtime.gatewayName,
+          OPENSHELL_WORKSPACE: runtime.workspace,
+          OPENSHELL_LOCAL_TLS_DIR: runtime.localTlsDir,
+        }),
+        replaceEnv: true,
+        timeout: 30000,
+      }),
+    );
+    expect(f.observe.mock.calls[0][1]?.env).not.toHaveProperty("ABSENT");
+    expect(f.write).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    {
+      name: "same-name replacement",
+      arrange: (f: ReturnType<typeof fixture>) =>
+        f.observe.mockReturnValue({
+          status: 0,
+          output: "Id: foreign-id",
+          stdout: "Id: foreign-id",
+        }),
+    },
+    {
+      name: "unobservable target",
+      arrange: (f: ReturnType<typeof fixture>) =>
+        f.observe.mockReturnValue({
+          status: 1,
+          output: "unavailable",
+          stdout: "",
+        }),
+    },
+    {
+      name: "registered generation drift",
+      arrange: (f: ReturnType<typeof fixture>) =>
+        f.project.mockImplementation(async (_n, _m, _p, _g, revalidate) => {
+          f.entry.lifecycleGeneration = "foreign-generation";
+          revalidate?.("write restored config");
+          f.write();
+        }),
+    },
+  ])("refuses $name without a write", async ({ arrange }) => {
+    const f = fixture();
+    arrange(f);
+    await expect(
+      refreshRestoredHermesInferenceRoute(
+        "alpha",
+        runtime,
+        registry.getSandbox,
+        commandEnvironment,
+      ),
+    ).rejects.toThrow();
+    expect(f.write).not.toHaveBeenCalled();
   });
 });

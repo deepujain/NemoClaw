@@ -7,6 +7,7 @@ import { validateCurlProbeArgs } from "../../adapters/http/curl-args";
 import type { CurlProbeOptions, CurlProbeResult } from "../../adapters/http/probe";
 import { isSafeLlamaCppServedModelAlias, probeLlamaCppAttachment } from "./index";
 
+/** Build an HTTP probe response without making a network request. */
 function response(httpStatus: number, body: string): CurlProbeResult {
   return {
     ok: httpStatus >= 200 && httpStatus < 300,
@@ -18,6 +19,7 @@ function response(httpStatus: number, body: string): CurlProbeResult {
   } as CurlProbeResult;
 }
 
+/** Represent a curl transport failure without an HTTP response. */
 function curlFailure(curlStatus: number): CurlProbeResult {
   return {
     ok: false,
@@ -29,6 +31,7 @@ function curlFailure(curlStatus: number): CurlProbeResult {
   };
 }
 
+/** Provide native metadata with distinct served and training context windows. */
 function nativeModel(id = "team/model-alias") {
   return {
     id,
@@ -38,6 +41,7 @@ function nativeModel(id = "team/model-alias") {
   };
 }
 
+/** Supply successful authentication and native-server fingerprint responses. */
 function nativeResponses(model = "team/model-alias"): CurlProbeResult[] {
   return [
     response(401, '{"error":"unauthorized"}'),
@@ -56,6 +60,7 @@ function nativeResponses(model = "team/model-alias"): CurlProbeResult[] {
   ];
 }
 
+/** Validate each probe's arguments and return its next scripted response. */
 function scriptedProbe(responses: CurlProbeResult[]) {
   let index = 0;
   return vi.fn((argv: string[], options?: CurlProbeOptions) => {
@@ -78,6 +83,157 @@ describe("isSafeLlamaCppServedModelAlias", () => {
 });
 
 describe("probeLlamaCppAttachment", () => {
+  it.each([
+    { managedRuntime: undefined, timeout: "5" },
+    { managedRuntime: true as const, timeout: "30" },
+  ])("bounds every fingerprint request to $timeout seconds", ({ managedRuntime, timeout }) => {
+    const probe = scriptedProbe(nativeResponses());
+
+    expect(
+      probeLlamaCppAttachment("secret-token", {
+        managedRuntime,
+        runCurlProbeImpl: probe,
+      }),
+    ).toMatchObject({ ok: true, model: "team/model-alias" });
+    expect(probe).toHaveBeenCalledTimes(5);
+    expect(probe.mock.calls.map(([args]) => args[args.indexOf("--max-time") + 1])).toEqual(
+      Array(5).fill(timeout),
+    );
+  });
+
+  it("allows the measured slow bridge to complete within one managed fingerprint deadline", () => {
+    let elapsedMs = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => elapsedMs);
+    const scripted = scriptedProbe(nativeResponses());
+    const probe = vi.fn((argv: string[], options?: CurlProbeOptions) => {
+      const result = scripted(argv, options);
+      elapsedMs += 16_000;
+      return result;
+    });
+    try {
+      expect(
+        probeLlamaCppAttachment("secret-token", {
+          managedRuntime: true,
+          runCurlProbeImpl: probe,
+        }),
+      ).toMatchObject({ ok: true, model: "team/model-alias" });
+      expect(probe).toHaveBeenCalledTimes(5);
+      expect(probe.mock.calls.map(([args]) => args[args.indexOf("--max-time") + 1])).toEqual([
+        "30",
+        "30",
+        "30",
+        "30",
+        "26",
+      ]);
+      expect(probe.mock.calls.map(([, options]) => options?.timeoutMs)).toEqual([
+        35_000, 35_000, 35_000, 35_000, 26_000,
+      ]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("stops the managed fingerprint at the request that exhausts its shared deadline", () => {
+    let elapsedMs = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => elapsedMs);
+    const scripted = scriptedProbe(nativeResponses());
+    const probe = vi.fn((argv: string[], options?: CurlProbeOptions) => {
+      const result = scripted(argv, options);
+      elapsedMs += 30_000;
+      return result;
+    });
+    try {
+      expect(
+        probeLlamaCppAttachment("secret-token", {
+          managedRuntime: true,
+          runCurlProbeImpl: probe,
+        }),
+      ).toMatchObject({
+        ok: false,
+        reason: "probe-timeout",
+        message: expect.stringContaining("authenticated /health"),
+      });
+      expect(probe).toHaveBeenCalledTimes(3);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each([
+    { phase: "anonymous /v1/models", timeoutAt: 0 },
+    { phase: "anonymous /props", timeoutAt: 1 },
+    { phase: "authenticated /v1/models", timeoutAt: 1 },
+    { phase: "authenticated /health", timeoutAt: 2 },
+    { phase: "authenticated /props", timeoutAt: 3 },
+    { phase: "authenticated /metrics", timeoutAt: 4 },
+  ])("identifies a managed fingerprint timeout at $phase (#12285)", ({ phase, timeoutAt }) => {
+    const responses = nativeResponses();
+    responses[0] = phase === "anonymous /props" ? response(200, '{"data":[]}') : responses[0]!;
+    responses[timeoutAt] = curlFailure(28);
+
+    expect(
+      probeLlamaCppAttachment("secret-token", {
+        managedRuntime: true,
+        runCurlProbeImpl: scriptedProbe(responses),
+      }),
+    ).toMatchObject({
+      ok: false,
+      reason: "probe-timeout",
+      message: expect.stringContaining(phase),
+    });
+  });
+
+  it("still rejects an invalid managed API key", () => {
+    const responses = nativeResponses();
+    responses[1] = response(401, '{"error":"unauthorized"}');
+
+    expect(
+      probeLlamaCppAttachment("secret-token", {
+        managedRuntime: true,
+        runCurlProbeImpl: scriptedProbe(responses),
+      }),
+    ).toMatchObject({ ok: false, reason: "authentication-rejected" });
+  });
+
+  it("returns the selected model's served context rather than its training limit (#11527)", () => {
+    const responses = nativeResponses();
+    responses[1] = response(
+      200,
+      JSON.stringify({
+        data: [
+          {
+            ...nativeModel(),
+            meta: { ...nativeModel().meta, n_ctx: 65536, n_ctx_train: 262144 },
+          },
+        ],
+      }),
+    );
+    expect(
+      probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: scriptedProbe(responses) }),
+    ).toEqual({ ok: true, model: "team/model-alias", contextWindow: 65536 });
+  });
+
+  it.each([undefined, null, 0, -1, 1.5, "65536", Number.MAX_SAFE_INTEGER])(
+    "does not return invalid context metadata %s (#11527)",
+    (n_ctx) => {
+      const responses = nativeResponses();
+      responses[1] = response(
+        200,
+        JSON.stringify({
+          data: [
+            {
+              ...nativeModel(),
+              meta: { ...nativeModel().meta, n_ctx, n_params: 1000, size: 2000 },
+            },
+          ],
+        }),
+      );
+      expect(
+        probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: scriptedProbe(responses) }),
+      ).toEqual({ ok: true, model: "team/model-alias" });
+    },
+  );
+
   it("requires an operator-supplied native API key (#8161)", () => {
     expect(probeLlamaCppAttachment("  ")).toMatchObject({
       ok: false,
@@ -102,12 +258,41 @@ describe("probeLlamaCppAttachment", () => {
     expect(probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: probe })).toEqual({
       ok: true,
       model: "team/model-alias",
+      contextWindow: 8192,
     });
     expect(probe).toHaveBeenCalledTimes(5);
     probe.mock.calls.forEach(([argv, options]) => {
       expect(argv).toEqual(expect.arrayContaining(["--max-time", "5", "--max-filesize", "262144"]));
       expect(options).toEqual(expect.objectContaining({ maxResponseBytes: 262144 }));
     });
+  });
+
+  it("falls back to unscoped read-only probes when model queries are unavailable (#9592)", () => {
+    const native = nativeResponses();
+    const probe = scriptedProbe([
+      native[0]!,
+      native[1]!,
+      native[2]!,
+      response(404, '{"error":{"code":"route_not_available","type":"invalid_request_error"}}'),
+      native[3]!,
+      response(404, '{"error":{"code":"route_not_available","type":"invalid_request_error"}}'),
+      native[4]!,
+    ]);
+
+    expect(probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: probe })).toEqual({
+      ok: true,
+      model: "team/model-alias",
+      contextWindow: 8192,
+    });
+    expect(probe.mock.calls.map(([argv]) => argv.at(-1))).toEqual([
+      "http://127.0.0.1:8081/v1/models",
+      "http://127.0.0.1:8081/v1/models",
+      "http://127.0.0.1:8081/health",
+      "http://127.0.0.1:8081/props?model=team%2Fmodel-alias",
+      "http://127.0.0.1:8081/props",
+      "http://127.0.0.1:8081/metrics?model=team%2Fmodel-alias",
+      "http://127.0.0.1:8081/metrics",
+    ]);
   });
 
   it("accepts llama.cpp's native metrics-disabled response (#8161)", () => {
@@ -143,7 +328,28 @@ describe("probeLlamaCppAttachment", () => {
       runCurlProbeImpl: scriptedProbe(responses),
     });
 
-    expect(result).toEqual({ ok: true, model: "second/model" });
+    expect(result).toEqual({ ok: true, model: "second/model", contextWindow: 8192 });
+  });
+
+  it("does not use an unscoped fallback when multiple models are served (#9592)", () => {
+    const responses = nativeResponses("second/model");
+    responses[1] = response(
+      200,
+      JSON.stringify({ data: [nativeModel("first/model"), nativeModel("second/model")] }),
+    );
+    responses[3] = response(
+      404,
+      '{"error":{"code":"route_not_available","type":"invalid_request_error"}}',
+    );
+    const probe = scriptedProbe(responses);
+
+    expect(
+      probeLlamaCppAttachment("secret-token", {
+        requestedModel: "second/model",
+        runCurlProbeImpl: probe,
+      }),
+    ).toMatchObject({ ok: false, reason: "conflicting-fingerprint" });
+    expect(probe).toHaveBeenCalledTimes(5);
   });
 
   it("rejects mixed llama.cpp and vLLM model metadata when the requested entry is native llama.cpp (#8161)", () => {
@@ -196,7 +402,7 @@ describe("probeLlamaCppAttachment", () => {
     ];
     expect(
       probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: scriptedProbe(responses) }),
-    ).toEqual({ ok: true, model: "team/model-alias" });
+    ).toEqual({ ok: true, model: "team/model-alias", contextWindow: 8192 });
   });
 
   it("rejects a non-llama.cpp server with public /v1/models (#8302)", () => {
@@ -325,10 +531,13 @@ describe("probeLlamaCppAttachment", () => {
   it("rejects a spoofed catalog without corroborating native endpoints (#8161)", () => {
     const responses = nativeResponses();
     responses[3] = response(404, '{"error":"not found"}');
+    const probe = scriptedProbe(responses);
 
-    expect(
-      probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: scriptedProbe(responses) }),
-    ).toMatchObject({ ok: false, reason: "conflicting-fingerprint" });
+    expect(probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: probe })).toMatchObject({
+      ok: false,
+      reason: "conflicting-fingerprint",
+    });
+    expect(probe).toHaveBeenCalledTimes(5);
   });
 
   it("rejects conflicting model identity across native endpoints (#8161)", () => {
@@ -346,6 +555,86 @@ describe("probeLlamaCppAttachment", () => {
     expect(
       probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: scriptedProbe(responses) }),
     ).toMatchObject({ ok: false, reason: "conflicting-fingerprint" });
+  });
+
+  it("attaches a native server whose properties omit the served model alias (#9603)", () => {
+    const responses = nativeResponses();
+    responses[3] = response(
+      200,
+      JSON.stringify({
+        model_path: "/models/model.gguf",
+        total_slots: 2,
+        default_generation_settings: { params: {} },
+      }),
+    );
+
+    expect(
+      probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: scriptedProbe(responses) }),
+    ).toEqual({ ok: true, model: "team/model-alias", contextWindow: 8192 });
+  });
+
+  it("rejects properties that report a null served model alias (#9603)", () => {
+    const responses = nativeResponses();
+    responses[3] = response(
+      200,
+      JSON.stringify({
+        model_alias: null,
+        model_path: "/models/model.gguf",
+        total_slots: 2,
+        default_generation_settings: { params: {} },
+      }),
+    );
+
+    expect(
+      probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: scriptedProbe(responses) }),
+    ).toMatchObject({ ok: false, reason: "conflicting-fingerprint" });
+  });
+
+  it("names the health endpoint when the server reports a loading model (#9603)", () => {
+    const responses = nativeResponses();
+    responses[2] = response(200, '{"status":"loading model"}');
+
+    expect(
+      probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: scriptedProbe(responses) }),
+    ).toMatchObject({
+      ok: false,
+      reason: "conflicting-fingerprint",
+      message: expect.stringContaining("health endpoint"),
+    });
+  });
+
+  it("names the properties endpoint when model_alias differs from the served model alias (#9603)", () => {
+    const responses = nativeResponses();
+    responses[3] = response(
+      200,
+      JSON.stringify({
+        model_alias: "different/model",
+        model_path: "/models/model.gguf",
+        total_slots: 2,
+        default_generation_settings: { params: {} },
+      }),
+    );
+
+    expect(
+      probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: scriptedProbe(responses) }),
+    ).toMatchObject({
+      ok: false,
+      reason: "conflicting-fingerprint",
+      message: expect.stringContaining("properties endpoint"),
+    });
+  });
+
+  it("names the metrics endpoint when the response has no llama.cpp metrics (#9603)", () => {
+    const responses = nativeResponses();
+    responses[4] = response(200, "# TYPE go_gc_duration_seconds summary\ngo_goroutines 12\n");
+
+    expect(
+      probeLlamaCppAttachment("secret-token", { runCurlProbeImpl: scriptedProbe(responses) }),
+    ).toMatchObject({
+      ok: false,
+      reason: "conflicting-fingerprint",
+      message: expect.stringContaining("metrics endpoint"),
+    });
   });
 
   it.each([
@@ -381,8 +670,11 @@ describe("probeLlamaCppAttachment", () => {
     expect(JSON.stringify(result)).not.toContain(token);
     probe.mock.calls.forEach(([argv, options]) => {
       expect(JSON.stringify(argv)).not.toContain(token);
-      expect((options?.trustedConfigFiles ?? []).every((configPath) =>
-          Object.is(fs.existsSync(configPath), false))).toBe(true);
+      expect(
+        (options?.trustedConfigFiles ?? []).every((configPath) =>
+          Object.is(fs.existsSync(configPath), false),
+        ),
+      ).toBe(true);
     });
     expect(configModes).toEqual([0o600, 0o600, 0o600, 0o600]);
   });

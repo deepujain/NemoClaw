@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { execFileSync } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import {
+  type DockerRunner,
+  validateDcodeRuntimeContract,
+} from "../../scripts/checks/validate-dcode-runtime-contract.mts";
 
 const AGENT = "langchain-deepagents-code";
 const IMAGE = "ghcr.io/nvidia/nemoclaw/langchain-deepagents-code-sandbox-base";
@@ -12,7 +16,6 @@ const PLATFORMS = ["linux/amd64", "linux/arm64"] as const;
 export const DCODE_BASE_IMAGE_TARGET_PLATFORM = "linux/amd64" as const;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const SHA_PATTERN = /^[0-9a-f]{40}$/u;
-const IMPORT_MARKER = "nemoclaw-dcode-base-imports-ok";
 
 type JsonRecord = Record<string, unknown>;
 export type DcodePlatform = (typeof PLATFORMS)[number];
@@ -112,7 +115,7 @@ export function parseDcodeBaseImageContract(value: unknown): DcodeBaseImageContr
 
 export function validateDcodeBaseImageContract(
   value: unknown,
-  expected: { runId: number; runAttempt: number; headSha: string },
+  expected: { runId: number; runAttempt: number; headSha: string; baseReference?: string },
 ): DcodeBaseImageContract {
   if (!SHA_PATTERN.test(expected.headSha)) {
     throw new Error("base contract source revision does not match the selected publication");
@@ -124,44 +127,17 @@ export function validateDcodeBaseImageContract(
   if (contract.run.id !== expected.runId || contract.run.attempt !== expected.runAttempt) {
     throw new Error("base contract run does not match the selected publication");
   }
+  if (
+    expected.baseReference !== undefined &&
+    contract.platformReferences[DCODE_BASE_IMAGE_TARGET_PLATFORM] !== expected.baseReference
+  ) {
+    throw new Error("base contract reference does not match the exact PR managed image");
+  }
   return contract;
 }
 
-export function validateDcodeBaseImageImports(
-  reference: string,
-  runDocker: (args: string[]) => string = (args) =>
-    execFileSync("docker", args, {
-      encoding: "utf8",
-      killSignal: "SIGKILL",
-      maxBuffer: 4 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 120_000,
-    }).trim(),
-): void {
-  const output = runDocker([
-    "run",
-    "--rm",
-    "--platform",
-    DCODE_BASE_IMAGE_TARGET_PLATFORM,
-    "--network",
-    "none",
-    "--cap-drop",
-    "ALL",
-    "--security-opt",
-    "no-new-privileges",
-    "--read-only",
-    "--user",
-    "999:999",
-    "--entrypoint",
-    "/opt/venv/bin/python3",
-    reference,
-    "-I",
-    "-c",
-    `import deepagents; import deepagents_code; print("${IMPORT_MARKER}")`,
-  ]);
-  if (output.trim() !== IMPORT_MARKER) {
-    throw new Error("immutable Deep Agents Code base did not prove both required imports");
-  }
+export function validateDcodeBaseImageImports(reference: string, runDocker?: DockerRunner): void {
+  validateDcodeRuntimeContract(reference, DCODE_BASE_IMAGE_TARGET_PLATFORM, runDocker);
 }
 
 function requiredInteger(value: string | undefined, label: string): number {
@@ -173,7 +149,7 @@ function requiredInteger(value: string | undefined, label: string): number {
 export function main(
   argv = process.argv.slice(2),
   env = process.env,
-  runDocker?: (args: string[]) => string,
+  runDocker?: DockerRunner,
 ): void {
   if (argv.length !== 1) throw new Error("expected one managed base contract path");
   const outputPath = env.GITHUB_OUTPUT ?? "";
@@ -186,6 +162,7 @@ export function main(
       runId: requiredInteger(env.PUBLICATION_RUN_ID, "PUBLICATION_RUN_ID"),
       runAttempt: requiredInteger(env.PUBLICATION_RUN_ATTEMPT, "PUBLICATION_RUN_ATTEMPT"),
       headSha: env.PUBLICATION_HEAD_SHA ?? "",
+      baseReference: env.EXPECTED_BASE_REF?.trim() || undefined,
     },
   );
   const baseReference = contract.platformReferences[DCODE_BASE_IMAGE_TARGET_PLATFORM];

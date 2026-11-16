@@ -102,10 +102,44 @@ describe("managed startup shared-state transaction", () => {
       Object.defineProperty(stat, "dev", {
         configurable: true,
         value:
-          typeof stat.dev === "bigint"
-            ? stat.dev + BigInt(deviceOffset)
-            : stat.dev + deviceOffset,
+          typeof stat.dev === "bigint" ? stat.dev + BigInt(deviceOffset) : stat.dev + deviceOffset,
       });
+      return stat;
+    }) as typeof fs.lstatSync);
+  }
+
+  function simulateLinuxDirectoryMode(root: string, initialMode: number): void {
+    const resolvedRoot = path.resolve(root);
+    let exactMode = initialMode;
+    const originalChmodSync = fs.chmodSync.bind(fs);
+    vi.spyOn(fs, "chmodSync").mockImplementation((target, targetMode) => {
+      originalChmodSync(target, targetMode);
+      [path.resolve(String(target))]
+        .filter((resolvedTarget) => resolvedTarget === resolvedRoot)
+        .forEach(() => {
+          exactMode = Number(targetMode);
+        });
+    });
+    const originalLstatSync = fs.lstatSync.bind(fs);
+    vi.spyOn(fs, "lstatSync").mockImplementation(((
+      target: fs.PathLike,
+      statOptions?: { readonly bigint?: boolean },
+    ) => {
+      const stat =
+        statOptions?.bigint === true
+          ? originalLstatSync(target, { bigint: true })
+          : originalLstatSync(target);
+      [path.resolve(String(target))]
+        .filter((resolvedTarget) => resolvedTarget === resolvedRoot)
+        .forEach(() => {
+          Object.defineProperty(stat, "mode", {
+            configurable: true,
+            value:
+              typeof stat.mode === "bigint"
+                ? (stat.mode & ~0o7777n) | BigInt(exactMode)
+                : (stat.mode & ~0o7777) | exactMode,
+          });
+        });
       return stat;
     }) as typeof fs.lstatSync);
   }
@@ -154,15 +188,15 @@ describe("managed startup shared-state transaction", () => {
         fs.chmodSync(target, 0o600);
       });
       const createManagedDrift: Record<ManagedStartupAgent, () => void> = {
-        openclaw: () => fs.writeFileSync(path.join(root, ".config-hash"), "new\n"),
+        openclaw: () => undefined,
         hermes: () => fs.writeFileSync(path.join(root, ".config-hash"), "new\n"),
         "langchain-deepagents-code": () => {
           fs.mkdirSync(path.join(root, ".state"));
-          fs.mkdirSync(path.join(root, "skills"));
         },
         pi: () => {
           fs.mkdirSync(path.join(root, "agent"));
           fs.writeFileSync(path.join(root, "agent", "models.json"), "{}\n");
+          fs.writeFileSync(path.join(root, "agent", "settings.json"), "{}\n");
         },
       };
       createManagedDrift[agent]();
@@ -177,13 +211,16 @@ describe("managed startup shared-state transaction", () => {
       });
       expect(mode(root)).toBe(0o750);
       const absentManagedPaths: Record<ManagedStartupAgent, readonly string[]> = {
-        openclaw: [".config-hash"],
+        openclaw: [],
         hermes: [".config-hash"],
-        "langchain-deepagents-code": [".state", "skills"],
-        pi: ["agent", path.join("agent", "models.json")],
+        "langchain-deepagents-code": [".state"],
+        pi: ["agent", path.join("agent", "models.json"), path.join("agent", "settings.json")],
       };
-      expect(absentManagedPaths[agent].every((relativePath) =>
-          Object.is(fs.existsSync(path.join(root, relativePath)), false))).toBe(true);
+      expect(
+        absentManagedPaths[agent].every((relativePath) =>
+          Object.is(fs.existsSync(path.join(root, relativePath)), false),
+        ),
+      ).toBe(true);
       expect(fs.existsSync(transactionDirectory)).toBe(false);
     },
   );
@@ -206,6 +243,24 @@ describe("managed startup shared-state transaction", () => {
     expect(rollbackManagedStartupSharedStateTransaction("hermes", options)).toBe(true);
     expect(fs.readFileSync(config, "utf8")).toBe("before: true\n");
     expect(fs.readFileSync(env, "utf8")).toBe("TOKEN=before\n");
+  });
+
+  it("restores the setgid bit on the exact Hermes state root (#9486)", () => {
+    const root = agentRoot("hermes");
+    fs.mkdirSync(root, { mode: 0o770 });
+    simulateLinuxDirectoryMode(root, 0o3770);
+    const config = path.join(root, "config.yaml");
+    fs.writeFileSync(config, "before: true\n");
+
+    expect(
+      beginManagedStartupSharedStateTransaction(managedStartupE2eProfile("hermes"), options),
+    ).toBe(true);
+    fs.chmodSync(root, 0o770);
+    fs.writeFileSync(config, "after: true\n");
+
+    expect(rollbackManagedStartupSharedStateTransaction("hermes", options)).toBe(true);
+    expect(mode(root)).toBe(0o3770);
+    expect(fs.readFileSync(config, "utf8")).toBe("before: true\n");
   });
 
   it("rejects a nested mount below the exact Hermes named-volume root", () => {
@@ -270,16 +325,16 @@ describe("managed startup shared-state transaction", () => {
     );
   });
 
-  it("retains the no-mounted-state-root boundary for other agents", () => {
+  it("accepts the exact declared OpenClaw state root mount", () => {
     const root = agentRoot("openclaw");
     fs.mkdirSync(root);
     fs.writeFileSync(path.join(root, "openclaw.json"), "{}\n");
     simulateMountedStateRoot(root);
 
-    expect(() =>
+    expect(
       beginManagedStartupSharedStateTransaction(managedStartupE2eProfile("openclaw"), options),
-    ).toThrow(/crosses a nested filesystem mount/u);
-    expect(fs.existsSync(transactionDirectory)).toBe(false);
+    ).toBe(true);
+    expect(fs.existsSync(transactionDirectory)).toBe(true);
   });
 
   it("tracks only active post-install messaging outputs and leaves disabled targets alone", () => {
@@ -784,11 +839,11 @@ describe("managed startup shared-state transaction", () => {
     expect(fs.existsSync(transactionDirectory)).toBe(false);
   });
 
-  it("does not rewrite unchanged shield-like files or directory metadata", () => {
+  it("does not rewrite unchanged files or directory metadata", () => {
     const root = agentRoot("openclaw");
     fs.mkdirSync(root, { mode: 0o755 });
     const config = path.join(root, "openclaw.json");
-    fs.writeFileSync(config, "shielded\n");
+    fs.writeFileSync(config, "unchanged\n");
     fs.chmodSync(config, 0o444);
     beginManagedStartupSharedStateTransaction(managedStartupE2eProfile("openclaw"), options);
     const rename = vi.spyOn(fs, "renameSync");
@@ -797,7 +852,7 @@ describe("managed startup shared-state transaction", () => {
     expect(rollbackManagedStartupSharedStateTransaction("openclaw", options)).toBe(true);
     expect(rename).not.toHaveBeenCalled();
     expect(chown).not.toHaveBeenCalled();
-    expect(fs.readFileSync(config, "utf8")).toBe("shielded\n");
+    expect(fs.readFileSync(config, "utf8")).toBe("unchanged\n");
     expect(mode(config)).toBe(0o444);
   });
 

@@ -11,7 +11,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { managedStartupE2eProfile } from "../../../scripts/checks/generate-managed-startup-profile-fixture.mts";
 import { loadAgent } from "../agent/defs";
 import { SANDBOX_BUILD_CONTEXT_PREFIX } from "../sandbox/build-context";
-import { MANAGED_BOOTSTRAP_IDENTITY_ENV } from "./managed-bootstrap/adapter";
 import { encodeManagedStartupProfile } from "./managed-startup/profile";
 import { createManagedStartupRootApplyRequest } from "./managed-startup/root-apply";
 import { createOpenshellCliHelpers } from "./openshell-cli";
@@ -33,6 +32,7 @@ function createTrustedBuildContext(): string {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const buildCtx of temporaryBuildContexts.splice(0)) {
     fs.rmSync(buildCtx, { recursive: true, force: true });
   }
@@ -123,6 +123,40 @@ describe("buildSandboxRuntimeEnvArgs", () => {
       env: {} as NodeJS.ProcessEnv,
     }).envArgs;
     expect(envArgs.some((arg) => arg.startsWith("NEMOCLAW_SANDBOX_NAME="))).toBe(false);
+  });
+
+  it.each([
+    [{ name: "openclaw", configPaths: { dir: "/sandbox/.openclaw" } }, true],
+    [null, true],
+    [{ name: "hermes", configPaths: { dir: "/sandbox/.hermes" } }, false],
+    [{ name: "langchain-deepagents-code", configPaths: { dir: "/sandbox/.deepagents" } }, false],
+  ] as const)("forwards an explicit gateway URL only to OpenClaw [%s]", (agent, expected) => {
+    const url = "wss://gateway.example.test:443/operator";
+    const envArgs = buildSandboxRuntimeEnvArgs({
+      agent: agent as any,
+      chatUiUrl: "",
+      manageDashboard: false,
+      getDashboardForwardPort: () => "0",
+      hermesDashboardState: disabledHermesDashboardState,
+      extraPlaceholderKeys: [],
+      env: { OPENCLAW_GATEWAY_URL: `  ${url}  ` },
+    }).envArgs;
+
+    expect(envArgs.includes(`OPENCLAW_GATEWAY_URL=${url}`)).toBe(expected);
+  });
+
+  it("keeps the native OpenClaw gateway URL absent from sandbox creation by default", () => {
+    const envArgs = buildSandboxRuntimeEnvArgs({
+      agent: { name: "openclaw", configPaths: { dir: "/sandbox/.openclaw" } } as any,
+      chatUiUrl: "",
+      manageDashboard: false,
+      getDashboardForwardPort: () => "0",
+      hermesDashboardState: disabledHermesDashboardState,
+      extraPlaceholderKeys: [],
+      env: {},
+    }).envArgs;
+
+    expect(envArgs.some((entry) => entry.startsWith("OPENCLAW_GATEWAY_URL="))).toBe(false);
   });
 
   it("forwards only the literal OpenClaw MCP shadow diagnostic opt-in", () => {
@@ -230,13 +264,47 @@ describe("buildSandboxRuntimeEnvArgs", () => {
 });
 
 describe("prepareSandboxCreateLaunch", () => {
+  it("uses the selected environment when no build environment override exists", () => {
+    const result = prepareSandboxCreateLaunch({
+      agent: null,
+      chatUiUrl: "",
+      createArgs: ["--from", "example.invalid/image", "--name", "demo"],
+      env: { HOME: "/selected/home" },
+      extraPlaceholderKeys: [],
+      getDashboardForwardPort: () => "",
+      hermesDashboardState: disabledHermesDashboardState,
+      openshellShellCommand: (args) => `openshell ${args.join(" ")}`,
+    });
+
+    expect(result.sandboxEnv).toEqual({ HOME: "/selected/home" });
+  });
+
+  it("removes an inherited sandbox policy when create omits caller policy (#9833)", () => {
+    const result = prepareSandboxCreateLaunch({
+      agent: null,
+      chatUiUrl: "",
+      createArgs: ["--from", "example.invalid/image", "--name", "demo"],
+      extraPlaceholderKeys: [],
+      getDashboardForwardPort: () => "",
+      hermesDashboardState: disabledHermesDashboardState,
+      openshellShellCommand: (args) => `openshell ${args.join(" ")}`,
+      buildEnv: () => ({
+        HOME: "/home/user",
+        OPENSHELL_SANDBOX_POLICY: "/tmp/inherited-policy.yaml",
+      }),
+    });
+
+    expect(result.sandboxEnv).toEqual({ HOME: "/home/user" });
+  });
+
   it.each(["openclaw", "hermes", "langchain-deepagents-code"] as const)(
-    "renders one identity-bound held launch for %s without exposing the startup profile",
+    "holds %s until its exact bounded startup profile is applied",
     (agentName) => {
       const request = createManagedStartupRootApplyRequest({
         agent: agentName,
         encodedProfile: encodeManagedStartupProfile(managedStartupE2eProfile(agentName)),
       });
+      const managedBootstrapIdentity = "f".repeat(64);
       const result = prepareSandboxCreateLaunch({
         agent: loadAgent(agentName),
         chatUiUrl: "",
@@ -250,6 +318,7 @@ describe("prepareSandboxCreateLaunch", () => {
         openshellShellCommand: (args) => args.join(" "),
         openshellArgv: (args) => ["openshell", ...args],
         buildEnv: () => ({}),
+        managedBootstrapIdentity,
         managedStartupRootApplyRequest: request,
       });
 
@@ -258,49 +327,23 @@ describe("prepareSandboxCreateLaunch", () => {
         ...result.envArgs,
         "/usr/local/bin/nemoclaw-start",
       ]);
-      expect(result.managedBootstrapIdentity).toMatch(/^[a-f0-9]{64}$/u);
       expect(result.sandboxStartupCommand).toEqual([
-        ...result.intendedSandboxStartupCommand.slice(0, -1),
+        "env",
+        ...result.envArgs,
         "/usr/local/bin/nemoclaw-managed-startup-hold",
         "--agent",
         agentName,
         "--profile-fingerprint",
         request.profileFingerprint,
         "--bootstrap-identity",
-        result.managedBootstrapIdentity,
+        managedBootstrapIdentity,
         "--",
+        "/usr/local/bin/nemoclaw-start",
       ]);
-      expect(result.createArgv).toEqual(
-        expect.arrayContaining([
-          "--env",
-          `${MANAGED_BOOTSTRAP_IDENTITY_ENV}=${result.managedBootstrapIdentity}`,
-        ]),
-      );
-      expect(result.createArgv.join("\n")).not.toContain(request.encodedProfile);
+      expect(result.managedBootstrapIdentity).toBe(managedBootstrapIdentity);
+      expect(result.envArgs.join("\n")).not.toContain(request.encodedProfile);
     },
   );
-
-  it("rejects a caller-supplied managed bootstrap identity environment", () => {
-    const request = createManagedStartupRootApplyRequest({
-      agent: "openclaw",
-      encodedProfile: encodeManagedStartupProfile(managedStartupE2eProfile("openclaw")),
-    });
-
-    expect(() =>
-      prepareSandboxCreateLaunch({
-        agent: loadAgent("openclaw"),
-        chatUiUrl: "",
-        createArgs: ["--env", `${MANAGED_BOOTSTRAP_IDENTITY_ENV}=${"a".repeat(64)}`],
-        env: {},
-        extraPlaceholderKeys: [],
-        getDashboardForwardPort: () => "0",
-        hermesDashboardState: disabledHermesDashboardState,
-        manageDashboard: false,
-        openshellShellCommand: (args) => args.join(" "),
-        managedStartupRootApplyRequest: request,
-      }),
-    ).toThrow(`must not override reserved ${MANAGED_BOOTSTRAP_IDENTITY_ENV}`);
-  });
 
   it("builds the sandbox create command and runtime env envelope", () => {
     const openshellShellCommand = vi.fn((args: string[]) => `openshell ${args.join(" ")}`);
@@ -565,6 +608,39 @@ describe("prepareSandboxCreateLaunch", () => {
     }
   });
 
+  it("routes bounded OpenShell probes through the process-tree timeout adapter (#10238)", () => {
+    const runCommand = vi.fn((_command: readonly string[], _options?: unknown) => {
+      return { status: 0 } as never;
+    });
+    const helpers = createOpenshellCliHelpers({
+      getCachedBinary: () => "/opt/openshell",
+      setCachedBinary: vi.fn(),
+      getGatewayPort: () => 31818,
+      getDockerDriverGatewayEndpoint: () => "http://127.0.0.1:31818",
+      runCommand,
+    });
+
+    helpers.runOpenshell(["sandbox", "list"], {
+      ignoreError: true,
+      killProcessTreeOnTimeout: true,
+      timeout: 1000,
+    });
+
+    const expectedArgv =
+      process.platform === "linux" && fs.existsSync("/usr/bin/timeout")
+        ? ["/usr/bin/timeout", "--signal=KILL", "0.75s", "/opt/openshell", "sandbox", "list"]
+        : ["/opt/openshell", "sandbox", "list"];
+    expect(runCommand).toHaveBeenCalledWith(
+      expectedArgv,
+      expect.objectContaining({
+        ignoreError: true,
+        killSignal: "SIGKILL",
+        timeout: 1000,
+      }),
+    );
+    expect(runCommand.mock.calls[0]?.[1]).not.toHaveProperty("killProcessTreeOnTimeout");
+  });
+
   it("forwards the validated sandbox name into the Deep Agents Code sandbox create env", () => {
     const result = prepareSandboxCreateLaunch({
       agent: { name: "langchain-deepagents-code" } as any,
@@ -678,7 +754,7 @@ describe("prepareSandboxCreateLaunchWithPrebuild", () => {
     },
   );
 
-  it("preserves the gateway builder for generated Deep Agents Code images", async () => {
+  it("builds generated Deep Agents Code images before rendering create", async () => {
     const buildCtx = createTrustedBuildContext();
     const dockerfile = path.join(buildCtx, "Dockerfile");
     const result = await prepareSandboxCreateLaunchWithPrebuild({
@@ -698,55 +774,56 @@ describe("prepareSandboxCreateLaunchWithPrebuild", () => {
         buildId: "build-123",
         dockerDriverGateway: true,
         env: { NEMOCLAW_SANDBOX_PREBUILD: "1" },
-        buildImage: async () => 1,
+        buildImage: async () => 0,
+        inspectImageId: () => IMAGE_ID,
         log: vi.fn(),
         origin: "generated",
       },
     });
 
     expect(result.prebuild).toEqual({
-      createArgs: ["--from", dockerfile, "--name", "demo"],
-      imageRef: null,
-      imageId: null,
+      createArgs: ["--from", "nemoclaw-sandbox-local:demo-build-123", "--name", "demo"],
+      imageRef: "nemoclaw-sandbox-local:demo-build-123",
+      imageId: IMAGE_ID,
     });
-    expect(result.createCommand).toContain(`sandbox create --from ${dockerfile} --name demo`);
-    expect(result.createCommand).not.toContain("nemoclaw-sandbox-local");
+    expect(result.createCommand).toContain(
+      "sandbox create --from nemoclaw-sandbox-local:demo-build-123 --name demo",
+    );
   });
 
-  it("preserves the rootless gateway path for a generated portable Hermes image", async () => {
+  it("stops a generated portable Hermes image after a failed Podman build", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+    const buildImage = vi.fn().mockResolvedValue(1);
     const buildCtx = createTrustedBuildContext();
     const dockerfile = path.join(buildCtx, "Dockerfile");
-    const result = await prepareSandboxCreateLaunchWithPrebuild({
-      agent: { name: "hermes" } as any,
-      chatUiUrl: "",
-      createArgs: ["--from", dockerfile, "--name", "demo"],
-      env: {},
-      extraPlaceholderKeys: [],
-      getDashboardForwardPort: () => "0",
-      hermesApiPort: 8642,
-      hermesDashboardState: disabledHermesDashboardState,
-      manageDashboard: false,
-      openshellShellCommand: (args) => args.join(" "),
-      sandboxName: "demo",
-      buildEnv: () => ({}),
-      prebuild: {
-        buildCtx,
-        buildId: "build-123",
-        dockerDriverGateway: true,
-        env: {
-          NEMOCLAW_EXPERIMENTAL_PROFILE: "portable",
-          NEMOCLAW_SANDBOX_PREBUILD: "1",
+    await expect(
+      prepareSandboxCreateLaunchWithPrebuild({
+        agent: { name: "hermes" } as any,
+        chatUiUrl: "",
+        createArgs: ["--from", dockerfile, "--name", "demo"],
+        env: {},
+        extraPlaceholderKeys: [],
+        getDashboardForwardPort: () => "0",
+        hermesApiPort: 8642,
+        hermesDashboardState: disabledHermesDashboardState,
+        manageDashboard: false,
+        openshellShellCommand: (args) => args.join(" "),
+        sandboxName: "demo",
+        buildEnv: () => ({}),
+        prebuild: {
+          buildCtx,
+          buildId: "build-123",
+          dockerDriverGateway: true,
+          env: {
+            NEMOCLAW_EXPERIMENTAL_PROFILE: "portable",
+            NEMOCLAW_SANDBOX_PREBUILD: "1",
+          },
+          buildImage,
+          log: vi.fn(),
+          origin: "generated",
         },
-        buildImage: async () => 1,
-        log: vi.fn(),
-        origin: "generated",
-      },
-    });
-
-    expect(result.prebuild).toEqual({
-      createArgs: ["--from", dockerfile, "--name", "demo"],
-      imageRef: null,
-      imageId: null,
-    });
+      }),
+    ).rejects.toThrow("Local rootless Podman build failed (exit 1)");
+    expect(buildImage).toHaveBeenCalledOnce();
   });
 });

@@ -3,6 +3,13 @@
 
 import type { SandboxMessagingPlan } from "../../messaging/manifest";
 import type { ToolDisclosure } from "../../tool-disclosure";
+import {
+  isLocalInferenceProvider,
+  usesNativeLocalInference,
+  usesNativeLocalInferenceForAgent,
+} from "../../inference/native-local/eligibility";
+import type { NativeLocalProviderAttachment } from "../../inference/native-local/profile";
+export { isLocalInferenceProvider };
 import type { ResolvedCorporateCa } from "../corporate-ca-types";
 import type { DcodeAutoApprovalMode } from "../dcode-auto-approval";
 import type { HermesDashboardOnboardState } from "../hermes-dashboard";
@@ -38,8 +45,15 @@ const PROFILE_ENVIRONMENT_INPUTS = {
     "NEMOCLAW_PROXY_PORT",
     "NEMOCLAW_REASONING",
     "NEMOCLAW_REASONING_EFFORT",
+    "NEMOCLAW_SERVING_PRESET",
   ],
-  hermes: ["NEMOCLAW_CONTEXT_WINDOW", "NEMOCLAW_PROXY_HOST", "NEMOCLAW_PROXY_PORT"],
+  hermes: [
+    "NEMOCLAW_CONTEXT_WINDOW",
+    "NEMOCLAW_HERMES_SWITCHYARD_ROUTING_B64",
+    "NEMOCLAW_HERMES_SWITCHYARD_BINDINGS_B64",
+    "NEMOCLAW_PROXY_HOST",
+    "NEMOCLAW_PROXY_PORT",
+  ],
   "langchain-deepagents-code": [
     "NEMOCLAW_PROXY_HOST",
     "NEMOCLAW_PROXY_PORT",
@@ -58,7 +72,7 @@ const HOST_NO_PROXY_INPUTS = ["NO_PROXY", "no_proxy"] as const;
 
 export interface ManagedStartupOnboardProfileInput {
   readonly agentName: string;
-  readonly inference: ManagedStartupResolvedInferenceInput;
+  readonly inference: ManagedStartupResolvedInferenceInput | null;
   readonly chatUiUrl: string;
   readonly effectiveDashboardPort: number;
   readonly manageDashboard: boolean;
@@ -87,6 +101,61 @@ export type BuiltManagedStartupOnboardProfile = BuiltManagedStartupProfile & {
   readonly credentialProxyReplayRequired: boolean;
 };
 
+export function resolveManagedStartupNativeLocalAttachment(input: {
+  agentName: string;
+  provider: string | null;
+  endpointUrl: string | null;
+  localNimSelected?: boolean;
+  nativeLocalProviderAttachment?: NativeLocalProviderAttachment;
+}): NativeLocalProviderAttachment | undefined {
+  const attachment = input.nativeLocalProviderAttachment;
+  return usesNativeLocalInferenceForAgent(
+    input.agentName,
+    input.provider,
+    input.endpointUrl ?? attachment?.endpointUrl,
+    input.localNimSelected,
+  ) &&
+    (input.agentName === "langchain-deepagents-code"
+      ? attachment?.agent === undefined
+      : attachment?.agent === input.agentName)
+    ? attachment
+    : undefined;
+}
+
+export function resolveManagedStartupInferenceEndpoint(input: {
+  agentName: string;
+  provider: string | null;
+  endpointUrl: string | null;
+  localNimSelected?: boolean;
+  nativeLocalProviderAttachment?: { endpointUrl: string };
+}): string | null {
+  if (input.agentName === "hermes") {
+    return input.nativeLocalProviderAttachment?.endpointUrl ?? input.endpointUrl;
+  }
+  if (input.agentName === "langchain-deepagents-code") {
+    if (input.provider === "vllm-local" && input.localNimSelected) return input.endpointUrl;
+    if (
+      usesNativeLocalInference(input.provider, input.endpointUrl) &&
+      !input.nativeLocalProviderAttachment
+    ) {
+      throw new Error("Deep Agents Code local inference requires its native provider attachment.");
+    }
+    return input.nativeLocalProviderAttachment?.endpointUrl ?? input.endpointUrl;
+  }
+  if (input.agentName === "pi") {
+    return (
+      input.nativeLocalProviderAttachment?.endpointUrl ??
+      (usesNativeLocalInferenceForAgent(input.agentName, input.provider, input.endpointUrl)
+        ? null
+        : input.endpointUrl)
+    );
+  }
+  if (input.agentName === "openclaw" && input.nativeLocalProviderAttachment) {
+    return input.nativeLocalProviderAttachment.endpointUrl;
+  }
+  return input.endpointUrl;
+}
+
 export class ManagedStartupOnboardProfileError extends Error {
   constructor(message: string) {
     super(`Cannot prepare managed onboarding profile: ${message}`);
@@ -106,6 +175,10 @@ function requireDashboardPort(port: number): number {
     throw new ManagedStartupOnboardProfileError("dashboard port is missing or invalid");
   }
   return port;
+}
+
+function loopbackDashboardUrl(port: number): string {
+  return `http://127.0.0.1:${String(port)}`;
 }
 
 function dashboardHostname(chatUiUrl: string): string {
@@ -161,11 +234,13 @@ function dashboardForInput(
   }
 
   const config = input.hermesDashboardState.config;
+  const effectivePort = requireDashboardPort(input.effectiveDashboardPort);
   if (!input.hermesDashboardState.enabled) {
     return {
       agent,
       mode: "disabled",
-      url: input.chatUiUrl,
+      url: loopbackDashboardUrl(effectivePort),
+      browserUrl: input.chatUiUrl,
       publicPort: null,
       internalPort: null,
       tuiEnabled: false,
@@ -176,11 +251,18 @@ function dashboardForInput(
       "Hermes dashboard is enabled without resolved configuration",
     );
   }
+  const publicPort = requireDashboardPort(config.port);
+  if (publicPort !== effectivePort) {
+    throw new ManagedStartupOnboardProfileError(
+      "Hermes dashboard state must match the allocated dashboard port",
+    );
+  }
   return {
     agent,
     mode: "loopback-forwarded",
-    url: input.chatUiUrl,
-    publicPort: requireDashboardPort(config.port),
+    url: loopbackDashboardUrl(publicPort),
+    browserUrl: input.chatUiUrl,
+    publicPort,
     internalPort: requireDashboardPort(config.internalPort),
     tuiEnabled: config.tuiEnabled,
   };

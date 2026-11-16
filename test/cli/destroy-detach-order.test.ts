@@ -34,7 +34,7 @@ describe("CLI dispatch", () => {
                 model: "test-model",
                 provider: "nvidia-prod",
                 gpuEnabled: false,
-                policies: [],
+                agent: "langchain-deepagents-code",
               },
             },
             defaultSandbox: "alpha",
@@ -45,10 +45,19 @@ describe("CLI dispatch", () => {
           path.join(localBin, "openshell"),
           [
             "#!/bin/sh",
+            'if [ "$1" = "gateway" ] && [ "$2" = "list" ]; then',
+            '  printf \'[{"name":"nemoclaw","active":true}]\\n\'',
+            "  exit 0",
+            "fi",
             `log_file=${JSON.stringify(openshellLog)}`,
             'if [ "$1" = "sandbox" ] && [ "$2" = "list" ]; then',
             '  printf "NAME STATUS\\n" >> "$log_file"',
             "  exit 0",
+            "fi",
+            'if [ "$1 $2 $3 $4 $5" = "sandbox get -g nemoclaw alpha" ]; then',
+            '  printf \'%s\\n\' "$*" >> "$log_file"',
+            '  printf "Error: code: \'Some requested entity was not found\', message: \\"sandbox not found\\"\\n" >&2',
+            "  exit 1",
             "fi",
             'printf \'%s\\n\' "$*" >> "$log_file"',
             "exit 0",
@@ -58,30 +67,35 @@ describe("CLI dispatch", () => {
         fs.writeFileSync(path.join(localBin, "docker"), ["#!/bin/sh", "exit 0"].join("\n"), {
           mode: 0o755,
         });
+        fs.writeFileSync(path.join(localBin, "brew"), ["#!/bin/sh", "exit 127"].join("\n"), {
+          mode: 0o755,
+        });
 
         const r = runWithEnv("alpha destroy -y", {
           HOME: home,
           PATH: `${localBin}:${process.env.PATH || ""}`,
         });
 
-        expect(r.code, r.out).toBe(0);
         const log = fs.readFileSync(openshellLog, "utf8");
-        const deleteIdx = indexOfArg(log, "sandbox delete alpha");
+        expect(r.code, `${r.out}\nOpenShell log:\n${log}`).toBe(0);
+        const deleteIdx = indexOfArg(log, "sandbox delete -g nemoclaw alpha");
         expect(deleteIdx).toBeGreaterThan(-1);
 
         const expectedDetachLines = [
-          "sandbox provider detach alpha alpha-telegram-bridge",
-          "sandbox provider detach alpha alpha-discord-bridge",
-          "sandbox provider detach alpha alpha-wechat-bridge",
-          "sandbox provider detach alpha alpha-slack-bridge",
-          "sandbox provider detach alpha alpha-slack-app",
-          "sandbox provider detach alpha alpha-brave-search",
-          "sandbox provider detach alpha alpha-tavily-search",
+          "sandbox provider detach -g nemoclaw alpha alpha-telegram-bridge",
+          "sandbox provider detach -g nemoclaw alpha alpha-discord-bridge",
+          "sandbox provider detach -g nemoclaw alpha alpha-wechat-bridge",
+          "sandbox provider detach -g nemoclaw alpha alpha-slack-bridge",
+          "sandbox provider detach -g nemoclaw alpha alpha-slack-app",
+          "sandbox provider detach -g nemoclaw alpha alpha-brave-search",
+          "sandbox provider detach -g nemoclaw alpha alpha-tavily-search",
         ];
         expectedDetachLines.forEach((line) => {
           const idx = indexOfArg(log, line);
           expect(idx, `${line} should appear in openshell log`).toBeGreaterThan(-1);
-          expect(idx, `${line} should precede 'sandbox delete alpha'`).toBeLessThan(deleteIdx);
+          expect(idx, `${line} should precede the owner-scoped sandbox delete`).toBeLessThan(
+            deleteIdx,
+          );
         });
       } finally {
         fs.rmSync(home, { recursive: true, force: true });

@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { MIN_HERMES_OLLAMA_CONTEXT_WINDOW } from "../inference/ollama-runtime-context";
@@ -8,7 +12,11 @@ import {
   decideInstallOllamaLinuxMode,
   type InstallOllamaLinuxOptions,
   installOllamaOnLinux,
+  OFFICIAL_OLLAMA_INSTALLER_SHA256,
+  OFFICIAL_OLLAMA_INSTALLER_URL,
+  ollamaInstallerDownloadFailureMessage,
   resolveOllamaTarballArch,
+  sha256File,
 } from "./install-ollama-linux";
 
 function makeOpts(overrides: Partial<InstallOllamaLinuxOptions>): InstallOllamaLinuxOptions {
@@ -22,6 +30,7 @@ function makeOpts(overrides: Partial<InstallOllamaLinuxOptions>): InstallOllamaL
     runCaptureImpl: vi.fn().mockReturnValue(""),
     runCaptureExImpl: vi.fn().mockReturnValue({ stdout: "", exitCode: 0, timedOut: false }),
     runShellImpl: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "", error: null }),
+    sha256FileImpl: vi.fn().mockReturnValue(OFFICIAL_OLLAMA_INSTALLER_SHA256),
     waitForHttpImpl: vi.fn().mockReturnValue(true),
     sleepSecondsImpl: vi.fn(),
     ensureManagedOllamaLoopbackSystemdOverrideImpl: vi.fn().mockReturnValue("ready"),
@@ -45,6 +54,21 @@ describe("resolveOllamaTarballArch", () => {
     expect(resolveOllamaTarballArch("arm" as NodeJS.Architecture)).toBeNull();
     expect(resolveOllamaTarballArch("ia32" as NodeJS.Architecture)).toBeNull();
     expect(resolveOllamaTarballArch("ppc64" as NodeJS.Architecture)).toBeNull();
+  });
+});
+
+describe("sha256File", () => {
+  it("computes a lowercase SHA-256 identity for downloaded bytes", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-ollama-integrity-"));
+    const file = `${directory}/install.sh`;
+    try {
+      fs.writeFileSync(file, "#!/bin/sh\nexit 0\n");
+      expect(sha256File(file)).toBe(
+        "306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb",
+      );
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
 
@@ -374,7 +398,285 @@ describe("installOllamaOnLinux (system)", () => {
     return undefined;
   }
 
+  function outputPathFromCurlCommand(command: readonly string[]): string {
+    const outputIndex = command.indexOf("--output");
+    expect(outputIndex).toBeGreaterThanOrEqual(0);
+    const outputPath = command[outputIndex + 1];
+    expect(outputPath).toBeTruthy();
+    return outputPath;
+  }
+
+  function configuredCurlAttempts(command: readonly string[]): number {
+    const retryIndex = command.indexOf("--retry");
+    expect(retryIndex).toBeGreaterThanOrEqual(0);
+    const retries = Number(command[retryIndex + 1]);
+    expect(retries).toBe(3);
+    expect(command).toContain("--retry-all-errors");
+    return retries + 1;
+  }
+
+  it("retries a transient installer fetch and executes the complete file once (#9698)", () => {
+    let fetchAttempts = 0;
+    let installerPath = "";
+    const runCaptureExImpl = vi.fn().mockImplementation((command: readonly string[]) => {
+      installerPath = outputPathFromCurlCommand(command);
+      const allowedAttempts = configuredCurlAttempts(command);
+      fetchAttempts = 2;
+      expect(fetchAttempts).toBeLessThanOrEqual(allowedAttempts);
+      fs.writeFileSync(installerPath, "#!/bin/sh\nexit 0\n");
+      expect(fs.statSync(installerPath).mode & 0o777).toBe(0o600);
+      return { stdout: "", stderr: "", exitCode: 0, timedOut: false };
+    });
+    const runShellImpl = vi
+      .fn()
+      .mockReturnValue({ status: 0, stdout: "", stderr: "", error: null });
+
+    const result = installOllamaOnLinux(
+      makeOpts({
+        modeOverride: "system",
+        runCaptureImpl: vi.fn().mockReturnValue("/usr/bin/zstd"),
+        runCaptureExImpl,
+        runShellImpl,
+      }),
+    );
+
+    expect(result.ok).toBe(true);
+    expect(fetchAttempts).toBe(2);
+    expect(runCaptureExImpl).toHaveBeenCalledTimes(1);
+    expect(runShellImpl).toHaveBeenCalledTimes(1);
+    expect(String(runShellImpl.mock.calls[0]?.[0])).toContain(installerPath);
+    expect(fs.existsSync(installerPath)).toBe(false);
+  });
+
+  it("stops after bounded DNS retries without executing an installer (#9698)", () => {
+    let fetchAttempts = 0;
+    let installerPath = "";
+    const runCaptureExImpl = vi.fn().mockImplementation((command: readonly string[]) => {
+      installerPath = outputPathFromCurlCommand(command);
+      fetchAttempts = configuredCurlAttempts(command);
+      return { stdout: "", stderr: "curl: (6)", exitCode: 6, timedOut: false };
+    });
+    const runShellImpl = vi.fn();
+    const errorLog = vi.fn();
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    try {
+      expect(() =>
+        installOllamaOnLinux(
+          makeOpts({
+            modeOverride: "system",
+            runCaptureImpl: vi.fn().mockReturnValue("/usr/bin/zstd"),
+            runCaptureExImpl,
+            runShellImpl,
+            errorLog,
+          }),
+        ),
+      ).toThrow("process.exit(6)");
+      expect(fetchAttempts).toBe(4);
+      expect(runShellImpl).not.toHaveBeenCalled();
+      expect(fs.existsSync(installerPath)).toBe(false);
+      const message = errorLog.mock.calls[0]?.[0] as string;
+      expect(message).toContain(OFFICIAL_OLLAMA_INSTALLER_URL);
+      expect(message).toContain("raw.githubusercontent.com");
+      expect(message).toContain("curl reported:");
+      expect(message).toContain("Allow outbound HTTPS");
+      expect(message).toContain("rerun nemoclaw onboard");
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    {
+      exitCode: 5,
+      stderr:
+        "curl: (5) Having a SOCKS pre-proxy and proxy is not supported with 'alice:FAKE_PROXY_CREDENTIAL_47@proxy.example:8080'",
+    },
+    {
+      exitCode: 5,
+      stderr:
+        "curl: (5) Unsupported proxy syntax in 'alice:FAKE_PROXY_CREDENTIAL_47@proxy.example:invalid'",
+    },
+    {
+      exitCode: 7,
+      stderr:
+        "> Proxy-Authorization: Basic FAKE_PROXY_TOKEN\n" +
+        "curl: (7) Failed through https://alice:FAKE_PROXY_CREDENTIAL_47@proxy.example \u009b\u202e",
+    },
+    { exitCode: 99, stderr: "curl: (99) FAKE_PROXY_CREDENTIAL_47" },
+    { exitCode: null, stderr: "FAKE_PROXY_CREDENTIAL_47" },
+  ])("keeps host diagnostics out of installer download failures (%#)", ({ exitCode, stderr }) => {
+    const errorLog = vi.fn();
+    const runShellImpl = vi.fn();
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    try {
+      expect(() =>
+        installOllamaOnLinux(
+          makeOpts({
+            modeOverride: "system",
+            runCaptureExImpl: vi.fn().mockReturnValue({
+              stdout: "",
+              stderr,
+              exitCode,
+              timedOut: false,
+            }),
+            runCaptureImpl: vi.fn().mockReturnValue("/usr/bin/zstd"),
+            runShellImpl,
+            errorLog,
+          }),
+        ),
+      ).toThrow(`process.exit(${exitCode ?? 1})`);
+      expect(runShellImpl).not.toHaveBeenCalled();
+      expect(errorLog).toHaveBeenCalledOnce();
+      const message = errorLog.mock.calls[0]?.[0] as string;
+      expect(message).not.toContain("FAKE_PROXY_");
+      expect(message).not.toContain("alice");
+      expect(message).not.toContain("Proxy-Authorization");
+      expect(message).not.toMatch(/[\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/u);
+      expect(message).toContain(OFFICIAL_OLLAMA_INSTALLER_URL);
+      expect(message).toContain("rerun nemoclaw onboard");
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
+  it("names the failed URL, host, and connection error with a recovery hint", () => {
+    const message = ollamaInstallerDownloadFailureMessage(7);
+    expect(message).toContain("exit 7");
+    expect(message).toContain(OFFICIAL_OLLAMA_INSTALLER_URL);
+    expect(message).toContain("raw.githubusercontent.com (outbound HTTPS, port 443)");
+    expect(message).toContain("Could not connect");
+    expect(message).toContain("Allow outbound HTTPS to raw.githubusercontent.com");
+    expect(message).toContain("export HTTPS_PROXY to a working proxy");
+    expect(message).toContain(`curl -fsSI "${OFFICIAL_OLLAMA_INSTALLER_URL}"`);
+    expect(message).toContain("rerun nemoclaw onboard");
+  });
+
+  it.each([
+    [5, /proxy.*resolution or configuration/i],
+    [6, /resolve.*host/i],
+    [22, /HTTP error/],
+    [28, /timed out/],
+    [35, /TLS connection/],
+    [60, /certificate verification/],
+  ] as const)("explains the network failure for curl exit %i", (exitCode, cause) => {
+    const message = ollamaInstallerDownloadFailureMessage(exitCode);
+    expect(message).toMatch(cause);
+    expect(message).toContain(`exit ${exitCode}`);
+  });
+
+  it.each([null, 99])("keeps recovery guidance when curl exit %s has no summary", (exitCode) => {
+    const message = ollamaInstallerDownloadFailureMessage(exitCode);
+    expect(message).toContain(`exit ${exitCode ?? "unknown"}`);
+    expect(message).not.toContain("curl reported:");
+    expect(message).toContain("Allow outbound HTTPS");
+  });
+
+  it("never executes a partially transferred installer (#9698)", () => {
+    let installerPath = "";
+    const runCaptureExImpl = vi.fn().mockImplementation((command: readonly string[]) => {
+      installerPath = outputPathFromCurlCommand(command);
+      fs.writeFileSync(installerPath, "#!/bin/sh\necho partial");
+      return { stdout: "", stderr: "curl: (18)", exitCode: 18, timedOut: false };
+    });
+    const runShellImpl = vi.fn();
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    try {
+      expect(() =>
+        installOllamaOnLinux(
+          makeOpts({
+            modeOverride: "system",
+            runCaptureImpl: vi.fn().mockReturnValue("/usr/bin/zstd"),
+            runCaptureExImpl,
+            runShellImpl,
+          }),
+        ),
+      ).toThrow("process.exit(18)");
+      expect(runShellImpl).not.toHaveBeenCalled();
+      expect(fs.existsSync(installerPath)).toBe(false);
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
+  it("rejects installer content whose digest differs from the pinned identity", () => {
+    let installerPath = "";
+    const runCaptureExImpl = vi.fn().mockImplementation((command: readonly string[]) => {
+      installerPath = outputPathFromCurlCommand(command);
+      fs.writeFileSync(installerPath, "#!/bin/sh\nprintf substituted\n");
+      return { stdout: "", stderr: "", exitCode: 0, timedOut: false };
+    });
+    const runShellImpl = vi.fn();
+    const errorLog = vi.fn();
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    try {
+      expect(() =>
+        installOllamaOnLinux(
+          makeOpts({
+            modeOverride: "system",
+            runCaptureImpl: vi.fn().mockReturnValue("/usr/bin/zstd"),
+            runCaptureExImpl,
+            runShellImpl,
+            sha256FileImpl: sha256File,
+            errorLog,
+          }),
+        ),
+      ).toThrow("process.exit(1)");
+      expect(runShellImpl).not.toHaveBeenCalled();
+      expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("integrity check failed"));
+      expect(fs.existsSync(installerPath)).toBe(false);
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
+  it("does not retry an installer that exits nonzero (#9698)", () => {
+    let installerPath = "";
+    const runCaptureExImpl = vi.fn().mockImplementation((command: readonly string[]) => {
+      installerPath = outputPathFromCurlCommand(command);
+      fs.writeFileSync(installerPath, "#!/bin/sh\nexit 9\n");
+      return { stdout: "", stderr: "", exitCode: 0, timedOut: false };
+    });
+    const runShellImpl = vi
+      .fn()
+      .mockReturnValue({ status: 9, stdout: "", stderr: "", error: null });
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    try {
+      expect(() =>
+        installOllamaOnLinux(
+          makeOpts({
+            modeOverride: "system",
+            runCaptureImpl: vi.fn().mockReturnValue("/usr/bin/zstd"),
+            runCaptureExImpl,
+            runShellImpl,
+          }),
+        ),
+      ).toThrow("process.exit(9)");
+      expect(runCaptureExImpl).toHaveBeenCalledTimes(1);
+      expect(runShellImpl).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(installerPath)).toBe(false);
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
   it("runs the official install.sh and applies the systemd loopback override", () => {
+    const runCaptureExImpl = vi
+      .fn()
+      .mockReturnValue({ stdout: "", stderr: "", exitCode: 0, timedOut: false });
     const runShellImpl = vi
       .fn()
       .mockReturnValue({ status: 0, stdout: "", stderr: "", error: null });
@@ -383,15 +685,26 @@ describe("installOllamaOnLinux (system)", () => {
     const opts = makeOpts({
       modeOverride: "system",
       runCaptureImpl: vi.fn().mockReturnValue("/usr/bin/zstd"),
+      runCaptureExImpl,
       runShellImpl,
       ensureManagedOllamaLoopbackSystemdOverrideImpl: ensureOverride,
       removeUserLocalOllamaOwnershipImpl: removeOwnership,
     });
     const result = installOllamaOnLinux(opts);
     expect(result).toEqual({ ok: true, mode: "system", binPath: "/usr/local/bin/ollama" });
-    const installCall = findRunShellCall(runShellImpl, "ollama.com/install.sh");
+    const fetchCall = runCaptureExImpl.mock.calls.find(([command]) =>
+      Array.isArray(command) ? command.includes(OFFICIAL_OLLAMA_INSTALLER_URL) : false,
+    )?.[0] as readonly string[] | undefined;
+    expect(fetchCall).toContain("--connect-timeout");
+    expect(fetchCall).toContain("--max-time");
+    expect(fetchCall).toContain("--retry-max-time");
+    expect(fetchCall).toContain("--proto-redir");
+    expect(fetchCall).not.toContain("--insecure");
+    expect(opts.sha256FileImpl).toHaveBeenCalled();
+    const installCall = findRunShellCall(runShellImpl, "sh '");
     expect(installCall).toBeDefined();
-    expect(installCall).toContain("curl -fsSL");
+    expect(installCall).not.toContain("curl");
+    expect(installCall).not.toContain("|");
     expect(ensureOverride).toHaveBeenCalled();
     expect(removeOwnership).toHaveBeenCalledWith({ homeDir: "/home/test" });
   });

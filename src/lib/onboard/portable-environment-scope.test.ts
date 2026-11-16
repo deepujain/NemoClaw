@@ -3,6 +3,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 
+import type { CheckpointPortableRuntimeAuthority } from "../state/onboard-checkpoint-types";
 import {
   createDefaultResumeProfileEnvironmentScope,
   createPortableOnboardEnvironmentScope,
@@ -17,7 +18,65 @@ const CLEARED_PORTABLE_RUNTIME_ENV_KEYS = PORTABLE_RUNTIME_ENV_KEYS.filter(
   (key) => key !== "NEMOCLAW_EXPERIMENTAL_PROFILE",
 );
 
+/** Build a current-user runtime authority for environment-scope tests. */
+function portableRuntimeAuthority(): CheckpointPortableRuntimeAuthority {
+  const uid = process.getuid!();
+  return {
+    schemaVersion: 1,
+    kind: "podman",
+    ownership: "current-user",
+    uid,
+    homeDir: "/home/alice",
+    configHome: "/home/alice/.config",
+    runtimeDir: `/run/user/${String(uid)}`,
+    socketPath: `/run/user/${String(uid)}/podman/podman.sock`,
+  };
+}
+
 describe("portable onboarding environment scope", () => {
+  it.each(["build", "nvidia", "invalid-private-provider"])(
+    "rejects non-Ollama provider intent before changing fresh environment [case %#] (#11718)",
+    (provider) => {
+      const env: NodeJS.ProcessEnv = {
+        NEMOCLAW_PROVIDER: provider,
+        NEMOCLAW_MODEL: "nvidia/example-model",
+        DOCKER_HOST: "unix:///previous.sock",
+      };
+      const before = { ...env };
+
+      expect(() => createPortableOnboardEnvironmentScope(env, null)).toThrow(
+        /NEMOCLAW_PROVIDER=ollama.*--experimental-profile portable/su,
+      );
+      expect(env).toEqual(before);
+    },
+  );
+
+  it.each(["ollama", " ollama ", "", "  "])(
+    "preserves the model for compatible fresh provider intent [case %#] (#11718)",
+    (provider) => {
+      const env: NodeJS.ProcessEnv = {
+        NEMOCLAW_PROVIDER: provider,
+        NEMOCLAW_MODEL: "qwen3.6:35b",
+      };
+      const before = { ...env };
+      const scope = createPortableOnboardEnvironmentScope(env, null);
+
+      expect(env.NEMOCLAW_PROVIDER).toBe("ollama");
+      expect(env.NEMOCLAW_MODEL).toBe("qwen3.6:35b");
+      scope.restore();
+      expect(env).toEqual(before);
+    },
+  );
+
+  it("leaves provider selection to the checkpoint during resume (#11718)", () => {
+    const env: NodeJS.ProcessEnv = { NEMOCLAW_PROVIDER: "build" };
+    const scope = createPortableOnboardEnvironmentScope(env, null, { resume: true });
+
+    expect(env.NEMOCLAW_PROVIDER).toBeUndefined();
+    scope.restore();
+    expect(env.NEMOCLAW_PROVIDER).toBe("build");
+  });
+
   it("preserves an explicit model during fresh portable onboarding (#9200)", () => {
     const env: NodeJS.ProcessEnv = { NEMOCLAW_MODEL: "qwen3.6:35b" };
     const scope = createPortableOnboardEnvironmentScope(env, null);
@@ -93,7 +152,10 @@ describe("portable onboarding environment scope", () => {
   });
 
   it("uses the activation model instead of ambient fresh model intent (#9200)", () => {
-    const env: NodeJS.ProcessEnv = { NEMOCLAW_MODEL: "ambient/model" };
+    const env: NodeJS.ProcessEnv = {
+      NEMOCLAW_PROVIDER: "build",
+      NEMOCLAW_MODEL: "ambient/model",
+    };
     const scope = createPortableOnboardEnvironmentScope(env, {
       schemaVersion: 1,
       baseUrl: "https://inference.example.test/v1",
@@ -105,7 +167,7 @@ describe("portable onboarding environment scope", () => {
     expect(env.NEMOCLAW_MODEL).toBe("activation/model");
 
     scope.restore();
-    expect(env).toEqual({ NEMOCLAW_MODEL: "ambient/model" });
+    expect(env).toEqual({ NEMOCLAW_PROVIDER: "build", NEMOCLAW_MODEL: "ambient/model" });
   });
 
   it("rejects malformed fresh model intent with the provider validator (#9200)", () => {
@@ -176,6 +238,54 @@ describe("portable onboarding environment scope", () => {
     },
   );
 
+  it("removes exact scope-owned selectors only from the Hermes Podman authority source", () => {
+    const runtime = portableRuntimeAuthority();
+    const containersConf = "/home/alice/.config/nemoclaw/portable/containers.conf";
+    const env: NodeJS.ProcessEnv = { HOME: runtime.homeDir, PATH: "/usr/bin" };
+    const scope = createPortableOnboardEnvironmentScope(env, null);
+    scope.installRuntime({ containersConf, socketPath: runtime.socketPath });
+
+    const source = scope.createHermesPortablePodmanSourceEnvironment(runtime);
+
+    expect(source).not.toHaveProperty("DOCKER_HOST");
+    expect(source).not.toHaveProperty("CONTAINERS_CONF");
+    expect(source).toMatchObject({ HOME: runtime.homeDir, PATH: "/usr/bin" });
+    expect(env).toMatchObject({
+      DOCKER_HOST: `unix://${runtime.socketPath}`,
+      CONTAINERS_CONF: containersConf,
+      NETAVARK_FW: "iptables",
+    });
+  });
+
+  it.each([
+    ["DOCKER_HOST", "unix:///run/user/1000/replaced/podman.sock"],
+    ["CONTAINERS_CONF", "/home/alice/.config/replaced/containers.conf"],
+  ] as const)("keeps a replaced %s selector for Hermes authority rejection", (name, value) => {
+    const runtime = portableRuntimeAuthority();
+    const env: NodeJS.ProcessEnv = { HOME: runtime.homeDir, PATH: "/usr/bin" };
+    const scope = createPortableOnboardEnvironmentScope(env, null);
+    scope.installRuntime({
+      containersConf: "/home/alice/.config/nemoclaw/portable/containers.conf",
+      socketPath: runtime.socketPath,
+    });
+    env[name] = value;
+
+    expect(scope.createHermesPortablePodmanSourceEnvironment(runtime)[name]).toBe(value);
+  });
+
+  it("rejects a scope whose installed selectors disagree with runtime authority", () => {
+    const runtime = portableRuntimeAuthority();
+    const scope = createPortableOnboardEnvironmentScope({}, null);
+    scope.installRuntime({
+      containersConf: "/home/alice/.config/nemoclaw/portable/containers.conf",
+      socketPath: "/run/user/1000/replaced/podman.sock",
+    });
+
+    expect(() => scope.createHermesPortablePodmanSourceEnvironment(runtime)).toThrow(
+      "disagrees with runtime authority",
+    );
+  });
+
   it("restores absent, empty, and valued keys exactly after success or failure", () => {
     const env: NodeJS.ProcessEnv = {
       DOCKER_HOST: "",
@@ -216,17 +326,15 @@ describe("portable onboarding environment scope", () => {
     expect(env).toEqual(before);
   });
 
-  it.each(
-    [
-        "NEMOCLAW_PROVIDER",
-        "NEMOCLAW_MODEL",
-        "NEMOCLAW_PROVIDER_MODEL",
-        "NEMOCLAW_ENDPOINT_URL",
-        "NEMOCLAW_PREFERRED_API",
-        "NEMOCLAW_POLICY_TIER",
-        "NEMOCLAW_TOOL_DISCLOSURE",
-      ],
-  )(
+  it.each([
+    "NEMOCLAW_PROVIDER",
+    "NEMOCLAW_MODEL",
+    "NEMOCLAW_PROVIDER_MODEL",
+    "NEMOCLAW_ENDPOINT_URL",
+    "NEMOCLAW_PREFERRED_API",
+    "NEMOCLAW_POLICY_TIER",
+    "NEMOCLAW_TOOL_DISCLOSURE",
+  ])(
     "clears ambient inference selectors while preserving an explicit resume policy list [%s] (#9035)",
     (key) => {
       const env: NodeJS.ProcessEnv = {

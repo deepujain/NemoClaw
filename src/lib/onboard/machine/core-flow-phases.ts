@@ -6,7 +6,10 @@ import {
   normalizeInferenceEndpointSource,
 } from "../../inference/selection";
 import type { WebSearchConfig } from "../../inference/web-search";
+import { isN1xManagedVllmProviderModel } from "../../domain/sandbox/n1x-managed-vllm-rebuild";
 import type { DcodeAutoApprovalMode } from "../dcode-auto-approval";
+import { assertProviderlessInterceptorEnvironment } from "../entry-options";
+import { assertProviderlessSandboxAgent } from "../sandbox-agent";
 import type {
   createProviderRecoveryReceiptLedger,
   ProviderRecoveryReceipt,
@@ -19,6 +22,7 @@ import {
 import { createProviderInferencePhase, createSandboxPhase } from "./flow-phases/provider-sandbox";
 import { UnexpectedOnboardFlowSliceStateError } from "./flow-slice-error";
 import { runCoreOnboardFlowSequence } from "./flow-slices";
+import { advanceTo } from "./result";
 import {
   handleProviderInferenceState,
   type ProviderInferenceStateOptions,
@@ -38,11 +42,9 @@ export interface EndpointProvenanceOptions {
   endpointSource?: InferenceEndpointSource | null;
   endpointSourceProvider?: string | null;
   endpointSourceEndpointUrl?: string | null;
-  getSandboxRegistryEntry: (name: string) => {
-    provider?: unknown;
-    endpointUrl?: unknown;
-    endpointSource?: unknown;
-  } | null;
+  getSandboxRegistryEntry: (
+    name: string,
+  ) => Partial<import("../../state/registry").SandboxEntry> | null;
 }
 
 export interface ProviderInferenceOnboardFlowPhaseOptions<
@@ -51,10 +53,14 @@ export interface ProviderInferenceOnboardFlowPhaseOptions<
 > {
   gatewayName: string;
   forceProviderSelection: boolean;
+  recreateSandbox?: (requested?: boolean) => boolean;
   forceInferenceSetup?: boolean;
+  apfInterceptorRequested?: boolean;
   authoritativeResumeConfig?: boolean;
   providerRecoveryReceipt?: ProviderRecoveryReceipt | null;
   providerRecoveryReceiptLedger?: ReturnType<typeof createProviderRecoveryReceiptLedger>;
+  rebuildSandboxPolicyDocument?: string;
+  inspectSandboxForCreate: import("../sandbox-lifecycle").SandboxLifecycleHelpers["inspectSandboxForCreate"];
   endpointProvenance: EndpointProvenanceOptions;
   env: NodeJS.ProcessEnv;
   constants: ProviderInferenceStateOptions<Context["gpu"], Context["agent"], Host>["constants"];
@@ -67,14 +73,16 @@ export interface SandboxOnboardFlowPhaseOptions<
   ResourceProfile = unknown,
 > {
   gatewayName: string;
+  /** Internal schema-5 lifecycle selection from the locked portable runtime. */
+  hermesPortableLifecycle?: boolean;
+  apfInterceptorRequested?: boolean;
   authoritativeResumeConfig?: boolean;
-  authoritativePolicyTier?: string | null;
 
   recreateJournalTargetIntentFingerprint?: string | null;
   resumeAgentChanged: boolean;
   requestedObservabilityEnabled?: boolean | null;
   requestedDcodeAutoApprovalMode?: DcodeAutoApprovalMode | null;
-  rebuildPreservedEnv?: readonly import("../../state/preserved-env").PreservedEnvFile[];
+  rebuildPolicySourcePath?: string;
   hostMounts?: readonly import("../../state/registry/types").SandboxHostMount[];
   endpointProvenance: EndpointProvenanceOptions;
   recreateSandbox: (requested?: boolean) => boolean;
@@ -99,6 +107,46 @@ export interface CoreOnboardFlowPhases<Context extends OnboardFlowContext> {
 interface EndpointProvenance {
   endpointSource: InferenceEndpointSource | null;
   onboardEndpointUrl: string | null;
+}
+
+export function isCoreFlowCompleteBeforeFinalization(result: {
+  readonly context: Pick<
+    OnboardFlowContext,
+    "providerlessApf" | "sandboxName" | "externalComponent"
+  >;
+  readonly session: { readonly machine: { readonly state: string } };
+}): boolean {
+  return (
+    result.context.providerlessApf === true &&
+    !result.context.externalComponent &&
+    result.session.machine.state === "complete" &&
+    Boolean(result.context.sandboxName)
+  );
+}
+
+function hasProviderBackedApfIntent(context: OnboardFlowContext): boolean {
+  const routeValues = [
+    context.provider,
+    context.model,
+    context.endpointUrl,
+    context.onboardEndpointUrl,
+    context.credentialEnv,
+    context.preferredInferenceApi,
+    context.compatibleEndpointReasoning,
+    context.compatibleEndpointReasoningEffort,
+    context.nimContainer,
+  ];
+  return (
+    routeValues.some((value) => typeof value === "string" && value.trim().length > 0) ||
+    context.endpointSource != null ||
+    context.selectedMessagingChannels.length > 0 ||
+    context.hermesToolGateways.length > 0 ||
+    context.webSearchConfig !== null ||
+    Boolean(context.session?.messagingPlan) ||
+    context.hostLocalInferenceRouteOnly === true ||
+    context.hostLocalInferenceSandboxProofAuthority != null ||
+    context.session?.servingProfileProvenance != null
+  );
 }
 
 function endpointProvenanceForPhase(
@@ -139,11 +187,71 @@ export function createProviderInferenceOnboardFlowPhase<
   Host = unknown,
 >(options: ProviderInferenceOnboardFlowPhaseOptions<Context, Host>): OnboardSequencePhase<Context> {
   return createProviderInferencePhase<Context>(async (context) => {
+    if (
+      options.apfInterceptorRequested === true ||
+      context.session?.apfInterceptorRequested === true
+    ) {
+      assertProviderlessInterceptorEnvironment(true, options.env);
+      assertProviderlessSandboxAgent(context.agent);
+      if (hasProviderBackedApfIntent(context)) {
+        throw new Error(
+          "Interceptor onboarding supports providerless sandbox creation only. No sandbox or provider was created.",
+        );
+      }
+      const sandboxName =
+        context.sandboxName ?? (await options.deps.promptValidatedSandboxName(context.agent));
+      const reservationSessionId = context.session?.sessionId;
+      if (!reservationSessionId) {
+        throw new Error(
+          "APF interceptor onboarding requires a durable session before providerless sandbox creation.",
+        );
+      }
+      const observed = options.inspectSandboxForCreate(sandboxName);
+      if (observed.existingEntry || observed.liveExists) {
+        throw new Error(
+          `APF interceptor selection cannot adopt existing sandbox '${sandboxName}'. Choose a new sandbox name.`,
+        );
+      }
+      await options.deps.checkpointSandboxIdentity(sandboxName, context.agent);
+      const reserved = await options.deps.withGatewayRouteMutationLock(options.gatewayName, () =>
+        options.deps.reserveSandboxInferenceRoute(
+          sandboxName,
+          {
+            provider: null,
+            model: null,
+            endpointUrl: null,
+            endpointSource: null,
+            credentialEnv: null,
+            preferredInferenceApi: null,
+            gatewayName: options.gatewayName,
+            reservationSessionId,
+          },
+          { requireAbsent: true },
+        ),
+      );
+      if (!reserved) {
+        throw new Error(
+          `APF interceptor onboarding could not reserve sandbox '${sandboxName}' for verified providerless creation.`,
+        );
+      }
+      return {
+        context: { ...context, sandboxName, providerlessApf: true },
+        result: [
+          advanceTo("inference", {
+            metadata: { state: "provider_selection", providerlessApf: true },
+          }),
+          advanceTo("sandbox", {
+            metadata: { state: "inference", providerlessApf: true },
+          }),
+        ],
+      };
+    }
     const endpointProvenance = endpointProvenanceForPhase(context, options.endpointProvenance);
     const providerInferenceResult = await handleProviderInferenceState({
       gatewayName: options.gatewayName,
       resume: context.resume,
       fresh: context.fresh,
+      recreateSandbox: options.recreateSandbox?.(false) ?? false,
       session: context.session,
       gpu: context.gpu,
       gpuPassthrough: context.gpuPassthrough,
@@ -155,6 +263,7 @@ export function createProviderInferenceOnboardFlowPhase<
       authoritativeResumeConfig: options.authoritativeResumeConfig,
       providerRecoveryReceipt: options.providerRecoveryReceipt,
       providerRecoveryReceiptLedger: options.providerRecoveryReceiptLedger,
+      rebuildSandboxPolicyDocument: options.rebuildSandboxPolicyDocument,
       initial: {
         model: context.model,
         provider: context.provider,
@@ -174,7 +283,10 @@ export function createProviderInferenceOnboardFlowPhase<
       selectedMessagingChannels: context.selectedMessagingChannels,
       env: options.env,
       constants: options.constants,
-      deps: options.deps,
+      deps: {
+        ...options.deps,
+        getSandboxRegistryEntry: options.endpointProvenance.getSandboxRegistryEntry,
+      },
     });
 
     return {
@@ -199,6 +311,8 @@ export function createProviderInferenceOnboardFlowPhase<
         hostLocalInferenceRouteOnly: providerInferenceResult.hostLocalInferenceRouteOnly,
         hostLocalInferenceSandboxProofAuthority:
           providerInferenceResult.hostLocalInferenceSandboxProofAuthority,
+        deferredInferenceRoute: providerInferenceResult.deferredInferenceRoute,
+        stagedNativeLocalRecreation: providerInferenceResult.stagedNativeLocalRecreation,
       }),
       result: providerInferenceResult.stateResults,
     };
@@ -224,23 +338,31 @@ export function createSandboxOnboardFlowPhase<
       resume: context.resume,
       fresh: context.fresh,
       gatewayName: options.gatewayName,
+      hermesPortableLifecycle: options.hermesPortableLifecycle === true,
+      apfInterceptorRequested: options.apfInterceptorRequested === true,
+      externalComponentRegistered:
+        context.externalComponent !== null && context.externalComponent !== undefined,
       authoritativeResumeConfig: options.authoritativeResumeConfig,
-      authoritativePolicyTier: options.authoritativePolicyTier,
+      deferredN1xManagedVllmPreviewIntent:
+        context.deferredN1xManagedVllmPreviewAccepted === true &&
+        isN1xManagedVllmProviderModel(context.provider, context.model),
+      deferSandboxEffectsUntilIdentityVerification: options.apfInterceptorRequested === true,
 
       recreateJournalTargetIntentFingerprint: options.recreateJournalTargetIntentFingerprint,
       endpointSource: endpointProvenance.endpointSource,
       resumeAgentChanged: options.resumeAgentChanged,
       requestedObservabilityEnabled: options.requestedObservabilityEnabled,
       requestedDcodeAutoApprovalMode: options.requestedDcodeAutoApprovalMode,
-      rebuildPreservedEnv: options.rebuildPreservedEnv,
+      rebuildPolicySourcePath: options.rebuildPolicySourcePath,
       hostMounts: options.hostMounts,
       recreateSandbox: options.recreateSandbox,
       session: context.session,
       sandboxName: context.sandboxName,
-      model: context.model,
-      provider: context.provider,
+      model: context.model ?? "",
+      provider: context.provider ?? "",
       endpointUrl: context.endpointUrl,
       compatibleEndpointReasoning: context.compatibleEndpointReasoning,
+      compatibleEndpointReasoningEffort: context.compatibleEndpointReasoningEffort,
       credentialEnv: context.credentialEnv,
       nimContainer: context.nimContainer,
       webSearchConfig: context.webSearchConfig,
@@ -253,6 +375,8 @@ export function createSandboxOnboardFlowPhase<
       hermesToolGateways: context.hermesToolGateways,
       hermesAuthMethod: context.hermesAuthMethod,
       hostLocalInferenceRouteOnly: context.hostLocalInferenceRouteOnly === true,
+      deferredInferenceRoute: context.deferredInferenceRoute,
+      stagedNativeLocalRecreation: context.stagedNativeLocalRecreation,
       controlUiPort: options.controlUiPort,
       rootDir: options.rootDir,
       env: options.env,
@@ -268,6 +392,7 @@ export function createSandboxOnboardFlowPhase<
         hermesToolGateways: sandboxStateResult.hermesToolGateways,
         selectedMessagingChannels: sandboxStateResult.selectedMessagingChannels,
         webSearchSupported: sandboxStateResult.webSearchSupported,
+        revalidateSandboxIdentity: sandboxStateResult.revalidateSandboxIdentity,
       }),
       result: sandboxStateResult.stateResult,
     };

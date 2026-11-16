@@ -1,15 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { nativeLocalIdentity } from "../../inference/native-local/contract";
 import { makeMessagingPlan } from "../../../../test/helpers/messaging-plan-fixtures";
 import { expectNoSandboxDelete } from "../../../../test/helpers/rebuild-delete-assertions";
+import {
+  rebuildBackupPhase,
+  listHarnessRebuildBackups,
+} from "../../../../test/helpers/rebuild-flow-harness";
 import {
   createRebuildFlowHarness,
   installRebuildFlowTestHooks,
   snapshotEnv,
 } from "../../../../test/helpers/rebuild-flow-generic-harness";
-import { makePreparedRecoveryManifest } from "./rebuild-flow-test-fixtures";
+import {
+  makePreparedRecoveryManifest,
+  nativeProviderRebuildScenario,
+} from "./rebuild-flow-test-fixtures";
+
+const nativeLocalProfile =
+  require("../../inference/native-local/profile") as typeof import("../../inference/native-local/profile");
+const hermesPostRestore =
+  require("./rebuild-hermes-post-restore") as typeof import("./rebuild-hermes-post-restore");
 
 type Harness = ReturnType<typeof createRebuildFlowHarness>;
 
@@ -33,26 +46,97 @@ function configureSession(
 function providerRuntime(
   registeredProviders: readonly string[],
   credentialKeys: Record<string, string> = {},
+  credentialExpiresAtMs: Record<string, Record<string, number>> = {},
 ) {
+  const providerCredentialKeys = (provider: string) => [
+    ...new Set([
+      credentialKeys[provider] ?? "NVIDIA_INFERENCE_API_KEY",
+      ...Object.keys(credentialExpiresAtMs[provider] ?? {}),
+    ]),
+  ];
   const describeProvider = (provider: string) => {
-    const credentialEnv = credentialKeys[provider] ?? "NVIDIA_INFERENCE_API_KEY";
     const output = [
       `Name: ${provider}`,
       "Type: openai",
-      `Credential keys: ${credentialEnv}`,
+      `Credential keys: ${providerCredentialKeys(provider).join(", ")}`,
       "Config keys: OPENAI_BASE_URL",
     ].join("\n");
     return { status: 0, output, stdout: output, stderr: "" };
   };
   const missingProvider = { status: 1, output: "", stdout: "", stderr: "provider not found" };
+  const inventoryOutput = JSON.stringify(
+    registeredProviders.map((provider) => ({
+      name: provider,
+      credential_keys: providerCredentialKeys(provider),
+      ...(credentialExpiresAtMs[provider]
+        ? { credential_expires_at_ms: credentialExpiresAtMs[provider] }
+        : {}),
+    })),
+  );
   return (args: string[]) => {
     const provider = args[0] === "provider" && args[1] === "get" ? args[2] : undefined;
-    return provider === undefined
-      ? undefined
-      : registeredProviders.includes(provider)
-        ? describeProvider(provider)
-        : missingProvider;
+    return args[0] === "provider" && args[1] === "list"
+      ? { status: 0, output: inventoryOutput, stdout: inventoryOutput, stderr: "" }
+      : provider === undefined
+        ? undefined
+        : registeredProviders.includes(provider)
+          ? describeProvider(provider)
+          : missingProvider;
   };
+}
+
+function createNativeProviderRebuildHarness(replaced: boolean, provider = "nvidia-prod") {
+  const { overrides, reads, providerName } = nativeProviderRebuildScenario(replaced, provider);
+  const harness = createRebuildFlowHarness(overrides);
+  configureSession(harness, provider, overrides.sandboxEntry.credentialEnv);
+  return { harness, reads, providerName };
+}
+
+function createNativeLocalRebuildHarness(
+  agent: "hermes" | "langchain-deepagents-code" | "openclaw" = "openclaw",
+  beforeBackup: () => void = () => {},
+) {
+  const binding = {
+    agent: agent === "langchain-deepagents-code" ? undefined : agent,
+    provider:
+      agent === "openclaw" ? ("llama-cpp-local" as const) : ("compatible-endpoint" as const),
+    endpointUrl: "http://host.openshell.internal:8000/v1",
+    credentialEnv: "NEMOCLAW_LOCAL_INFERENCE_TOKEN",
+    authMode: "authenticated" as const,
+    sandboxName: "alpha",
+    gatewayName: "nemoclaw",
+  };
+  const credentialEnv = agent === "openclaw" ? "LLAMA_CPP_API_KEY" : "COMPATIBLE_API_KEY";
+  const attachment = {
+    ...binding,
+    ...nativeLocalIdentity(binding),
+    schemaVersion: 1 as const,
+    providerId: "owned",
+  };
+  const verify = vi
+    .spyOn(nativeLocalProfile, "verifyRecordedNativeLocalProviderAttachment")
+    .mockResolvedValue(attachment);
+  const refresh = vi
+    .spyOn(hermesPostRestore, "refreshRestoredHermesInferenceRoute")
+    .mockResolvedValue(undefined);
+  const harness = createRebuildFlowHarness({
+    sandboxEntry: {
+      agent,
+      provider: binding.provider,
+      model: MODEL,
+      endpointUrl: binding.endpointUrl,
+      credentialEnv,
+      nativeLocalProviderAttachment: attachment,
+    },
+    hydrateCredentialEnv: () => null,
+    runOpenshell: providerRuntime([]),
+    beforeBackup,
+  });
+  configureSession(harness, binding.provider, credentialEnv, {
+    agent,
+    endpointUrl: binding.endpointUrl,
+  });
+  return { harness, verify, refresh, attachment };
 }
 
 function diagnostics(harness: Harness): string {
@@ -79,8 +163,302 @@ function makeStagedHermesMessagingPlan() {
   });
 }
 
+function disabledDiscordRebuildHarness(recorded: ReturnType<typeof makeStagedHermesMessagingPlan>) {
+  const harness = createRebuildFlowHarness({
+    sandboxEntry: {
+      agent: "hermes",
+      provider: "nvidia-prod",
+      model: MODEL,
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+      messaging: { schemaVersion: 1, plan: recorded },
+    },
+    buildMessagingRebuildPlan: () => ({
+      ...recorded,
+      channels: recorded.channels.map((channel) => ({ ...channel, active: false, disabled: true })),
+      disabledChannels: ["discord"],
+    }),
+    hydrateCredentialEnv: () => "saved-provider-key",
+    runOpenshell: providerRuntime(["nvidia-prod"]),
+  });
+  configureSession(harness, "nvidia-prod", "NVIDIA_INFERENCE_API_KEY");
+  return harness;
+}
+
 describe("rebuildSandbox flow: credential preflight", () => {
   installRebuildFlowTestHooks();
+
+  it.each(["routed", "nvidia-router"])(
+    "rejects retired %s before rebuild backup or deletion",
+    async (provider) => {
+      const harness = createRebuildFlowHarness({ sandboxEntry: { provider } });
+      const before = structuredClone(harness.session);
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes", "--force"], { throwOnError: true }),
+      ).rejects.toThrow("Model Router has been removed");
+      expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
+      expectNoSandboxDelete(harness.runOpenshellSpy);
+      expect(harness.onboardSpy).not.toHaveBeenCalled();
+      expect(harness.session).toEqual(before);
+    },
+  );
+
+  it.each(["hermes", "langchain-deepagents-code"] as const)(
+    "rebuilds native local %s with only its scoped provider",
+    async (agent) => {
+      const { harness, verify, refresh, attachment } = createNativeLocalRebuildHarness(agent);
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes", "--force"], { throwOnError: true }),
+      ).resolves.toBeUndefined();
+      expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
+      expect(harness.onboardSpy).toHaveBeenCalledOnce();
+      expect(verify).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          expected: attachment,
+          sandboxName: "alpha",
+          gatewayName: "nemoclaw",
+          agent,
+          provider: "compatible-endpoint",
+        }),
+      );
+      const finalProofOrder = verify.mock.invocationCallOrder.at(-1)!;
+      expect(finalProofOrder).toBeGreaterThan(
+        harness.backupSandboxStateSpy.mock.invocationCallOrder[0],
+      );
+      expect(finalProofOrder).toBeLessThan(harness.onboardSpy.mock.invocationCallOrder[0]);
+      expect(refresh).toHaveBeenCalledTimes(Number(agent === "hermes"));
+    },
+  );
+
+  it.each(["hermes", "langchain-deepagents-code"] as const)(
+    "retains the source and backup when native local %s authority drifts during backup",
+    async (agent) => {
+      const { harness, verify, refresh } = createNativeLocalRebuildHarness(agent, () => {
+        verify.mockRejectedValue(new Error("private provider diagnostic"));
+      });
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes", "--force"], { throwOnError: true }),
+      ).rejects.toThrow("Native local provider authority changed before sandbox deletion.");
+      expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
+      expectNoSandboxDelete(harness.runOpenshellSpy);
+      expect(harness.onboardSpy).not.toHaveBeenCalled();
+      expect(refresh).not.toHaveBeenCalled();
+      expect(listHarnessRebuildBackups()).toHaveLength(1);
+      expect(diagnostics(harness)).not.toContain("private provider diagnostic");
+    },
+  );
+
+  it.each([
+    { agent: "openclaw", recovery: false },
+    { agent: null, recovery: false },
+    { agent: "openclaw", recovery: true },
+  ])(
+    "refuses an invalid tools/list timeout for agent=$agent recovery=$recovery before mutation (#14435)",
+    async ({ agent, recovery }) => {
+      vi.stubEnv("NEMOCLAW_MCP_TOOLS_LIST_TIMEOUT_MS", "500");
+      const harness = createRebuildFlowHarness({ sandboxEntry: { agent } });
+      const before = structuredClone(harness.getSandboxEntry());
+      const recoveryManifest = recovery ? makePreparedRecoveryManifest() : undefined;
+      const recoveryBefore = structuredClone(recoveryManifest);
+
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true, recoveryManifest }),
+      ).rejects.toThrow("NEMOCLAW_MCP_TOOLS_LIST_TIMEOUT_MS");
+
+      expect(diagnostics(harness)).toContain("1500 to 10000");
+      expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
+      expect(harness.onboardSpy).not.toHaveBeenCalled();
+      expectNoSandboxDelete(harness.runOpenshellSpy);
+      expect(harness.getSandboxEntry()).toEqual(before);
+      expect(recoveryManifest).toEqual(recoveryBefore);
+    },
+  );
+
+  it.each([undefined, " 3000 "])(
+    "continues rebuild with tools/list timeout %s (#14435)",
+    async (value) => {
+      vi.stubEnv("NEMOCLAW_MCP_TOOLS_LIST_TIMEOUT_MS", value);
+      const harness = createRebuildFlowHarness();
+
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
+      ).resolves.toBeUndefined();
+      expect(harness.onboardSpy).toHaveBeenCalled();
+    },
+  );
+
+  it("ignores an invalid OpenClaw tools/list timeout when rebuilding Hermes (#14435)", async () => {
+    vi.stubEnv("NEMOCLAW_MCP_TOOLS_LIST_TIMEOUT_MS", "500");
+    const harness = createRebuildFlowHarness({
+      sandboxEntry: { agent: "hermes" },
+      beforeBackup: () => {
+        throw new Error("reached backup");
+      },
+    });
+
+    await expect(
+      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
+    ).rejects.toThrow("reached backup");
+  });
+
+  it("rechecks native Hermes authority after asynchronous policy recapture", async () => {
+    const { harness, verify, refresh } = createNativeLocalRebuildHarness("hermes");
+    const capture = rebuildBackupPhase.captureRebuildPolicyDocument;
+    const captureSpy = vi
+      .spyOn(rebuildBackupPhase, "captureRebuildPolicyDocument")
+      .mockImplementation(async (...args) => {
+        const document = await capture(...args);
+        verify.mockRejectedValue(new Error("attachment changed during policy recapture"));
+        return document;
+      });
+    await expect(
+      harness.rebuildSandbox("alpha", ["--yes", "--force"], { throwOnError: true }),
+    ).rejects.toThrow("Native local provider authority changed before sandbox deletion.");
+    expect(captureSpy).toHaveBeenCalledOnce();
+    expect(verify.mock.invocationCallOrder.at(-1)).toBeGreaterThan(
+      captureSpy.mock.invocationCallOrder[0],
+    );
+    expectNoSandboxDelete(harness.runOpenshellSpy);
+    expect(harness.onboardSpy).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
+    expect(listHarnessRebuildBackups()).toHaveLength(1);
+  });
+
+  it.each(["nvidia-prod", "hermes-provider"])(
+    "rebuilds with recorded native %s and no host key",
+    async (provider) => {
+      const { harness, reads, providerName } = createNativeProviderRebuildHarness(false, provider);
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes", "--force"], { throwOnError: true }),
+      ).resolves.toBeUndefined();
+      expect(harness.onboardSpy).toHaveBeenCalledOnce();
+      expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
+      expect(reads.length).toBeGreaterThanOrEqual(2);
+      expect(new Set(reads)).toEqual(new Set([providerName]));
+    },
+  );
+
+  it.each(["nvidia-prod", "hermes-provider"])(
+    "preserves the sandbox when native %s ownership changes during backup",
+    async (provider) => {
+      const { harness } = createNativeProviderRebuildHarness(true, provider);
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes", "--force"], { throwOnError: true }),
+      ).rejects.toThrow("is indeterminate before sandbox deletion");
+      expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
+      expectNoSandboxDelete(harness.runOpenshellSpy);
+      expect(harness.onboardSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["saved-provider-key", null])(
+    "preserves the sandbox when credentials expire during backup with host key %s (#10394)",
+    async (hostKey) => {
+      const start = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+      const expires = start + 60_000;
+      let inventoryReads = 0;
+      const runtime = providerRuntime(
+        ["nvidia-prod"],
+        {},
+        {
+          "nvidia-prod": { NVIDIA_INFERENCE_API_KEY: expires },
+        },
+      );
+      const harness = createRebuildFlowHarness({
+        sandboxEntry: {
+          provider: "nvidia-prod",
+          model: MODEL,
+          credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+        },
+        hydrateCredentialEnv: () => hostKey,
+        beforeBackup: () => {
+          clock.mockReturnValue(expires + 1);
+        },
+        runOpenshell: (args) => {
+          inventoryReads += Number(args[0] === "provider" && args[1] === "list");
+          return runtime(args);
+        },
+      });
+      configureSession(harness, "nvidia-prod", "NVIDIA_INFERENCE_API_KEY");
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes", "--force"], { throwOnError: true }),
+      ).rejects.toThrow("is expired before sandbox deletion");
+      expect(Date.now()).toBeGreaterThan(expires);
+      expect(inventoryReads).toBe(2);
+      expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
+      expectNoSandboxDelete(harness.runOpenshellSpy);
+      expect(harness.onboardSpy).not.toHaveBeenCalled();
+      clock.mockRestore();
+    },
+  );
+
+  it.each(["missing", "malformed", "unreachable"])(
+    "preserves the sandbox when provider inventory becomes %s during backup (#10394)",
+    async (failure) => {
+      let backedUp = false;
+      const runtime = providerRuntime(["nvidia-prod"]);
+      const harness = createRebuildFlowHarness({
+        sandboxEntry: {
+          provider: "nvidia-prod",
+          model: MODEL,
+          credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+        },
+        hydrateCredentialEnv: () => "saved-provider-key",
+        beforeBackup: () => {
+          backedUp = true;
+        },
+        runOpenshell: (args) => {
+          const stdout = failure === "missing" ? "[]" : "invalid-json";
+          return backedUp && args[0] === "provider" && args[1] === "list"
+            ? { status: failure === "unreachable" ? 1 : 0, stdout, output: stdout, stderr: "" }
+            : runtime(args);
+        },
+      });
+      configureSession(harness, "nvidia-prod", "NVIDIA_INFERENCE_API_KEY");
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes", "--force"], { throwOnError: true }),
+      ).rejects.toThrow("is indeterminate before sandbox deletion");
+      expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
+      expectNoSandboxDelete(harness.runOpenshellSpy);
+      expect(harness.onboardSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rebuilds native OpenClaw without a shared provider after checking authority", async () => {
+    const { harness, attachment, verify } = createNativeLocalRebuildHarness();
+    await expect(
+      harness.rebuildSandbox("alpha", ["--yes", "--verbose"], {
+        throwOnError: true,
+      }),
+    ).resolves.toBeUndefined();
+    expect(harness.onboardSpy).toHaveBeenCalledOnce();
+    expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
+    expect(verify).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        expected: attachment,
+        sandboxName: "alpha",
+        gatewayName: "nemoclaw",
+        agent: "openclaw",
+        provider: "llama-cpp-local",
+      }),
+    );
+  });
+
+  it("stops before deletion when native OpenClaw authority is detached during backup", async () => {
+    const { harness } = createNativeLocalRebuildHarness("openclaw", () => {
+      vi.mocked(nativeLocalProfile.verifyRecordedNativeLocalProviderAttachment).mockRejectedValue(
+        new Error("detached during backup"),
+      );
+    });
+    await expect(
+      harness.rebuildSandbox("alpha", ["--yes", "--verbose"], {
+        throwOnError: true,
+      }),
+    ).rejects.toThrow("Native local provider authority changed before sandbox deletion");
+    expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
+    expectNoSandboxDelete(harness.runOpenshellSpy);
+    expect(harness.onboardSpy).not.toHaveBeenCalled();
+  });
 
   it("aborts before backup when the target provider and credential are missing", async () => {
     const harness = createRebuildFlowHarness({
@@ -131,6 +509,149 @@ describe("rebuildSandbox flow: credential preflight", () => {
     expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
   });
 
+  it("aborts before backup when the selected provider credential is expired (#10394)", async () => {
+    const harness = createRebuildFlowHarness({
+      sandboxEntry: {
+        provider: "nvidia-prod",
+        model: MODEL,
+        credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+      },
+      hydrateCredentialEnv: () => "saved-provider-key",
+      runOpenshell: providerRuntime(
+        ["nvidia-prod"],
+        {},
+        { "nvidia-prod": { NVIDIA_INFERENCE_API_KEY: 1_000 } },
+      ),
+    });
+    configureSession(harness, "nvidia-prod", "NVIDIA_INFERENCE_API_KEY");
+
+    await expect(
+      harness.rebuildSandbox("alpha", ["--yes", "--force"], { throwOnError: true }),
+    ).rejects.toThrow("Expired gateway provider credential: nvidia-prod/NVIDIA_INFERENCE_API_KEY");
+
+    expect(diagnostics(harness)).toContain(
+      "provider 'nvidia-prod' credential NVIDIA_INFERENCE_API_KEY is expired",
+    );
+    expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
+    expect(harness.onboardSpy).not.toHaveBeenCalled();
+    expectNoSandboxDelete(harness.runOpenshellSpy);
+    expect(harness.removeSandboxRegistryEntryWithReceiptSpy).not.toHaveBeenCalled();
+  });
+
+  it("aborts before backup when the provider lacks the selected credential key (#10394)", async () => {
+    const harness = createRebuildFlowHarness({
+      sandboxEntry: {
+        provider: "nvidia-prod",
+        model: MODEL,
+        credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+      },
+      hydrateCredentialEnv: () => "saved-provider-key",
+      runOpenshell: providerRuntime(["nvidia-prod"], {
+        "nvidia-prod": "OTHER_API_KEY",
+      }),
+    });
+    configureSession(harness, "nvidia-prod", "NVIDIA_INFERENCE_API_KEY");
+
+    await expect(
+      harness.rebuildSandbox("alpha", ["--yes", "--force"], { throwOnError: true }),
+    ).rejects.toThrow("Missing gateway provider credential: nvidia-prod/NVIDIA_INFERENCE_API_KEY");
+
+    expect(diagnostics(harness)).toContain(
+      "provider 'nvidia-prod' no longer exposes credential NVIDIA_INFERENCE_API_KEY",
+    );
+    expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
+    expect(harness.onboardSpy).not.toHaveBeenCalled();
+    expectNoSandboxDelete(harness.runOpenshellSpy);
+    expect(harness.removeSandboxRegistryEntryWithReceiptSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["has no expiration map", undefined],
+    ["has an explicit non-expiring value", { NVIDIA_INFERENCE_API_KEY: 0 }],
+    ["is absent from another credential's expiration map", { OTHER_API_KEY: 1_000 }],
+    ["has a future expiration", { NVIDIA_INFERENCE_API_KEY: 8_640_000_000_000_000 }],
+  ])(
+    "continues when the selected provider credential %s (#10394)",
+    async (_case, expirationMap) => {
+      const harness = createRebuildFlowHarness({
+        sandboxEntry: {
+          provider: "nvidia-prod",
+          model: MODEL,
+          credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+        },
+        hydrateCredentialEnv: () => "saved-provider-key",
+        runOpenshell: providerRuntime(
+          ["nvidia-prod"],
+          {},
+          expirationMap ? { "nvidia-prod": expirationMap } : {},
+        ),
+      });
+      configureSession(harness, "nvidia-prod", "NVIDIA_INFERENCE_API_KEY");
+
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
+      ).resolves.toBeUndefined();
+
+      expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("preserves the sandbox when the provider loses the selected credential key during backup (#10394)", async () => {
+    let backedUp = false;
+    const validProvider = providerRuntime(["nvidia-prod"]);
+    const mismatchedProvider = providerRuntime(["nvidia-prod"], {
+      "nvidia-prod": "OTHER_API_KEY",
+    });
+    const harness = createRebuildFlowHarness({
+      sandboxEntry: {
+        provider: "nvidia-prod",
+        model: MODEL,
+        credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+      },
+      hydrateCredentialEnv: () => "saved-provider-key",
+      beforeBackup: () => {
+        backedUp = true;
+      },
+      runOpenshell: (args) => (backedUp ? mismatchedProvider(args) : validProvider(args)),
+    });
+    configureSession(harness, "nvidia-prod", "NVIDIA_INFERENCE_API_KEY");
+
+    await expect(
+      harness.rebuildSandbox("alpha", ["--yes", "--force"], { throwOnError: true }),
+    ).rejects.toThrow(
+      "no longer exposes credential NVIDIA_INFERENCE_API_KEY before sandbox deletion",
+    );
+
+    expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
+    expectNoSandboxDelete(harness.runOpenshellSpy);
+    expect(harness.onboardSpy).not.toHaveBeenCalled();
+  });
+
+  it("aborts before backup when provider expiry metadata cannot be verified (#10394)", async () => {
+    const registeredProvider = providerRuntime(["nvidia-prod"]);
+    const harness = createRebuildFlowHarness({
+      sandboxEntry: {
+        provider: "nvidia-prod",
+        model: MODEL,
+        credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+      },
+      hydrateCredentialEnv: () => "saved-provider-key",
+      runOpenshell: (args) =>
+        args[0] === "provider" && args[1] === "list"
+          ? { status: 0, output: "not-json", stdout: "not-json", stderr: "" }
+          : registeredProvider(args),
+    });
+    configureSession(harness, "nvidia-prod", "NVIDIA_INFERENCE_API_KEY");
+
+    await expect(
+      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
+    ).rejects.toThrow("Could not verify gateway provider: nvidia-prod");
+
+    expect(diagnostics(harness)).toContain("could not verify provider 'nvidia-prod' in OpenShell");
+    expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
+    expectNoSandboxDelete(harness.runOpenshellSpy);
+  });
+
   it("does not let a host credential bypass a missing gateway provider", async () => {
     const harness = createRebuildFlowHarness({
       sandboxEntry: {
@@ -162,7 +683,9 @@ describe("rebuildSandbox flow: credential preflight", () => {
       },
       hydrateCredentialEnv: () => "host-provider-key",
       runOpenshell: providerRuntime([]),
-      sandboxListOutput: "alpha Error",
+      sandboxInventory: {
+        sandboxes: [{ name: "alpha", phase: "Error", readiness: "terminal" }],
+      },
     });
     configureSession(harness, "compatible-endpoint", "COMPATIBLE_API_KEY", {
       endpointUrl: "https://inference.example.test/v1",
@@ -212,7 +735,7 @@ describe("rebuildSandbox flow: credential preflight", () => {
       hydrateCredentialEnv: () => "host-provider-key",
       runOpenshell: (args) =>
         args[0] === "provider" ? (providerLookups.shift() ?? registeredProvider)(args) : undefined,
-      staleRecovery: true,
+      staleRecovery: false,
     });
     configureSession(harness, "compatible-endpoint", "COMPATIBLE_API_KEY", {
       endpointUrl: "https://inference.example.test/v1",
@@ -231,7 +754,7 @@ describe("rebuildSandbox flow: credential preflight", () => {
   });
 
   it("aborts if the provider credential disappears at the delete edge (#6114)", async () => {
-    let credentialHydrations = 0;
+    let credentialAvailable = true;
     const harness = createRebuildFlowHarness({
       sandboxEntry: {
         provider: "compatible-endpoint",
@@ -240,16 +763,20 @@ describe("rebuildSandbox flow: credential preflight", () => {
         endpointUrl: "https://inference.example.test/v1",
         preferredInferenceApi: "openai-completions",
       },
-      hydrateCredentialEnv: () => {
-        credentialHydrations += 1;
-        return credentialHydrations < 3 ? "host-provider-key" : null;
-      },
+      hydrateCredentialEnv: () => (credentialAvailable ? "host-provider-key" : null),
       runOpenshell: providerRuntime([]),
-      staleRecovery: true,
+      staleRecovery: false,
     });
     configureSession(harness, "compatible-endpoint", "COMPATIBLE_API_KEY", {
       endpointUrl: "https://inference.example.test/v1",
       preferredInferenceApi: "openai-completions",
+    });
+
+    const backupPhase = rebuildBackupPhase.runRebuildBackupPhase;
+    vi.spyOn(rebuildBackupPhase, "runRebuildBackupPhase").mockImplementation(async (args) => {
+      const result = await backupPhase(args);
+      credentialAvailable = false;
+      return result;
     });
 
     await expect(
@@ -285,7 +812,7 @@ describe("rebuildSandbox flow: credential preflight", () => {
         args[0] === "provider"
           ? (providerLookups.shift() ?? indeterminateProvider)(args)
           : undefined,
-      staleRecovery: true,
+      staleRecovery: false,
     });
     configureSession(harness, "compatible-endpoint", "COMPATIBLE_API_KEY", {
       endpointUrl: "https://inference.example.test/v1",
@@ -332,6 +859,38 @@ describe("rebuildSandbox flow: credential preflight", () => {
     expect(harness.onboardSpy).not.toHaveBeenCalled();
   });
 
+  it("stops before backup when staged Discord would disable an active channel (#13809)", async () => {
+    const harness = disabledDiscordRebuildHarness(makeStagedHermesMessagingPlan());
+    await expect(
+      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
+    ).rejects.toThrow("Rebuild would disable active messaging channels: discord");
+    expect(diagnostics(harness)).toContain("messaging plan validation failed.");
+    expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
+    expectNoSandboxDelete(harness.runOpenshellSpy);
+    expect(harness.onboardSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["stopped", { active: false, disabled: true }, ["discord"]],
+    ["stopped-list", { active: true, disabled: false }, ["discord"]],
+    ["pending-removal", { active: true, disabled: false, pendingRemoval: true }, []],
+  ] as const)(
+    "allows recorded %s Discord state during rebuild (#13809)",
+    async (_state, flags, disabledChannels) => {
+      const recorded = makeStagedHermesMessagingPlan();
+      const harness = disabledDiscordRebuildHarness({
+        ...recorded,
+        disabledChannels: [...disabledChannels],
+        channels: recorded.channels.map((channel) => ({ ...channel, ...flags })),
+      });
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
+      ).resolves.toBeUndefined();
+      expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
+      expect(harness.onboardSpy).toHaveBeenCalledOnce();
+    },
+  );
+
   it("copies the staged Hermes messaging plan into the rebuild resume session", async () => {
     const plan = makeStagedHermesMessagingPlan();
     const harness = createRebuildFlowHarness({
@@ -360,7 +919,7 @@ describe("rebuildSandbox flow: credential preflight", () => {
 
   it("stops before backup when the agent base-image preflight fails", async () => {
     const harness = createRebuildFlowHarness({
-      sandboxEntry: { agent: "hermes" },
+      sandboxEntry: { agent: "hermes", provider: "nvidia-prod" },
       baseImagePreflight: { ok: false, imageRef: null, overrideEnvVar: null },
     });
 
@@ -373,7 +932,7 @@ describe("rebuildSandbox flow: credential preflight", () => {
     expect(harness.onboardSpy).not.toHaveBeenCalled();
   });
 
-  it("skips credential hydration for local inference", async () => {
+  it("blocks legacy local inference before credential hydration", async () => {
     const harness = createRebuildFlowHarness({
       sandboxEntry: { provider: "ollama-local", model: MODEL, credentialEnv: null },
       hydrateCredentialEnv: () => {
@@ -384,31 +943,28 @@ describe("rebuildSandbox flow: credential preflight", () => {
 
     await expect(
       harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow("Legacy shared local inference cannot be rebuilt safely");
 
     expect(harness.hydrateCredentialEnvSpy).not.toHaveBeenCalled();
-    expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
+    expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
   });
 
-  it.each([
-    "ollama-local",
-    "vllm-local",
-  ])("migrates a legacy %s target away from OPENAI_API_KEY (#2519)", async (provider) => {
-    const harness = createRebuildFlowHarness({
-      sandboxEntry: { provider, model: MODEL, credentialEnv: "OPENAI_API_KEY" },
-    });
-    configureSession(harness, provider, "OPENAI_API_KEY");
+  it.each(["ollama-local", "vllm-local"])(
+    "blocks a legacy %s target before backup (#2519)",
+    async (provider) => {
+      const harness = createRebuildFlowHarness({
+        sandboxEntry: { provider, model: MODEL, credentialEnv: "OPENAI_API_KEY" },
+      });
+      configureSession(harness, provider, "OPENAI_API_KEY");
 
-    await expect(
-      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
-    ).resolves.toBeUndefined();
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
+      ).rejects.toThrow("Legacy shared local inference cannot be rebuilt safely");
 
-    const output = harness.logSpy.mock.calls.flat().map(String).join("\n");
-    expect(output).toContain("GH #2519");
-    expect(output).toContain(provider);
-    expect(harness.session.credentialEnv).toBeNull();
-    expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
-  });
+      expect(harness.session.credentialEnv).toBe("OPENAI_API_KEY");
+      expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
+    },
+  );
 
   it("fails closed when a matching session omits the remote target credential", async () => {
     const harness = createRebuildFlowHarness({

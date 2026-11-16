@@ -1,18 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
 import { createRequire } from "node:module";
+import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const require = createRequire(import.meta.url);
 const REPO_ROOT = path.join(import.meta.dirname, "../../..");
-const TAVILY_PROFILE_PATH = path.join(
-  REPO_ROOT,
-  "nemoclaw-blueprint",
-  "provider-profiles",
-  "tavily.yaml",
-);
 const COMMAND_PATHS = {
   common: path.join(REPO_ROOT, "dist", "lib", "credentials", "command-support.js"),
   credentials: path.join(REPO_ROOT, "dist", "commands", "credentials.js"),
@@ -32,6 +28,8 @@ const PROVIDER_COMMAND_PATH = path.join(
   "openshell",
   "provider-command.js",
 );
+let authorityFixtureRoot = "";
+let authorityDeclarationPath = "";
 type CredentialsCommandClasses = {
   CredentialsCommand: typeof import("../../../src/commands/credentials.js").default;
   CredentialsAddCommand: typeof import("../../../src/commands/credentials/add.js").default;
@@ -60,6 +58,56 @@ type RuntimeBridge = {
   forgetExtraProvider: (name: string) => boolean;
 };
 type OpenshellCall = { args: string[]; opts?: RuntimeBridgeRunOptions };
+
+const TAVILY_PROFILE_EXPORT = JSON.stringify({
+  id: "tavily",
+  credentials: [
+    {
+      name: "api_key",
+      env_vars: ["TAVILY_API_KEY"],
+      required: true,
+      auth_style: "bearer",
+      header_name: "authorization",
+      query_param: "",
+    },
+  ],
+  endpoints: [
+    {
+      host: "api.tavily.com",
+      port: 443,
+      protocol: "rest",
+      enforcement: "enforce",
+      request_body_credential_rewrite: true,
+      rules: [
+        { allow: { method: "POST", path: "/search" } },
+        { allow: { method: "POST", path: "/extract" } },
+      ],
+    },
+  ],
+  binaries: [
+    "/opt/venv/bin/python3*",
+    "/usr/local/bin/node",
+    "/usr/bin/node",
+    "/usr/local/bin/curl",
+    "/usr/bin/curl",
+  ],
+  inference_capable: false,
+});
+
+function tavilyProfileCommandResult(args: string[]): SpawnLikeResult | null {
+  return args.includes("profile")
+    ? args.includes("export")
+      ? { status: 0, stdout: TAVILY_PROFILE_EXPORT }
+      : { status: 0, stdout: "" }
+    : null;
+}
+
+function credentialPreflightCommandResult(args: string[]): SpawnLikeResult | null {
+  return (
+    tavilyProfileCommandResult(args) ??
+    (args[0] === "provider" && args[1] === "list" ? { status: 0, stdout: "" } : null)
+  );
+}
 
 function loadCommands(): CredentialsCommandClasses {
   for (const modulePath of Object.values(COMMAND_PATHS)) {
@@ -140,7 +188,10 @@ async function captureOutput(
   return { stdout, stderr };
 }
 
-async function expectExitCode(action: () => Promise<unknown>, expectedCode: number): Promise<void> {
+async function expectExitCode(
+  action: () => Promise<unknown>,
+  expectedCode: number | undefined,
+): Promise<void> {
   const originalExitCode = process.exitCode;
   process.exitCode = undefined;
   try {
@@ -151,12 +202,41 @@ async function expectExitCode(action: () => Promise<unknown>, expectedCode: numb
   }
 }
 
+beforeAll(() => {
+  authorityFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-credentials-cli-"));
+  authorityDeclarationPath = path.join(authorityFixtureRoot, "gateway-management.json");
+  fs.writeFileSync(
+    authorityDeclarationPath,
+    JSON.stringify({
+      version: 1,
+      mode: "nemoclaw-managed",
+      supervisor: null,
+      requiredCapabilities: [],
+    }),
+  );
+});
+
+beforeEach(() => {
+  vi.stubEnv("HOME", authorityFixtureRoot);
+  vi.stubEnv("NEMOCLAW_GATEWAY_MANAGEMENT", authorityDeclarationPath);
+});
+
 afterEach(() => {
   for (const modulePath of Object.values(COMMAND_PATHS)) {
     delete require.cache[modulePath];
   }
   delete require.cache[GLOBAL_ACTIONS_PATH];
-  delete require.cache[PROVIDER_COMMAND_PATH];
+  const providerCommands = require(PROVIDER_COMMAND_PATH) as {
+    setProviderCommandRuntimeHooksForTest: (hooks: {
+      runOpenshell?: RuntimeBridge["runOpenshell"];
+    }) => void;
+  };
+  providerCommands.setProviderCommandRuntimeHooksForTest({});
+  vi.unstubAllEnvs();
+});
+
+afterAll(() => {
+  fs.rmSync(authorityFixtureRoot, { recursive: true, force: true });
 });
 
 describe("credentials oclif commands", () => {
@@ -166,7 +246,9 @@ describe("credentials oclif commands", () => {
 
     expect(output.stdout).toContain("Usage: nemoclaw credentials <subcommand>");
     expect(output.stdout).toMatch(/list\s+List provider credentials/);
-    expect(output.stdout).toMatch(/add <PROVIDER> --type <TYPE>\s+Register a provider credential/);
+    expect(output.stdout).toMatch(
+      /add <PROVIDER> --type <TYPE> \[--agent <AGENT>\]\s+Register a provider credential/,
+    );
     expect(output.stdout).toContain("reset <PROVIDER> [--yes]");
   });
 
@@ -192,10 +274,11 @@ describe("credentials oclif commands", () => {
 
     expect(calls).toEqual([
       {
-        args: ["provider", "list", "--names"],
+        args: ["provider", "list", "-g", "nemoclaw", "--names"],
         opts: {
           env: expect.any(Object),
           ignoreError: true,
+          maxBuffer: 64 * 1024,
           replaceEnv: true,
           stdio: ["ignore", "pipe", "pipe"],
           timeout: 30_000,
@@ -205,7 +288,9 @@ describe("credentials oclif commands", () => {
     expect(output.stdout).toContain("openai-prod");
     expect(output.stdout).toContain("nvidia-prod");
     expect(output.stdout).toContain("2 per-sandbox messaging bridge(s)");
-    expect(output.stdout).toContain("channels list/remove/stop");
+    expect(output.stdout).toContain("oclif <sandbox> channels list");
+    expect(output.stdout).toContain("oclif <sandbox> channels remove <channel>");
+    expect(output.stdout).toContain("oclif <sandbox> channels stop <channel>");
     expect(output.stdout).not.toContain("alpha-telegram-bridge");
   });
 
@@ -217,7 +302,9 @@ describe("credentials oclif commands", () => {
 
     const output = await captureOutput(() => CredentialsListCommand.run([]));
 
-    expect(output.stdout).toContain("No provider credentials registered.");
+    expect(output.stdout).toContain(
+      "No provider credentials registered with OpenShell gateway 'nemoclaw'.",
+    );
     expect(output.stdout).toContain("2 per-sandbox messaging bridge(s)");
   });
 
@@ -231,8 +318,9 @@ describe("credentials oclif commands", () => {
       expectExitCode(() => CredentialsListCommand.run([]), 1),
     );
 
-    expect(output.stderr).toContain("Could not query OpenShell gateway");
-    expect(output.stderr).toContain("Start the gateway again with `nemoclaw onboard`.");
+    expect(output.stderr).toContain("Could not query OpenShell providers");
+    expect(output.stderr).toContain("gateway unavailable");
+    expect(output.stderr).not.toContain("Start the gateway again");
   });
 
   it("records gateway recovery failures without calling provider list", async () => {
@@ -264,18 +352,19 @@ describe("credentials oclif commands", () => {
 
     expect(calls).toEqual([
       {
-        args: ["provider", "delete", "nvidia-prod"],
+        args: ["provider", "delete", "-g", "nemoclaw", "nemoclaw-nvidia-prod-v1"],
         opts: {
           env: expect.any(Object),
           ignoreError: true,
           replaceEnv: true,
           stdio: ["ignore", "pipe", "pipe"],
+          suppressOutput: true,
           timeout: 30_000,
         },
       },
     ]);
     expect(output.stdout).toContain("Removed provider 'nvidia-prod'");
-    expect(output.stdout).toContain("Re-run 'nemoclaw onboard'");
+    expect(output.stdout).toContain("Rerun 'nemoclaw onboard'");
   });
 
   it("rejects per-sandbox messaging bridge names for credential reset", async () => {
@@ -337,7 +426,7 @@ describe("credentials oclif commands", () => {
     const calls = installRuntimeBridge({
       runOpenshell: (args, opts) => {
         calls.push({ args, opts });
-        return { status: 0, stdout: "" };
+        return credentialPreflightCommandResult(args) ?? { status: 0, stdout: "" };
       },
       recordExtraProvider: (name) => {
         extraProviderCalls.push(name);
@@ -359,12 +448,13 @@ describe("credentials oclif commands", () => {
 
       expect(calls).toEqual([
         {
-          args: ["provider", "profile", "import", "--file", TAVILY_PROFILE_PATH],
+          args: ["provider", "profile", "-g", "nemoclaw", "export", "tavily", "--output", "json"],
           opts: {
             env: expect.any(Object),
             ignoreError: true,
             replaceEnv: true,
             stdio: ["ignore", "pipe", "pipe"],
+            suppressOutput: true,
             timeout: 30_000,
           },
         },
@@ -372,6 +462,8 @@ describe("credentials oclif commands", () => {
           args: [
             "provider",
             "create",
+            "-g",
+            "nemoclaw",
             "--name",
             "tavily-search",
             "--type",
@@ -382,8 +474,21 @@ describe("credentials oclif commands", () => {
           opts: {
             env: expect.any(Object),
             ignoreError: true,
+            maxBuffer: 64 * 1024,
             replaceEnv: true,
             stdio: ["ignore", "pipe", "pipe"],
+            suppressOutput: true,
+            timeout: 30_000,
+          },
+        },
+        {
+          args: ["provider", "profile", "-g", "nemoclaw", "export", "tavily", "--output", "json"],
+          opts: {
+            env: expect.any(Object),
+            ignoreError: true,
+            replaceEnv: true,
+            stdio: ["ignore", "pipe", "pipe"],
+            suppressOutput: true,
             timeout: 30_000,
           },
         },
@@ -394,24 +499,36 @@ describe("credentials oclif commands", () => {
       expect(calls[1]?.args).not.toContain("tvly-test-12345");
       expect(extraProviderCalls).toEqual(["tavily-search"]);
       expect(output.stdout).toContain("Registered provider 'tavily-search'");
-      expect(output.stdout).toContain("rebuild");
+      expect(output.stdout).toContain(
+        "openshell sandbox provider attach -g nemoclaw <sandbox> tavily-search",
+      );
+      expect(output.stdout).not.toContain("rebuild");
     } finally {
       delete process.env.TAVILY_API_KEY;
       delete process.env.UNRELATED_API_KEY;
     }
   });
 
-  it("credentials add does not record an extra provider when the gateway rejects the call", async () => {
+  it("credentials add rolls back its provider reservation when the gateway rejects the call", async () => {
     process.env.TAVILY_API_KEY = "tvly-test-12345";
-    const extraProviderCalls: string[] = [];
+    const lifecycleCalls: string[] = [];
+    const extraProviders = new Set<string>();
+    const rejectGatewayCall = () => {
+      expect(extraProviders.has("tavily-search")).toBe(true);
+      lifecycleCalls.push("gateway:tavily-search");
+      return { status: 1, stderr: "gateway unavailable" };
+    };
     installRuntimeBridge({
-      runOpenshell: (args) =>
-        args.includes("profile")
-          ? { status: 0, stdout: "" }
-          : { status: 1, stderr: "gateway unavailable" },
+      runOpenshell: (args) => credentialPreflightCommandResult(args) ?? rejectGatewayCall(),
       recordExtraProvider: (name) => {
-        extraProviderCalls.push(name);
-        return true;
+        lifecycleCalls.push(`record:${name}`);
+        const sizeBefore = extraProviders.size;
+        extraProviders.add(name);
+        return extraProviders.size !== sizeBefore;
+      },
+      forgetExtraProvider: (name) => {
+        lifecycleCalls.push(`forget:${name}`);
+        return extraProviders.delete(name);
       },
     });
     const { CredentialsAddCommand } = loadCommands();
@@ -431,7 +548,12 @@ describe("credentials oclif commands", () => {
         ),
       );
 
-      expect(extraProviderCalls).toEqual([]);
+      expect(lifecycleCalls).toEqual([
+        "record:tavily-search",
+        "gateway:tavily-search",
+        "forget:tavily-search",
+      ]);
+      expect([...extraProviders]).toEqual([]);
     } finally {
       delete process.env.TAVILY_API_KEY;
     }
@@ -442,12 +564,10 @@ describe("credentials oclif commands", () => {
     const leakedTavilyValue = `tvly-${"leaked-secret"}-9999`;
     installRuntimeBridge({
       runOpenshell: (args) =>
-        args.includes("profile")
-          ? { status: 0, stdout: "" }
-          : {
-              status: 1,
-              stderr: `auth failed: TAVILY_API_KEY=${leakedTavilyValue} rejected`,
-            },
+        credentialPreflightCommandResult(args) ?? {
+          status: 1,
+          stderr: `auth failed: TAVILY_API_KEY=${leakedTavilyValue} rejected`,
+        },
     });
     const { CredentialsAddCommand } = loadCommands();
 
@@ -477,9 +597,10 @@ describe("credentials oclif commands", () => {
     process.env.TAVILY_API_KEY = "tvly-test-12345";
     installRuntimeBridge({
       runOpenshell: (args) =>
-        args.includes("profile")
-          ? { status: 0, stdout: "" }
-          : { status: 1, stderr: "provider 'tavily-search' already exists" },
+        credentialPreflightCommandResult(args) ?? {
+          status: 1,
+          stderr: "provider 'tavily-search' already exists",
+        },
     });
     const { CredentialsAddCommand } = loadCommands();
 
@@ -505,7 +626,7 @@ describe("credentials oclif commands", () => {
     }
   });
 
-  it("credentials add stops before provider create when bundled profile import fails", async () => {
+  it("credentials add stops before provider create when bundled profile validation fails", async () => {
     process.env.TAVILY_API_KEY = "tvly-test-12345";
     const leakedTavilyValue = `tvly-${"leaked"}-9999`;
     const calls: OpenshellCall[] = [];
@@ -536,9 +657,12 @@ describe("credentials oclif commands", () => {
       expect(calls[0]?.args).toEqual([
         "provider",
         "profile",
-        "import",
-        "--file",
-        TAVILY_PROFILE_PATH,
+        "-g",
+        "nemoclaw",
+        "export",
+        "tavily",
+        "--output",
+        "json",
       ]);
       expect(output.stderr).toContain("Could not import bundled provider profile 'tavily'");
       expect(output.stderr).not.toContain(leakedTavilyValue);
@@ -726,6 +850,121 @@ describe("credentials oclif commands", () => {
     }
   });
 
+  it.each(
+    [
+      {
+        type: "tavily",
+        provider: "custom-provider",
+        metadata: {
+          status: 0,
+          stdout:
+            "Name: custom-provider\nType: tavily\nCredential keys: API_KEY\nConfig keys: <none>\n",
+        },
+        attach: true,
+        rebuild: false,
+        unknown: false,
+      },
+      {
+        type: "tavily-hermes-v1",
+        provider: "custom-provider",
+        metadata: {
+          status: 0,
+          stdout:
+            "Name: custom-provider\nType: tavily-hermes-v1\nCredential keys: API_KEY\nConfig keys: <none>\n",
+        },
+        attach: true,
+        rebuild: false,
+        unknown: false,
+      },
+      {
+        type: "generic",
+        provider: "tavily-search",
+        metadata: {
+          status: 0,
+          stdout:
+            "Name: tavily-search\nType: generic\nCredential keys: API_KEY\nConfig keys: <none>\n",
+        },
+        attach: false,
+        rebuild: true,
+        unknown: false,
+      },
+      {
+        type: "unavailable",
+        provider: "tavily-search",
+        metadata: { status: 1, stderr: "provider metadata unavailable" },
+        attach: false,
+        rebuild: false,
+        unknown: true,
+      },
+    ].flatMap((profile) =>
+      [
+        {
+          outcome: "removed",
+          finalDelete: { status: 0, stdout: "" },
+          exitCode: undefined,
+          stream: "stdout" as const,
+        },
+        {
+          outcome: "already-absent",
+          finalDelete: { status: 1, stderr: "provider not found" },
+          exitCode: undefined,
+          stream: "stdout" as const,
+        },
+        {
+          outcome: "partial",
+          finalDelete: { status: 1, stderr: "gateway unavailable" },
+          exitCode: 1,
+          stream: "stderr" as const,
+        },
+      ].map((outcome) => ({ ...profile, ...outcome })),
+    ),
+  )(
+    "credentials reset selects $type recovery after $outcome removal",
+    async ({
+      provider,
+      metadata,
+      attach,
+      rebuild,
+      unknown,
+      outcome,
+      finalDelete,
+      exitCode,
+      stream,
+    }) => {
+      const restoreUnknown = unknown && outcome !== "partial";
+      const operations: string[] = [];
+      const responses: Record<string, SpawnLikeResult[]> = {
+        get: [metadata],
+        delete: [{ status: 1, stderr: "provider is attached to sandbox(es): alpha" }, finalDelete],
+        detach: [{ status: 0, stdout: "" }],
+      };
+      installRuntimeBridge({
+        runOpenshell: (args) => {
+          const operation = args.find((arg) => Object.hasOwn(responses, arg))!;
+          operations.push(operation);
+          return responses[operation]!.shift()!;
+        },
+      });
+      const { CredentialsResetCommand } = loadCommands();
+      const output = await captureOutput(() =>
+        expectExitCode(() => CredentialsResetCommand.run([provider, "--yes"]), exitCode),
+      );
+      const text = output[stream];
+      expect(text).toContain("detached from sandbox(es): alpha");
+      expect(
+        text.includes(`openshell sandbox provider attach -g nemoclaw <sandbox> ${provider}`),
+      ).toBe(attach);
+      expect(text.includes("openshell sandbox provider attach")).toBe(attach || restoreUnknown);
+      expect(text.includes("nemoclaw alpha rebuild")).toBe(rebuild || restoreUnknown);
+      expect(text.includes("rebuild")).toBe(rebuild || restoreUnknown);
+      expect(text.includes("Provider type could not be verified")).toBe(unknown);
+      expect(text.includes("nemoclaw credentials list")).toBe(unknown && !restoreUnknown);
+      expect(text.includes(`openshell provider get -g nemoclaw ${provider}`)).toBe(restoreUnknown);
+      expect(text.includes("Tavily")).toBe(attach || restoreUnknown);
+      expect(operations).toEqual(["delete", "get", "detach", "delete"]);
+    },
+  );
+
   it("credentials reset redacts credential-shaped stderr from OpenShell failures", async () => {
     installRuntimeBridge({
       runOpenshell: () => ({
@@ -741,6 +980,25 @@ describe("credentials oclif commands", () => {
 
     expect(output.stderr).not.toContain("nvapi-abcdefghijklmnopqrstuv");
     expect(output.stderr).toContain("delete failed");
+  });
+
+  it("credentials reset rejects invalid provider names before gateway mutation (#9806)", async () => {
+    const gatewayRecoveries: string[] = [];
+    const openshellCalls = installRuntimeBridge({
+      recoverNamedGatewayRuntime: async () => {
+        gatewayRecoveries.push("recover");
+        return { recovered: true };
+      },
+    });
+    const { CredentialsResetCommand } = loadCommands();
+
+    const output = await captureOutput(() =>
+      expectExitCode(() => CredentialsResetCommand.run(["bad name/with*chars", "--yes"]), 1),
+    );
+
+    expect(output.stderr).toContain("Provider name must be");
+    expect(gatewayRecoveries).toEqual([]);
+    expect(openshellCalls).toEqual([]);
   });
 
   it("credentials add rejects --config values that look secret-shaped", async () => {

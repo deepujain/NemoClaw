@@ -7,6 +7,7 @@ import path from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 import { createInMemoryRuntimeProviderBundle } from "../../../test/helpers/runtime-provider-bundle";
+import { LEAF_PEM, tmpDir, writeCa } from "./__test-helpers__/corporate-ca-fixtures";
 import {
   ManagedImageCatalogError,
   ManagedImageCatalogUnavailableError,
@@ -25,7 +26,10 @@ import {
 } from "./managed-image/contract";
 import { createRuntimeProviderBundleRegistry } from "./runtime-provider/registry";
 import {
+  installedManagedImageCatalogRevision,
+  liveE2eManagedImageCatalog,
   prepareSandboxWorkloadSource,
+  readLiveE2eManagedImageCatalogContracts,
   SandboxWorkloadPreparationError,
 } from "./workload/preparation";
 import { resolveSandboxWorkloadRuntimeCapabilities } from "./workload/runtime";
@@ -85,27 +89,234 @@ function input(agentName: string) {
 }
 
 describe("sandbox workload preparation", () => {
-  it.each(
-    SHIPPED_MANAGED_IMAGE_AGENTS,
-  )("resolves the complete release catalog and exact %s image (#7744)", async (agent) => {
-    const resolveCatalog = vi.fn(async () => CATALOG);
-
-    const prepared = await prepareSandboxWorkloadSource(input(agent), { resolveCatalog });
-
-    expect(resolveCatalog).toHaveBeenCalledExactlyOnceWith({
-      release: RELEASE,
-      platform: MANAGED_IMAGE_PLATFORM,
-    });
-    expect(prepared).toEqual({
-      source: {
-        kind: "managed-image",
-        reference: contract(agent, SHIPPED_MANAGED_IMAGE_AGENTS.indexOf(agent)).reference,
-        contract: contract(agent, SHIPPED_MANAGED_IMAGE_AGENTS.indexOf(agent)),
-      },
-      release: RELEASE,
-      fallbackDiagnostic: null,
-    });
+  it("pins an untagged installed build to its exact source revision", () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-untagged-build-"));
+    fs.writeFileSync(path.join(fixtureRoot, "package.json"), JSON.stringify({ version: "0.1.0" }));
+    fs.writeFileSync(path.join(fixtureRoot, ".source-revision"), REVISION);
+    try {
+      expect(installedManagedImageCatalogRevision({}, fixtureRoot)).toBe(REVISION);
+    } finally {
+      fs.rmSync(fixtureRoot, { force: true, recursive: true });
+    }
   });
+
+  it("rejects a truncated installed source revision (#8379)", () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-truncated-build-"));
+    fs.writeFileSync(path.join(fixtureRoot, "package.json"), JSON.stringify({ version: "0.1.0" }));
+    fs.writeFileSync(path.join(fixtureRoot, ".source-revision"), "a".repeat(39));
+    try {
+      expect(() => installedManagedImageCatalogRevision({}, fixtureRoot)).toThrow(
+        "Could not resolve the immutable NemoClaw source revision.",
+      );
+    } finally {
+      fs.rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
+  it("keeps a matching tagged install on its release catalog", () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-release-build-"));
+    fs.writeFileSync(path.join(fixtureRoot, "package.json"), JSON.stringify({ version: "0.0.97" }));
+    fs.writeFileSync(path.join(fixtureRoot, ".source-revision"), REVISION);
+    fs.writeFileSync(path.join(fixtureRoot, ".version"), "0.0.97\n");
+    try {
+      expect(installedManagedImageCatalogRevision({}, fixtureRoot)).toBeNull();
+    } finally {
+      fs.rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
+  it("honors an exact install ref only when it matches the installed build", () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-exact-build-"));
+    fs.writeFileSync(path.join(fixtureRoot, "package.json"), JSON.stringify({ version: "0.0.97" }));
+    fs.writeFileSync(path.join(fixtureRoot, ".source-revision"), REVISION);
+    fs.writeFileSync(path.join(fixtureRoot, ".version"), "0.0.97\n");
+    try {
+      expect(
+        installedManagedImageCatalogRevision({ NEMOCLAW_INSTALL_REF: REVISION }, fixtureRoot),
+      ).toBe(REVISION);
+      expect(() =>
+        installedManagedImageCatalogRevision({ NEMOCLAW_INSTALL_REF: "a".repeat(40) }, fixtureRoot),
+      ).toThrow("the exact install ref does not match the installed build identity");
+      expect(() =>
+        installedManagedImageCatalogRevision({ NEMOCLAW_INSTALL_REF: "a".repeat(39) }, fixtureRoot),
+      ).toThrow("is not a supported lowercase 40-character source revision");
+      expect(() =>
+        installedManagedImageCatalogRevision(
+          { NEMOCLAW_INSTALL_REF: REVISION.toUpperCase() },
+          fixtureRoot,
+        ),
+      ).toThrow("is not a supported lowercase 40-character source revision");
+    } finally {
+      fs.rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
+  it("does not treat a mutable install ref as revision authority", () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-mutable-build-"));
+    fs.writeFileSync(path.join(fixtureRoot, "package.json"), JSON.stringify({ version: "0.0.97" }));
+    fs.writeFileSync(path.join(fixtureRoot, ".source-revision"), REVISION);
+    fs.writeFileSync(path.join(fixtureRoot, ".version"), "0.0.97\n");
+    try {
+      expect(
+        installedManagedImageCatalogRevision({ NEMOCLAW_INSTALL_REF: "main" }, fixtureRoot),
+      ).toBeNull();
+    } finally {
+      fs.rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
+  it("selects an exact embedded catalog only for live PR E2E (#9464)", () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-live-e2e-catalog-"));
+    const catalogPath = path.join(fixtureRoot, "catalog.json");
+    const packagedCatalogPath = path.join(fixtureRoot, "dist", "e2e-managed-image-catalog.json");
+    fs.mkdirSync(path.dirname(packagedCatalogPath));
+    fs.writeFileSync(catalogPath, "{}\n", { mode: 0o600 });
+    fs.writeFileSync(packagedCatalogPath, "{}\n", { mode: 0o600 });
+    try {
+      expect(
+        liveE2eManagedImageCatalog({
+          GITHUB_ACTIONS: "true",
+          NEMOCLAW_RUN_LIVE_E2E: "1",
+          NEMOCLAW_E2E_EXPECTED_SHA: REVISION,
+          NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG: catalogPath,
+        }),
+      ).toEqual({ path: catalogPath, revision: REVISION });
+      expect(
+        liveE2eManagedImageCatalog({
+          GITHUB_ACTIONS: "true",
+          NEMOCLAW_RUN_LIVE_E2E: "1",
+          NEMOCLAW_E2E_EXPECTED_SHA: "b".repeat(40),
+          NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG: catalogPath,
+          NEMOCLAW_E2E_MANAGED_IMAGE_REVISION: REVISION,
+        }),
+      ).toEqual({ path: catalogPath, revision: REVISION });
+      expect(
+        liveE2eManagedImageCatalog({
+          GITHUB_ACTIONS: "true",
+          NEMOCLAW_RUN_LIVE_E2E: "1",
+          NEMOCLAW_E2E_EXPECTED_SHA: "b".repeat(40),
+          NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG_JSON: JSON.stringify(CATALOG),
+        }),
+      ).toEqual({ catalog: CATALOG, revision: REVISION });
+      expect(
+        liveE2eManagedImageCatalog({
+          GITHUB_ACTIONS: "true",
+          GITHUB_WORKSPACE: fixtureRoot,
+          NEMOCLAW_RUN_LIVE_E2E: "1",
+          NEMOCLAW_E2E_EXPECTED_SHA: REVISION,
+        }),
+      ).toEqual({ path: packagedCatalogPath, revision: REVISION });
+      expect(
+        liveE2eManagedImageCatalog({
+          NEMOCLAW_RUN_LIVE_E2E: "1",
+          NEMOCLAW_E2E_EXPECTED_SHA: REVISION,
+          NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG: catalogPath,
+        }),
+      ).toBeNull();
+      expect(
+        liveE2eManagedImageCatalog({
+          GITHUB_ACTIONS: "true",
+          GITHUB_WORKSPACE: path.join(fixtureRoot, "empty-workspace"),
+          NEMOCLAW_RUN_LIVE_E2E: "1",
+        }),
+      ).toBeNull();
+      expect(
+        liveE2eManagedImageCatalog({
+          GITHUB_ACTIONS: "true",
+          NEMOCLAW_RUN_LIVE_E2E: "1",
+          NEMOCLAW_E2E_EXPECTED_SHA: REVISION,
+          NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG: path.join(fixtureRoot, "missing.json"),
+        }),
+      ).toBeNull();
+    } finally {
+      fs.rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects an embedded catalog without an exact publication revision (#9464)", () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-live-e2e-catalog-"));
+    const catalogPath = path.join(fixtureRoot, "catalog.json");
+    fs.writeFileSync(catalogPath, "{}\n", { mode: 0o600 });
+    try {
+      expect(() =>
+        liveE2eManagedImageCatalog({
+          GITHUB_ACTIONS: "true",
+          NEMOCLAW_RUN_LIVE_E2E: "1",
+          NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG: catalogPath,
+        }),
+      ).toThrow("requires an exact publication revision");
+      expect(() =>
+        liveE2eManagedImageCatalog({
+          GITHUB_ACTIONS: "true",
+          NEMOCLAW_RUN_LIVE_E2E: "1",
+          NEMOCLAW_E2E_EXPECTED_SHA: REVISION,
+          NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG: catalogPath,
+          NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG_JSON: JSON.stringify(CATALOG),
+        }),
+      ).toThrow("conflicting authorities");
+    } finally {
+      fs.rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
+  it("validates every contract in an inline live E2E catalog", () => {
+    const selected = liveE2eManagedImageCatalog({
+      GITHUB_ACTIONS: "true",
+      NEMOCLAW_RUN_LIVE_E2E: "1",
+      NEMOCLAW_E2E_EXPECTED_SHA: REVISION,
+      NEMOCLAW_E2E_MANAGED_IMAGE_CATALOG_JSON: JSON.stringify(CATALOG),
+    });
+
+    expect(selected).not.toBeNull();
+    expect(readLiveE2eManagedImageCatalogContracts(selected!)).toEqual(
+      new Map(SHIPPED_MANAGED_IMAGE_AGENTS.map((agent, index) => [agent, contract(agent, index)])),
+    );
+  });
+
+  it("reads a regular live E2E catalog without following a symbolic link", () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-live-e2e-catalog-"));
+    const catalogPath = path.join(fixtureRoot, "catalog.json");
+    const symlinkPath = path.join(fixtureRoot, "catalog-link.json");
+    fs.writeFileSync(catalogPath, JSON.stringify(CATALOG), { mode: 0o600 });
+    fs.symlinkSync(catalogPath, symlinkPath);
+    try {
+      expect(
+        readLiveE2eManagedImageCatalogContracts({ path: catalogPath, revision: REVISION }),
+      ).toEqual(
+        new Map(
+          SHIPPED_MANAGED_IMAGE_AGENTS.map((agent, index) => [agent, contract(agent, index)]),
+        ),
+      );
+      expect(() =>
+        readLiveE2eManagedImageCatalogContracts({ path: symlinkPath, revision: REVISION }),
+      ).toThrow("must be a bounded regular file");
+    } finally {
+      fs.rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
+  it.each(SHIPPED_MANAGED_IMAGE_AGENTS)(
+    "resolves the complete release catalog and exact %s image (#7744)",
+    async (agent) => {
+      const resolveCatalog = vi.fn(async () => CATALOG);
+
+      const prepared = await prepareSandboxWorkloadSource(input(agent), { resolveCatalog });
+
+      expect(resolveCatalog).toHaveBeenCalledExactlyOnceWith({
+        release: RELEASE,
+        platform: MANAGED_IMAGE_PLATFORM,
+      });
+      expect(prepared).toEqual({
+        source: {
+          kind: "managed-image",
+          reference: contract(agent, SHIPPED_MANAGED_IMAGE_AGENTS.indexOf(agent)).reference,
+          contract: contract(agent, SHIPPED_MANAGED_IMAGE_AGENTS.indexOf(agent)),
+        },
+        release: RELEASE,
+        fallbackDiagnostic: null,
+      });
+    },
+  );
 
   it("passes an immutable qualification revision to catalog resolution (#9385)", async () => {
     const resolveCatalog = vi.fn(async () => CATALOG);
@@ -120,6 +331,87 @@ describe("sandbox workload preparation", () => {
       platform: MANAGED_IMAGE_PLATFORM,
       revision: REVISION,
     });
+  });
+
+  it("uses a resolver-fetched exact-revision catalog when local release labels differ", async () => {
+    const resolveCatalog = vi.fn(async () => CATALOG);
+
+    const prepared = await prepareSandboxWorkloadSource(
+      { ...input("openclaw"), version: "0.1.0", catalogRevision: REVISION },
+      { resolveCatalog },
+    );
+
+    expect(resolveCatalog).toHaveBeenCalledExactlyOnceWith({
+      release: "v0.1.0",
+      platform: MANAGED_IMAGE_PLATFORM,
+      revision: REVISION,
+    });
+    expect(prepared.release).toBe(RELEASE);
+    expect(prepared.source).toMatchObject({
+      kind: "managed-image",
+      contract: { source: { release: RELEASE, revision: REVISION } },
+    });
+  });
+
+  it("rejects an exact catalog from another PR commit (#9464)", async () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-managed-catalog-"));
+    const catalogPath = path.join(fixtureRoot, "catalog.json");
+    fs.writeFileSync(catalogPath, JSON.stringify(CATALOG), { mode: 0o600 });
+    try {
+      await expect(
+        prepareSandboxWorkloadSource({
+          ...input("openclaw"),
+          catalogPath,
+          expectedCatalogRevision: "b".repeat(40),
+        }),
+      ).rejects.toThrow("does not match the trusted catalog revision");
+    } finally {
+      fs.rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
+  it("uses an exact-revision E2E catalog when local git describe labels differ", async () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-managed-catalog-"));
+    const catalogPath = path.join(fixtureRoot, "catalog.json");
+    fs.writeFileSync(catalogPath, JSON.stringify(CATALOG), { mode: 0o600 });
+    try {
+      const prepared = await prepareSandboxWorkloadSource({
+        ...input("openclaw"),
+        version: "0.1.0",
+        catalogPath,
+        expectedCatalogRevision: REVISION,
+      });
+
+      expect(prepared.release).toBe(RELEASE);
+      expect(prepared.source).toMatchObject({
+        kind: "managed-image",
+        contract: { source: { release: RELEASE, revision: REVISION } },
+      });
+    } finally {
+      fs.rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects a registry catalog that does not match its trusted revision", async () => {
+    await expect(
+      prepareSandboxWorkloadSource(
+        {
+          ...input("hermes"),
+          version: "0.1.0",
+          catalogRevision: "b".repeat(40),
+        },
+        { resolveCatalog: async () => CATALOG },
+      ),
+    ).rejects.toThrow("does not match the trusted catalog revision");
+  });
+
+  it("rejects a cross-release catalog without an exact trusted revision", async () => {
+    await expect(
+      prepareSandboxWorkloadSource(
+        { ...input("langchain-deepagents-code"), version: "0.1.0" },
+        { resolveCatalog: async () => CATALOG },
+      ),
+    ).rejects.toThrow("belongs to 'v0.0.97', not 'v0.1.0'");
   });
 
   it("loads an exact local all-agent catalog without using the registry resolver (#7744)", async () => {
@@ -141,6 +433,21 @@ describe("sandbox workload preparation", () => {
     } finally {
       fs.rmSync(fixtureRoot, { force: true, recursive: true });
     }
+  });
+
+  it("loads an exact inline all-agent catalog without using the registry resolver", async () => {
+    const resolveCatalog = vi.fn(async () => CATALOG);
+
+    const prepared = await prepareSandboxWorkloadSource(
+      { ...input("hermes"), catalog: CATALOG, expectedCatalogRevision: REVISION },
+      { resolveCatalog },
+    );
+
+    expect(resolveCatalog).not.toHaveBeenCalled();
+    expect(prepared.source).toMatchObject({
+      kind: "managed-image",
+      contract: { source: { revision: REVISION } },
+    });
   });
 
   it("rejects a symlinked local managed-image catalog before selection (#7744)", async () => {
@@ -171,6 +478,98 @@ describe("sandbox workload preparation", () => {
       {
         ...input("openclaw"),
         customDockerfilePath: "/workspace/CustomDockerfile",
+      },
+      { resolveCatalog },
+    );
+
+    expect(resolveCatalog).not.toHaveBeenCalled();
+    expect(prepared.source).toEqual({
+      kind: "legacy-dockerfile",
+      dockerfilePath: "/workspace/CustomDockerfile",
+      reason: "custom-dockerfile",
+    });
+  });
+
+  it("fails closed without disclosing a base-image override that the managed workload cannot honor (#11138)", async () => {
+    const resolveCatalog = vi.fn(async () => CATALOG);
+    const credentialBearingOverride =
+      "https://registry-user:registry-password@registry.example.test/sandbox-base:latest";
+    let rejection: Error | null = null;
+    try {
+      await prepareSandboxWorkloadSource(
+        {
+          ...input("openclaw"),
+          environment: { NEMOCLAW_SANDBOX_BASE_IMAGE_REF: credentialBearingOverride },
+        },
+        { resolveCatalog },
+      );
+    } catch (error) {
+      rejection = error as Error;
+    }
+
+    expect(rejection?.message).toContain("'NEMOCLAW_SANDBOX_BASE_IMAGE_REF' is set");
+    expect(rejection?.message).not.toContain(credentialBearingOverride);
+    expect(rejection?.message).not.toContain("registry-password");
+    // The rejection precedes catalog resolution, so a catalog outage cannot
+    // turn it into a legacy Dockerfile build that consumes the override.
+    expect(resolveCatalog).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on the agent-specific override env var, not just the openclaw default (#11138)", async () => {
+    const resolveCatalog = vi.fn(async () => CATALOG);
+    await expect(
+      prepareSandboxWorkloadSource(
+        {
+          ...input("hermes"),
+          environment: { NEMOCLAW_HERMES_SANDBOX_BASE_IMAGE_REF: "evil:tag" },
+        },
+        { resolveCatalog },
+      ),
+    ).rejects.toThrow(/NEMOCLAW_HERMES_SANDBOX_BASE_IMAGE_REF/);
+  });
+
+  it("still onboards the managed image when no base-image override is set (#11138)", async () => {
+    const resolveCatalog = vi.fn(async () => CATALOG);
+    const prepared = await prepareSandboxWorkloadSource(
+      { ...input("openclaw"), environment: {} },
+      { resolveCatalog },
+    );
+
+    expect(prepared.source.kind).toBe("managed-image");
+    expect(resolveCatalog).toHaveBeenCalledOnce();
+  });
+
+  it("rejects the override even when the managed catalog is unavailable (#11138)", async () => {
+    // The prefer-managed fallback would otherwise select the legacy Dockerfile
+    // path, which consumes the override, so a catalog outage must not turn a
+    // fail-closed onboard into an override-honoring build.
+    const resolveCatalog = vi.fn(async () => {
+      throw new ManagedImageCatalogUnavailableError("registry offline");
+    });
+
+    await expect(
+      prepareSandboxWorkloadSource(
+        {
+          ...input("openclaw"),
+          policy: "prefer-managed",
+          environment: { NEMOCLAW_SANDBOX_BASE_IMAGE_REF: "evil:tag" },
+        },
+        { resolveCatalog },
+      ),
+    ).rejects.toThrow(/NEMOCLAW_SANDBOX_BASE_IMAGE_REF/);
+    expect(resolveCatalog).not.toHaveBeenCalled();
+  });
+
+  it("still honors a base-image override on the legacy custom-Dockerfile path (#11138)", async () => {
+    const resolveCatalog = vi.fn(async () => CATALOG);
+    const prepared = await prepareSandboxWorkloadSource(
+      {
+        ...input("openclaw"),
+        customDockerfilePath: "/workspace/CustomDockerfile",
+        environment: {
+          NEMOCLAW_SANDBOX_BASE_IMAGE_REF:
+            "ghcr.io/nvidia/nemoclaw/sandbox-base:local-only-no-push",
+        },
       },
       { resolveCatalog },
     );
@@ -286,6 +685,28 @@ describe("sandbox workload preparation", () => {
     expect(resolveCatalog).not.toHaveBeenCalled();
   });
 
+  it("does not select a generated Dockerfile when native Podman has no managed image (#12942)", async () => {
+    const resolveCatalog = vi.fn(async () => {
+      throw new ManagedImageCatalogUnavailableError("registry offline");
+    });
+
+    await expect(
+      prepareSandboxWorkloadSource(
+        {
+          ...input("openclaw"),
+          runtime: resolveSandboxWorkloadRuntimeCapabilities(
+            { driverName: "podman" },
+            undefined,
+            "x64",
+          ),
+          policy: "prefer-managed",
+        },
+        { resolveCatalog },
+      ),
+    ).rejects.toThrow("cannot use the legacy Dockerfile workload for contract-unavailable");
+    expect(resolveCatalog).toHaveBeenCalledOnce();
+  });
+
   it("fails before catalog access when an incapable runtime requires managed images (#7744)", async () => {
     const resolveCatalog = vi.fn(async () => CATALOG);
 
@@ -337,6 +758,51 @@ describe("sandbox workload preparation", () => {
         { resolveCatalog },
       ),
     ).rejects.toThrow("managed image catalog 'v0.0.97' failed validation");
+  });
+
+  it("names an invalid explicit corporate CA before registry access (#12059)", async () => {
+    const bundlePath = writeCa(tmpDir(), LEAF_PEM);
+    let rejection: Error | null = null;
+
+    try {
+      await prepareSandboxWorkloadSource({
+        ...input("openclaw"),
+        environment: { NEMOCLAW_CORPORATE_CA_BUNDLE: bundlePath },
+      });
+    } catch (error) {
+      rejection = error as Error;
+    }
+
+    expect(rejection).toMatchObject({
+      name: "SandboxWorkloadPreparationError",
+      message: expect.stringMatching(
+        /NEMOCLAW_CORPORATE_CA_BUNDLE was rejected:.*not a CA \(basicConstraints CA:TRUE required\)/u,
+      ),
+    });
+    expect(rejection?.message).not.toContain("BEGIN CERTIFICATE");
+    expect(rejection?.message).not.toContain(LEAF_PEM);
+  });
+
+  it("omits an operator-controlled corporate CA path from the rejection (#12059)", async () => {
+    const sentinel = "registry-password-secret";
+    const bundlePath = path.join(tmpDir(), `${sentinel}\n\u001b[31m.pem`);
+    let rejection: Error | null = null;
+
+    try {
+      await prepareSandboxWorkloadSource({
+        ...input("openclaw"),
+        environment: { NEMOCLAW_CORPORATE_CA_BUNDLE: bundlePath },
+      });
+    } catch (error) {
+      rejection = error as Error;
+    }
+
+    expect(rejection?.message).toBe(
+      "Sandbox workload preparation failed: NEMOCLAW_CORPORATE_CA_BUNDLE was rejected: corporate CA bundle not found or unreadable",
+    );
+    expect(rejection?.message).not.toContain(bundlePath);
+    expect(rejection?.message).not.toContain(sentinel);
+    expect(rejection?.message).not.toMatch(/[\u0000-\u001f\u007f]/u);
   });
 
   it("rejects an invalid release before preferred-policy catalog fallback (#7744)", async () => {
@@ -452,7 +918,7 @@ describe("sandbox workload preparation", () => {
         { ...input("pi"), acceptedCandidateContract: contract("pi", 3) },
         { resolveCatalog },
       ),
-    ).rejects.toThrow("requires an exact managed image catalog file");
+    ).rejects.toThrow("requires an exact managed image catalog");
     expect(resolveCatalog).not.toHaveBeenCalled();
   });
 
@@ -471,6 +937,25 @@ describe("sandbox workload preparation", () => {
       kind: "managed-image",
       reference: piContract.reference,
     });
+  });
+
+  it("fails closed for a candidate agent's base-image override too, not just shipped agents (#11138)", async () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-candidate-override-"));
+    const catalogPath = path.join(fixtureRoot, "catalog.json");
+    const piContract = contract("pi", 3);
+    fs.writeFileSync(catalogPath, JSON.stringify({ pi: piContract }), { mode: 0o600 });
+
+    await expect(
+      prepareSandboxWorkloadSource(
+        {
+          ...input("pi"),
+          acceptedCandidateContract: piContract,
+          catalogPath,
+          environment: { NEMOCLAW_PI_SANDBOX_BASE_IMAGE_REF: "evil:tag" },
+        },
+        { resolveCatalog: async () => CATALOG },
+      ),
+    ).rejects.toThrow(/NEMOCLAW_PI_SANDBOX_BASE_IMAGE_REF/);
   });
 
   it("refuses a candidate catalog that differs from the accepted receipt (#7927)", async () => {
@@ -518,6 +1003,8 @@ describe("sandbox workload preparation", () => {
         { ...input("pi"), runtime: runtime("docker") },
         { resolveCatalog: async () => CATALOG },
       ),
-    ).rejects.toThrow("the selected agent is a release candidate and candidate selection is disabled");
+    ).rejects.toThrow(
+      "the selected agent is a release candidate and candidate selection is disabled",
+    );
   });
 });

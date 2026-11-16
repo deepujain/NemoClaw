@@ -1,4 +1,4 @@
-#!/usr/bin/env -S node --no-warnings --experimental-strip-types
+#!/usr/bin/env -S node --no-warnings
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -9,12 +9,14 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { DGX_STATION_PYTHON_IDENTITY_PROBE } from "../src/lib/inference/dgx-station-identity.ts";
 import {
   clearDualStationSshBinding,
   encodeDualStationSshBindingHandoff,
   stationKnownHostsDigest,
   writeDualStationSshBinding,
 } from "../src/lib/inference/vllm-station-ssh-binding.ts";
+import { strictVllmSshTransportArgs } from "../src/lib/inference/serving/vllm-ssh-transport-policy.ts";
 import {
   type DualStationPreparationDeps,
   type DualStationResumeState,
@@ -81,7 +83,7 @@ const SUBPROCESS_ENV_NAMES = new Set([
   "SSH_AUTH_SOCK",
 ]);
 
-const STATION_DISCOVERY_PROBE = String.raw`
+export const STATION_DISCOVERY_PROBE = String.raw`
 import csv
 import json
 from pathlib import Path
@@ -89,6 +91,8 @@ import platform
 import re
 import socket
 import subprocess
+
+${DGX_STATION_PYTHON_IDENTITY_PROBE}
 
 def read_text(path):
     try:
@@ -110,17 +114,6 @@ def run(argv, timeout=5):
         return result.returncode, result.stdout.strip()
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return 127, ""
-
-def product_name():
-    for candidate in (
-        "/sys/class/dmi/id/product_name",
-        "/sys/devices/virtual/dmi/id/product_name",
-        "/sys/firmware/devicetree/base/model",
-    ):
-        value = read_text(candidate)
-        if value:
-            return value
-    return ""
 
 def gpu_inventory():
     rc, output = run([
@@ -203,9 +196,9 @@ def rail_inventory():
     return rails
 
 print(json.dumps({
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "hostname": socket.gethostname(),
-    "productName": product_name(),
+    **station_identity_payload(),
     "architecture": platform.machine(),
     "gpus": gpu_inventory(),
     "rails": rail_inventory(),
@@ -378,64 +371,6 @@ function runStreamingCommand(
   return result.status ?? 1;
 }
 
-export function strictStationPrepSshTransportArgs(): string[] {
-  return [
-    "-T",
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "StrictHostKeyChecking=yes",
-    "-o",
-    "VerifyHostKeyDNS=no",
-    "-o",
-    "NoHostAuthenticationForLocalhost=no",
-    "-o",
-    "NumberOfPasswordPrompts=0",
-    "-o",
-    "PasswordAuthentication=no",
-    "-o",
-    "KbdInteractiveAuthentication=no",
-    "-o",
-    "PreferredAuthentications=publickey",
-    "-o",
-    "ConnectTimeout=5",
-    "-o",
-    "ConnectionAttempts=1",
-    "-o",
-    "ServerAliveInterval=5",
-    "-o",
-    "ServerAliveCountMax=1",
-    "-o",
-    "ClearAllForwardings=yes",
-    "-o",
-    "ForwardAgent=no",
-    "-o",
-    "ForwardX11=no",
-    "-o",
-    "ForwardX11Trusted=no",
-    "-o",
-    "Tunnel=no",
-    "-o",
-    "UpdateHostKeys=no",
-    "-o",
-    "ControlMaster=no",
-    "-o",
-    "ControlPath=none",
-    "-o",
-    "PermitLocalCommand=no",
-    "-o",
-    "RemoteCommand=none",
-    "-o",
-    "ProxyCommand=none",
-    "-o",
-    "ProxyJump=none",
-    "-o",
-    "KnownHostsCommand=none",
-    "-o",
-    "LogLevel=ERROR",
-  ];
-}
-
 function parseSshConfig(stdout: string): SshConfig {
   const values = new Map<string, string[]>();
   for (const rawLine of stdout.split(/\r?\n/)) {
@@ -567,11 +502,7 @@ function knownHostEvidence(
 
 export function inspectPretrustedSshTarget(target: string): PretrustedSshTarget | null {
   validateStationPeerTarget(target);
-  const configResult = runCommand(
-    "ssh",
-    ["-G", ...strictStationPrepSshTransportArgs(), "--", target],
-    "",
-  );
+  const configResult = runCommand("ssh", ["-G", ...strictVllmSshTransportArgs(), "--", target], "");
   if (!commandSucceeded(configResult, true)) return null;
   const config = parseSshConfig(configResult.stdout);
   assertStrictSshConfig(config);
@@ -936,13 +867,13 @@ function assertHelperFile(helperPath: string): Buffer {
   }
 }
 
-function sshArgs(
+export function stationPrepSshArgs(
   binding: PretrustedSshTarget,
   pinnedKnownHostsPath: string,
   remoteCommand: string,
 ): string[] {
   return [
-    ...strictStationPrepSshTransportArgs(),
+    ...strictVllmSshTransportArgs(),
     "-o",
     `UserKnownHostsFile=${pinnedKnownHostsPath}`,
     "-o",
@@ -997,7 +928,7 @@ function createRuntimeDeps(options: CliOptions): {
       parseHostResult(
         runCommand(
           "ssh",
-          sshArgs(binding, pinnedKnownHosts(binding), "python3 -"),
+          stationPrepSshArgs(binding, pinnedKnownHosts(binding), "python3 -"),
           STATION_DISCOVERY_PROBE,
         ),
         "Peer Station identity probe",
@@ -1014,7 +945,11 @@ function createRuntimeDeps(options: CliOptions): {
       return connectivityMatches(
         runCommand(
           "ssh",
-          sshArgs(binding, pinnedKnownHosts(binding), ["python3", "-", ...args].join(" ")),
+          stationPrepSshArgs(
+            binding,
+            pinnedKnownHosts(binding),
+            ["python3", "-", ...args].join(" "),
+          ),
           CONNECTIVITY_PROBE,
         ),
         requests,
@@ -1023,7 +958,11 @@ function createRuntimeDeps(options: CliOptions): {
     runRemoteHelper: (binding, mode) => {
       return runStreamingCommand(
         "ssh",
-        sshArgs(binding, pinnedKnownHosts(binding), buildRemoteHelperCommand(helperSha256, mode)),
+        stationPrepSshArgs(
+          binding,
+          pinnedKnownHosts(binding),
+          buildRemoteHelperCommand(helperSha256, mode),
+        ),
         helperBytes.toString("utf8"),
       );
     },

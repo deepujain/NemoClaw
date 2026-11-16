@@ -2,15 +2,39 @@
 // SPDX-License-Identifier: Apache-2.0
 
 export const E2E_ACTION_PROVENANCE = {
+  reviewedNpmSetup: {
+    reference:
+      "NVIDIA/NemoClaw/.github/actions/setup-reviewed-npm@98669f24d35f18e49b6b2769cd68709509ea24f2",
+  },
   prepareWorkspace: {
     reference:
-      "NVIDIA/NemoClaw/.github/actions/prepare-e2e@f6304bc25fc35bfaa441c8c2fbfee38f72805a75",
-    contentSha256: "1283c2eadfbc38ccb3b795684ba5ced9c89ae2040fffbb6b81854a9d1926802b",
+      "NVIDIA/NemoClaw/.github/actions/prepare-e2e@e7e587da7c6c2c48aa112533c7eaeb549e40a351",
+    contentSha256: "9356afd1acf2038ade28c693a52194445d002115ea676f08f413f1a1530a92e6",
+  },
+  nativePodmanRuntime: {
+    reference:
+      "NVIDIA/NemoClaw/.github/actions/setup-native-podman-e2e@e85857e2a7bfb2af01241ecbce5947ee774c1280",
+    contentSha256: "ffedc78b82ac624702758ea76b0cc33045f546c9a4206742aaa9ebf1c4dbb7c0",
+  },
+  restoreNativePodmanRuntime: {
+    reference:
+      "NVIDIA/NemoClaw/.github/actions/restore-native-podman-e2e@9650336899bf836db5844381a97cbc2b0fe4a2b8",
+    contentSha256: "8a1f5ef5b8ecb170b65aa8c1bac1a6aee148375f39711a61c64186e54e60e4be",
+  },
+  stageNativePodmanToolchains: {
+    reference:
+      "NVIDIA/NemoClaw/.github/actions/stage-native-podman-e2e-toolchains@19eb13446b3eb5e41cca2e65b44c9b33c963a595",
+    contentSha256: "7fd90d4dc1fbed1c0c037a33239e68ab29ff7e937744743398d87cf834ac5c2a",
   },
   restoreCliArtifact: {
     reference:
-      "NVIDIA/NemoClaw/.github/actions/restore-e2e-cli-artifact@c246409193a31133cab10c8a3589001cc0d59eb3",
-    contentSha256: "3a81ad631b839aa938eaaf1ad6777bab247204bf86fbca3c43c326a44dfb9c6c",
+      "NVIDIA/NemoClaw/.github/actions/restore-e2e-cli-artifact@3c6d991640414a2d78f95f629d67194d44829554",
+    contentSha256: "4a6a6b21993e579855916dfb897995a3f35dc4461d04666094af7eddb8676077",
+  },
+  reviewedSdkInstall: {
+    reference:
+      "NVIDIA/NemoClaw/.github/actions/install-reviewed-openshell-sdk@855b8b80e13c4dbd59411672e3c3dd7720bc590f",
+    contentSha256: "51f7032ff93a525d985345124ce84e031700073760eaffa869e3d7e0df329f13",
   },
   uploadArtifacts: {
     reference:
@@ -31,14 +55,14 @@ export const E2E_ACTION_PROVENANCE = {
   },
   hostDependencies: {
     reference:
-      "NVIDIA/NemoClaw/.github/actions/host-dependency-setup@4def1501b34ce586f83b91af50a66b5d22b31d75",
-    actionSha256: "1ac05a0e0a0159fa0850eb82fccb0704d0e49b15bc6f2d6e3b6bb04c7ab94923",
-    scriptSha256: "2e910ed80b5dcf9aaf94230371fe586376c46f6df8fcbd76229063cbda1852c8",
+      "NVIDIA/NemoClaw/.github/actions/host-dependency-setup@e85857e2a7bfb2af01241ecbce5947ee774c1280",
+    actionSha256: "6eabd4f7f0d1eb0d3e1788323a0222173dc574f1f722c0ae302cacb268327154",
+    scriptSha256: "2df9f3342ad5c31a2d5221d2c7ee1d835bb43b798697171f21f4e5125cd7161a",
   },
 } as const;
 
 export const E2E_JOB_POLICY = {
   cliArtifactProducer: "generate-matrix",
-  prepareNoBuild: ["llama-cpp-dgx-spark-qualification", "managed-image-multiarch-startup"],
-  prepareTrustedBuild: ["managed-image-protected-runtime"],
+  prepareNoBuild: ["managed-image-multiarch-startup", "managed-image-protected-runtime"],
+  prepareTrustedBuild: ["llama-cpp-dgx-spark-qualification"],
 } as const;

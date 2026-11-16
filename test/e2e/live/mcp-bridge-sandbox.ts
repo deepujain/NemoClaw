@@ -4,21 +4,48 @@
 import assert from "node:assert/strict";
 import YAML from "yaml";
 import { shellQuote } from "../../../src/lib/core/shell-quote";
-import { parseOpenShellPolicy } from "../../../src/lib/policy/merge";
+import { parseOpenShellPolicy } from "../../../src/lib/adapters/openshell/policy-boundary";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
 import { assertExitZero, resultText } from "../fixtures/clients/command.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
+import { discoverHostAddress } from "../fixtures/host-address.ts";
 import type { SandboxClient } from "../fixtures/clients/sandbox.ts";
 import type { ShellProbeResult } from "../fixtures/shell-probe.ts";
 
 const MCP_CURL_HTTP_CODE_MARKER = "NEMOCLAW_MCP_CURL_HTTP_CODE=";
 
-export type McpDnsRebindingAdapter = "mcporter" | "hermes-config" | "deepagents-config";
+export type McpDnsRebindingAdapter = "openclaw-config" | "hermes-config" | "deepagents-config";
 
 export type CapturedManagedMcpPolicy = {
   networkPolicies: Record<string, McpNetworkPolicy>;
   policy: McpNetworkPolicy;
 };
+
+export async function applyMcpHostPolicyEdit(
+  sandbox: SandboxClient,
+  options: { artifactPrefix: string; sandboxName: string },
+): Promise<void> {
+  const result = await sandbox.openshell(
+    [
+      "policy",
+      "update",
+      options.sandboxName,
+      "--add-endpoint",
+      "host-edit-mcp.example.com:443:read-only:rest:enforce",
+      "--rule-name",
+      "mcp_host_edit_e2e",
+      "--binary",
+      "/usr/bin/curl",
+      "--wait",
+    ],
+    {
+      artifactName: `${options.artifactPrefix}-host-policy-edit-before-mcp-add`,
+      env: buildAvailabilityProbeEnv(),
+      timeoutMs: 60_000,
+    },
+  );
+  assertExitZero(result, `${options.artifactPrefix} host policy edit before MCP add`);
+}
 
 type McpNetworkPolicy = {
   endpoints?: Array<{
@@ -91,25 +118,7 @@ export async function hostAddressForSandbox(_host: HostCliClient): Promise<strin
 
 /** Concrete runner address used only to simulate a post-validation DNS rebind. */
 export async function hostPrivateAddressForSandbox(host: HostCliClient): Promise<string> {
-  const probe = await host.command(
-    "bash",
-    [
-      "-lc",
-      [
-        'ip_addr="$(ip route get 1.1.1.1 2>/dev/null | awk \'{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}\')"',
-        'if [ -n "$ip_addr" ]; then echo "$ip_addr"; exit 0; fi',
-        "ip_addr=\"$(hostname -I 2>/dev/null | awk '{print $1}')\"",
-        'if [ -n "$ip_addr" ]; then echo "$ip_addr"; exit 0; fi',
-        "echo 127.0.0.1",
-      ].join("\n"),
-    ],
-    {
-      artifactName: "host-private-ip-for-mcp-rebinding",
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 30_000,
-    },
-  );
-  return probe.stdout.trim().split(/\s+/)[0] || "127.0.0.1";
+  return (await discoverHostAddress(host, "host-private-ip-for-mcp-rebinding")).address;
 }
 
 export {
@@ -141,15 +150,15 @@ export function isExpectedMcpCurlPolicyDenial(
 
 /**
  * Build an MCP request whose curl child retains the selected adapter runtime
- * as an ancestor. OpenShell v0.0.101 attributes policy to /proc/<pid>/exe and
+ * as an ancestor. OpenShell v0.0.106 attributes policy to /proc/<pid>/exe and
  * ancestors, so this exercises the same unavoidable Node/Python identity used
  * by the corresponding adapter instead of an unrelated curl-only identity.
  *
  * Pinned upstream source contract:
- * NVIDIA/OpenShell@8ddd98c3dff62619a3963f99ba1e055b67650e72,
- * crates/openshell-supervisor-network/src/proxy.rs:3030-3055 resolves once,
- * proxy/destination.rs:134-185 validates and retains that same address list,
- * and proxy.rs:3209-3211 dials those addresses on the direct path used here.
+ * NVIDIA/OpenShell@c4b500a7de64d0b66e3ee8098f58d14299092162,
+ * crates/openshell-supervisor-network/src/proxy.rs:3070-3096 resolves once,
+ * proxy.rs:3121-3160 validates and retains that same address list, and
+ * proxy.rs:3193-3251 dials those addresses on the direct path used here.
  */
 export function buildMcpDnsRebindingProbeScript(
   adapter: McpDnsRebindingAdapter,
@@ -183,7 +192,7 @@ export function buildMcpDnsRebindingProbeScript(
   const quotedCurl = curlArgs.map(shellQuote).join(" ");
   const runtimeCommand = (() => {
     switch (adapter) {
-      case "mcporter": {
+      case "openclaw-config": {
         const runner =
           'const { spawnSync } = require("node:child_process"); const result = spawnSync(process.argv[1], process.argv.slice(2), { stdio: "inherit" }); process.exit(result.status ?? 1);';
         return `nemoclaw-start node -e ${shellQuote(runner)} ${quotedCurl}`;

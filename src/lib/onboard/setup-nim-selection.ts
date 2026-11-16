@@ -1,23 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import {
-  canonicalEndpoint,
-  normalizeProviderBaseUrl,
-  unsafeEndpointUrlViolation,
-} from "../core/url-utils";
+import type { ModelSelectionProvenance } from "../domain/telemetry/provenance";
+import type { NimStartReceipt } from "../inference/nim";
+import { unsafeEndpointUrlViolation } from "../core/endpoint-url-safety";
+import { canonicalEndpoint, normalizeProviderBaseUrl } from "../core/url-utils";
 import { applyCompatibleEndpointContextWindow } from "../inference/compatible-endpoint-context";
 import type { TrustedPrivateEndpointCapability } from "../inference/endpoint-ssrf-preflight";
 import type { GatewayRouteDiscoveryConstraints } from "../inference/gateway-route-compatibility";
 import { getProbeExtraHeaders } from "../inference/onboard-probes";
+import { usesNvidiaEndpointProbePayload } from "../inference/openai-probe-models";
 import type { OnboardInferenceCapabilityCache } from "./inference-capability-cache";
 import type { NvidiaFeaturedModelSession } from "./nvidia-featured-model-selection";
 import { exitOnboardFromPrompt, getNavigationChoice } from "./prompt-helpers";
 import type { ReasoningEffort } from "./reasoning-mode";
 
-export { createNvidiaFeaturedModelSession } from "./nvidia-featured-model-selection";
+export {
+  createNvidiaFeaturedModelSession,
+  selectFeaturedModelAfterCredentialPrompt,
+} from "./nvidia-featured-model-selection";
 
-export type SetupNimSelectionBackNavigation = Readonly<{ kind: "NEMOCLAW_BACK_TO_SELECTION" }>;
+export type SetupNimSelectionBackNavigation = Readonly<{
+  kind: "NEMOCLAW_BACK_TO_SELECTION";
+}>;
 
 /** Defaults passed into Ollama model selection and runtime context adoption. */
 export type OllamaModelSelectionDefaults = {
@@ -31,6 +36,7 @@ export type OllamaModelSelectionDefaults = {
 };
 
 export type SetupNimSelectionState<THermesAuthMethod = unknown> = {
+  onModelSelected?: (model: string, source: ModelSelectionProvenance["modelSource"]) => void;
   model: string | SetupNimSelectionBackNavigation | null;
   provider: string;
   endpointUrl: string | null;
@@ -41,6 +47,8 @@ export type SetupNimSelectionState<THermesAuthMethod = unknown> = {
   compatibleEndpointReasoning?: string | null;
   compatibleEndpointReasoningEffort?: string | null;
   nimContainer: string | null;
+  /** Ephemeral selection identity before the owned NIM container is started. */
+  localNimSelected?: boolean;
   allowToolsIncompatible: boolean;
   /** Minimum Ollama daemon context length to request for this agent. */
   ollamaContextWindowFloor?: number;
@@ -58,38 +66,71 @@ export type SetupNimSelectionState<THermesAuthMethod = unknown> = {
   openRouterFeaturedModels?: NvidiaFeaturedModelSession;
   /** Attempt-wide shared-gateway guard, invoked after identity selection and before probes. */
   assertRouteCompatible?: () => GatewayRouteDiscoveryConstraints;
+  /** Receipt-bound policy check invoked immediately before provider or runtime mutations. */
+  revalidateSandboxIdentity?: (operation: string) => void;
 };
 
-export type CloudFallbackConfig = {
-  providerName: string;
-  endpointUrl: string | null;
-  credentialEnv: string | null;
-  defaultModel: string;
-};
-
-export function applyCloudFallbackSelection(
+/** Revalidate the current provider selection before a policy-dependent mutation. */
+export function assertSelectionMutationAuthority(
   state: SetupNimSelectionState,
-  cloudConfig: CloudFallbackConfig,
+  operation: string,
 ): void {
-  // Source boundary: fallback may run after a local Ollama/NIM/vLLM branch
-  // accepted provider-specific tool constraints. Cloud fallback is a fresh
-  // provider selection, so clear local-only compatibility state here.
-  state.provider = cloudConfig.providerName;
-  state.endpointUrl = cloudConfig.endpointUrl;
-  state.credentialEnv = cloudConfig.credentialEnv;
-  state.model = cloudConfig.defaultModel;
-  state.preferredInferenceApi = null;
-  state.nimContainer = null;
-  state.allowToolsIncompatible = false;
-  state.skipHostInferenceSmoke = false;
-  state.reuseGatewayCredentialWithoutLocalKey = false;
-  delete state.vllmModelIdentity;
-  delete state.endpointPinnedAddresses;
-  delete state.endpointTrustedPrivateCapability;
+  state.revalidateSandboxIdentity?.(operation);
 }
 
-export function clearNimContainerBeforeRetry(state: SetupNimSelectionState): void {
+/** Carry the attempt's exact mutation guard through a blocking credential prompt. */
+export function credentialMutationGuardFor(
+  state: SetupNimSelectionState,
+): ((operation: string) => void) | undefined {
+  return state.revalidateSandboxIdentity;
+}
+
+export function withCredentialMutationGuard<T extends object>(
+  state: SetupNimSelectionState,
+  options: T,
+): T & { revalidateSandboxIdentity?: (operation: string) => void } {
+  const guard = credentialMutationGuardFor(state);
+  return guard ? { ...options, revalidateSandboxIdentity: guard } : options;
+}
+
+export function clearNimContainerBeforeRetry(
+  state: SetupNimSelectionState,
+  removeOwnedContainer: (name: string) => void,
+): void {
+  if (!state.nimContainer) {
+    throw new Error("Cannot retry Local NIM selection without its owned container identity");
+  }
+  assertSelectionMutationAuthority(
+    state,
+    "remove the local NIM runtime before retrying provider selection",
+  );
+  removeOwnedContainer(state.nimContainer);
   state.nimContainer = null;
+  delete state.localNimSelected;
+}
+
+/** Stop onboarding after failed Local NIM startup without changing its selected route. */
+export function abortFailedNimStartup(
+  state: SetupNimSelectionState,
+  started: NimStartReceipt,
+  removeExactContainer: (id: string) => void,
+): never {
+  if (state.nimContainer !== started.name) {
+    throw new Error("Local NIM startup receipt does not match the selected container");
+  }
+  try {
+    assertSelectionMutationAuthority(
+      state,
+      "remove the local NIM runtime after failed health validation",
+    );
+  } catch {
+    // The exact ID from `docker run -d` still proves which container this
+    // attempt created, even when the sandbox identity changed during the wait.
+  }
+  removeExactContainer(started.id);
+  state.nimContainer = null;
+  delete state.localNimSelected;
+  throw new Error("Local NVIDIA NIM failed to become healthy. Onboarding stopped.");
 }
 
 type CompatibleEndpointKind = "openai" | "anthropic";
@@ -202,6 +243,7 @@ type RemoteProviderConfig = {
   label: string;
   endpointUrl: string;
   helpUrl: string | null;
+  defaultModel?: string;
 };
 
 type ProbeAuthMode = "bearer" | "query-param" | undefined;
@@ -209,10 +251,13 @@ type ProbeAuthMode = "bearer" | "query-param" | undefined;
 type ProbeOptions = {
   requireResponsesToolCalling?: boolean;
   skipResponsesProbe?: boolean;
+  useNvidiaEndpointProbePayload?: boolean;
   authMode?: ProbeAuthMode;
   extraHeaders?: readonly string[];
   capabilityCache?: OnboardInferenceCapabilityCache;
   provider?: string;
+  providerDefaultModel?: string;
+  revalidateSandboxIdentity?: (operation: string) => void;
 };
 
 type ValidationResult =
@@ -223,7 +268,11 @@ type ValidationResult =
       pinnedAddresses?: string[];
       trustedPrivateCapability?: TrustedPrivateEndpointCapability;
     }
-  | { ok: false; api?: string; retry?: "credential" | "retry" | "model" | "selection" | string };
+  | {
+      ok: false;
+      api?: string;
+      retry?: "credential" | "retry" | "model" | "selection" | string;
+    };
 
 type RemoteModelValidationResult = "selected" | "retry-model" | "retry-selection";
 
@@ -239,6 +288,7 @@ type RemoteModelValidatorDeps = {
     credentialEnv: string,
     helpUrl: string | null,
     capabilityCache?: OnboardInferenceCapabilityCache,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ) => Promise<ValidationResult>;
   validateCustomAnthropicSelection: (
     label: string,
@@ -248,6 +298,7 @@ type RemoteModelValidatorDeps = {
     helpUrl: string | null,
     options?: {
       intendedApi?: "anthropic-messages" | "openai-completions";
+      revalidateSandboxIdentity?: (operation: string) => void;
     },
   ) => Promise<ValidationResult>;
   validateAnthropicSelectionWithRetryMessage: (
@@ -257,6 +308,7 @@ type RemoteModelValidatorDeps = {
     credentialEnv: string,
     retryMessage: string,
     helpUrl: string | null,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ) => Promise<ValidationResult>;
   validateOpenAiLikeSelection: (
     label: string,
@@ -332,14 +384,18 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
             "  ⚠ Reasoning mode validates Chat Completions only; tools and streaming are unverified.",
           );
         }
-        const validation = await deps.validateCustomOpenAiLikeSelection(
+        const validationArgs = [
           remoteConfig.label,
           state.endpointUrl || deps.OPENAI_ENDPOINT_URL,
           selectedModel,
           selectedCredentialEnv,
           remoteConfig.helpUrl,
           state.inferenceCapabilityCache,
-        );
+        ] as const;
+        const guard = credentialMutationGuardFor(state);
+        const validation = await (guard
+          ? deps.validateCustomOpenAiLikeSelection(...validationArgs, guard)
+          : deps.validateCustomOpenAiLikeSelection(...validationArgs));
         if (validation.ok) {
           if (validation.pinnedAddresses)
             state.endpointPinnedAddresses = validation.pinnedAddresses;
@@ -386,7 +442,7 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
           selectedModel,
           selectedCredentialEnv,
           remoteConfig.helpUrl,
-          { intendedApi },
+          withCredentialMutationGuard(state, { intendedApi }),
         );
         if (validation.ok) {
           if (validation.pinnedAddresses)
@@ -406,14 +462,18 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
 
       const retryMessage = "Please choose a provider/model again.";
       if (selected.key === "anthropic") {
-        const validation = await deps.validateAnthropicSelectionWithRetryMessage(
+        const validationArgs = [
           remoteConfig.label,
           state.endpointUrl || deps.ANTHROPIC_ENDPOINT_URL,
           selectedModel,
           selectedCredentialEnv,
           retryMessage,
           remoteConfig.helpUrl,
-        );
+        ] as const;
+        const guard = credentialMutationGuardFor(state);
+        const validation = await (guard
+          ? deps.validateAnthropicSelectionWithRetryMessage(...validationArgs, guard)
+          : deps.validateAnthropicSelectionWithRetryMessage(...validationArgs));
         if (validation.ok) {
           state.preferredInferenceApi = validation.api;
           return "selected";
@@ -431,15 +491,17 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
         selectedCredentialEnv,
         retryMessage,
         remoteConfig.helpUrl,
-        {
+        withCredentialMutationGuard(state, {
           provider: state.provider,
+          ...(remoteConfig.defaultModel ? { providerDefaultModel: remoteConfig.defaultModel } : {}),
+          useNvidiaEndpointProbePayload: usesNvidiaEndpointProbePayload(state.provider),
           requireResponsesToolCalling: deps.shouldRequireResponsesToolCalling(state.provider),
           skipResponsesProbe: deps.shouldSkipResponsesProbe(state.provider),
           authMode: deps.getProbeAuthMode(state.provider),
           extraHeaders:
             deps.getProbeExtraHeaders?.(state.provider) ?? getProbeExtraHeaders(state.provider),
           capabilityCache: state.inferenceCapabilityCache,
-        },
+        }),
       );
       if (validation.ok) {
         state.preferredInferenceApi = validation.api;

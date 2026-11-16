@@ -1,6 +1,37 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import type { OpenShellSandboxBufferedCommandExecutor } from "../adapters/openshell/sandbox-command";
+import type {
+  OpenShellGpuDiagnosticArtifact,
+  OpenShellGpuDiagnostics,
+} from "../adapters/openshell/gpu-diagnostics";
+import type { SandboxGpuProofResult } from "../state/registry";
+
+export interface SandboxCreateRuntimePatch {
+  maybeApplyDuringCreate(): void | Promise<void>;
+  replacementRuntimeId?(): string | null;
+  createFailureMessage(): string | null;
+  exitOnPatchError(): void | Promise<void>;
+  rollbackManagedStartupAfterCreateFailure(): void | Promise<void>;
+  ensureApplied(): void | Promise<void>;
+  waitForSupervisorReconnectIfNeeded(): void | Promise<void>;
+  commitAfterReady(options?: {
+    readonly beforeFinalHandoff?: (replacementRuntimeId: string | null) => void;
+  }): void | Promise<void>;
+  allowsNotReadyLifecycleRevalidation?(): boolean;
+  selectedMode(): {
+    readonly kind: string;
+    readonly label: string;
+    readonly device: string;
+    readonly args: readonly string[];
+  } | null;
+  printReadinessFailureIfEnabled(): void;
+  verifyGpuOrExit(
+    verifyDirectSandboxGpu: (sandboxName: string) => SandboxGpuProofResult,
+  ): Promise<SandboxGpuProofResult>;
+}
+
 type DockerRunResult = {
   status?: number | null;
   stdout?: string | Buffer | null;
@@ -23,6 +54,8 @@ type ContainerDnsProbeFn = (
 ) => import("./preflight").DnsProbeResult;
 
 export type DockerGpuPatchDeps = {
+  commandExecutor?: OpenShellSandboxBufferedCommandExecutor;
+  openShellGpuDiagnostics?: OpenShellGpuDiagnostics;
   dockerCapture?: DockerCaptureFn;
   dockerRun?: DockerRunFn;
   dockerRunDetached?: DockerRunFn;
@@ -58,6 +91,16 @@ export type DockerGpuPatchDeps = {
   errorPhaseDebouncePolls?: number;
 };
 
+export type DockerGpuDiagnosticDeps = Pick<
+  DockerGpuPatchDeps,
+  | "openShellGpuDiagnostics"
+  | "runCaptureOpenshell"
+  | "dockerCapture"
+  | "dockerLogs"
+  | "homedir"
+  | "now"
+>;
+
 export type DockerGpuPatchModeKind = "gpus" | "nvidia-runtime" | "cdi" | "startup-command";
 export type DockerGpuPatchBackend = "generic" | "jetson";
 
@@ -79,12 +122,14 @@ export type DockerGpuPatchFailureContext = {
   oldContainerId?: string | null;
   newContainerId?: string | null;
   backupContainerName?: string | null;
+  backupRemoved?: boolean;
   selectedMode?: DockerGpuPatchMode | null;
   modeAttempts?: DockerGpuPatchModeAttempt[];
   rolledBack?: boolean;
   replacementStopConfirmed?: boolean;
   replacementRemovalConfirmed?: boolean;
   replacementPresence?: "absent" | "present" | "unknown";
+  lastSandboxPhase?: string | null;
 };
 
 export type DockerGpuPatchResult = {
@@ -94,11 +139,11 @@ export type DockerGpuPatchResult = {
   originalName: string;
   backupContainerName: string;
   mode: DockerGpuPatchMode;
-  // True when the patch path also confirmed supervisor reconnect AND removed
-  // the backup container. False when the caller deferred the reconnect wait
-  // (via `waitForSupervisor: false`); the backup is still in place and the
-  // caller is responsible for calling `finalizeDockerGpuPatchBackup` after
-  // its own supervisor wait completes.
+  // True when the patch path confirmed the initial supervisor reconnect,
+  // removed the exact backup, restarted the exact replacement, and received
+  // the final OpenShell handoff acknowledgement. False means the caller used
+  // `waitForSupervisor: false`; the backup remains until the caller invokes
+  // `finalizeDockerGpuPatchBackup` after its own initial readiness check.
   backupRemoved: boolean;
 };
 
@@ -123,6 +168,8 @@ export type DockerGpuCloneRunOptions = {
   containerCommand?: readonly string[] | null;
   /** Stopped staging name used before exact-name cutover. */
   containerName?: string | null;
+  /** Preserve managed-bootstrap-only launch fields during stopped replacement. */
+  preserveManagedLaunchSpec?: boolean;
   /**
    * Extra supplementary group IDs to add to the recreated container via
    * `--group-add`. On Jetson these are the host group(s) owning the Tegra GPU
@@ -172,11 +219,20 @@ export type DockerGpuPatchSandboxSnapshot = {
   sandboxPhase: string | null;
   sandboxListLine: string | null;
   patchedContainerState: DockerContainerState | null;
+  /**
+   * The typed OpenShell observations used to derive the phase. Keeping the
+   * observations with the snapshot lets the diagnostics writer persist the
+   * same evidence without invoking the external collector a second time.
+   * Presence records an attempted collection; an empty array records a failed
+   * or empty attempt that must not be retried by the writer.
+   */
+  openShellDiagnosticArtifacts?: readonly OpenShellGpuDiagnosticArtifact[];
 };
 
 export type DockerGpuPatchFailureKind =
   | "patched_container_failed"
   | "sandbox_error_phase"
+  | "sandbox_deleting_phase"
   | "supervisor_unreachable"
   | "proof_failure"
   | "unknown";
@@ -206,6 +262,15 @@ export type DockerContainerInspect = {
     AttachStderr?: boolean;
     Env?: string[] | null;
     Labels?: Record<string, string> | null;
+    ExposedPorts?: Record<string, Record<string, never>> | null;
+    Healthcheck?: {
+      Test?: string[] | null;
+      Interval?: number;
+      Timeout?: number;
+      StartPeriod?: number;
+      StartInterval?: number;
+      Retries?: number;
+    } | null;
     Entrypoint?: string[] | string | null;
     Cmd?: string[] | string | null;
     User?: string;
@@ -222,7 +287,14 @@ export type DockerContainerInspect = {
     Restarting?: boolean;
     Dead?: boolean;
   } | null;
+  Mounts?: Array<{
+    Type?: string;
+    Source?: string;
+    Destination?: string;
+    RW?: boolean;
+  }> | null;
   HostConfig?: {
+    Annotations?: Record<string, string> | null;
     Binds?: string[] | null;
     Mounts?: Array<{
       Type?: string;
@@ -245,6 +317,7 @@ export type DockerContainerInspect = {
     }> | null;
     NetworkMode?: string;
     PortBindings?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null> | null;
+    Tmpfs?: Record<string, string> | null;
     RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null;
     CapAdd?: string[] | null;
     CapDrop?: string[] | null;
@@ -260,6 +333,7 @@ export type DockerContainerInspect = {
     CpusetCpus?: string;
     CpusetMems?: string;
     PidsLimit?: number | null;
+    OomScoreAdj?: number | null;
     ConsoleSize?: number[] | null;
     Privileged?: boolean;
     Init?: boolean;

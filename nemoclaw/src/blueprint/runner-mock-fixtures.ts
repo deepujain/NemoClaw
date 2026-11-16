@@ -22,7 +22,7 @@ export interface RunnerFsEntry {
 export const FAKE_HOME = "/fakehome";
 
 /** The deterministic UUID every runner suite mocks crypto.randomUUID() to. */
-export const FIXED_RUN_UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+export const FIXED_RUN_UUID = "aaaaaaaa-bbbb-4ccc-addd-eeeeeeeeeeee";
 
 /** An in-memory filesystem store with its seeding helpers. */
 export interface RunnerFsStore {
@@ -42,14 +42,14 @@ export function createRunnerFsStore(): RunnerFsStore {
 }
 
 function missingEntry(path: string): never {
-  throw new Error(`ENOENT: ${path}`);
+  throw Object.assign(new Error(`ENOENT: ${path}`), { code: "ENOENT" });
 }
 
 /** Behavior options for inMemoryFsMethods. */
 export interface InMemoryFsOptions {
   /** Canonical-path overrides consulted by realpathSync before the store. */
   realpaths?: Map<string, string>;
-  /** Wrapper applied to mutating methods so tests can track calls (pass vi.fn). */
+  /** Wrapper for mutations and directory reads so tests can track calls (pass vi.fn). */
   spy?: <T extends (...args: never[]) => unknown>(fn: T) => T;
 }
 
@@ -59,6 +59,8 @@ export interface InMemoryFsOptions {
  */
 export function inMemoryFsMethods(store: Map<string, RunnerFsEntry>, options?: InMemoryFsOptions) {
   const spy = options?.spy ?? (<T>(fn: T): T => fn);
+  let nextFd = 100;
+  const openFiles = new Map<number, string>();
   return {
     existsSync: (p: string) => store.has(p),
     mkdirSync: spy((p: string) => void store.set(p, { type: "dir" })),
@@ -69,7 +71,28 @@ export function inMemoryFsMethods(store: Map<string, RunnerFsEntry>, options?: I
     writeFileSync: spy((p: string, data: string) => {
       store.set(p, { type: "file", content: String(data) });
     }),
-    readdirSync: (p: string) => {
+    openSync: spy((p: string) => {
+      if (!store.has(p)) return missingEntry(p);
+      const fd = nextFd++;
+      openFiles.set(fd, p);
+      return fd;
+    }),
+    fsyncSync: spy((fd: number) => {
+      if (!openFiles.has(fd)) throw new Error(`EBADF: ${fd}`);
+    }),
+    closeSync: spy((fd: number) => {
+      if (!openFiles.delete(fd)) throw new Error(`EBADF: ${fd}`);
+    }),
+    renameSync: spy((source: string, destination: string) => {
+      const entry = store.get(source);
+      if (!entry) return missingEntry(source);
+      store.set(destination, entry);
+      store.delete(source);
+    }),
+    unlinkSync: spy((target: string) => {
+      if (!store.delete(target)) return missingEntry(target);
+    }),
+    readdirSync: spy((p: string) => {
       const prefix = p.endsWith("/") ? p : `${p}/`;
       const entries = new Set(
         [...store.keys()]
@@ -78,7 +101,7 @@ export function inMemoryFsMethods(store: Map<string, RunnerFsEntry>, options?: I
           .filter((first): first is string => Boolean(first)),
       );
       return entries.size === 0 && !store.has(p) ? missingEntry(p) : [...entries].sort();
-    },
+    }),
     realpathSync: (p: string) => {
       const resolved = resolve(p);
       const mapped = options?.realpaths?.get(resolved);
@@ -133,5 +156,14 @@ export function createStdoutCapture(): StdoutCapture {
     reset: () => {
       chunks.length = 0;
     },
+  };
+}
+
+/** Returns a callback that throws on one numbered invocation. */
+export function throwOnCall(callNumber: number, error: Error): () => void {
+  let calls = 0;
+  return () => {
+    calls += 1;
+    if (calls === callNumber) throw error;
   };
 }

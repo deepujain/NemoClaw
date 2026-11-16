@@ -269,9 +269,7 @@ describe("assertHostDnsHealthy (#4784)", () => {
     expect(logs.join("\n")).toContain("Host DNS resolution check skipped");
   });
 
-  it.each(
-    ["ollama", "openai", "anthropic", "vllm", "custom"],
-  )(
+  it.each(["ollama", "openai", "anthropic", "vllm", "custom"])(
     "skips silently (no probe, no exit) when a non-NVIDIA provider is selected (codex P2) [%s]",
     (provider) => {
       const exit = vi.fn();
@@ -321,8 +319,8 @@ describe("assertHostDnsHealthy (#4784)", () => {
     expect(exit).not.toHaveBeenCalled();
   });
 
-  it.each(["build", "cloud", "routed"])(
-    "runs for explicit NVIDIA Endpoints provider keys (build/cloud/routed) in non-interactive mode [%s]",
+  it.each(["build", "cloud"])(
+    "runs for explicit NVIDIA Endpoints provider keys (build/cloud) in non-interactive mode [%s]",
     (provider) => {
       const exit = vi.fn();
       vi.spyOn(console, "log").mockImplementation(() => {});

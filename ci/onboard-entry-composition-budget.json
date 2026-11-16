@@ -6,29 +6,23 @@
     "runOnboard": 2
   },
   "messaging": {
-    "createSandboxWithBaseImageResolution": 9,
-    "createSandboxWithBaseImageResolution.plan.rebindMessagingTokenDefs": 1,
     "getOpenShellInstallDeps.hasRequiredOpenshellMessagingFeatures": 4,
     "runOnboard": 1,
     "runOnboard.finalizationDeps.verifyDeployment.getMessagingChannels": 1
   },
   "policy": {
-    "createOnboardPolicyApplication.getRecordedPolicyTier": 1,
-    "createSandboxWithBaseImageResolution": 7,
     "preflightAuthoritativeRebuildTarget": 1,
-    "runOnboard": 6,
+    "runOnboard": 4,
     "sandboxCreateIntentResolver.getAgentPolicyPath": 1
   },
   "provider": {
-    "createSandboxWithBaseImageResolution": 20,
-    "handleNimLocalSelection": 36,
-    "handleRemoteProviderSelection": 84,
+    "handleNimLocalSelection": 32,
+    "handleRemoteProviderSelection": 81,
     "handleRemoteProviderSelection.providerExistsInGateway": 1,
     "handleRemoteProviderSelection.readGatewayProviderMetadata": 1,
-    "handleRoutedSelection": 16,
     "handleVllmSelection.queryVllmModels": 1,
     "preflightAuthoritativeRebuildTarget": 1,
-    "runOnboard": 8,
+    "runOnboard": 7,
     "runOnboard.providerInference.deps.needsBedrockRuntimeAdapter": 1,
     "selectAndValidateOllamaModel": 19
   }

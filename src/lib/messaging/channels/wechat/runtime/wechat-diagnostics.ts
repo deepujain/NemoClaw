@@ -54,7 +54,7 @@ type WechatHttpRequestLike = (this: unknown, ...args: unknown[]) => WechatReques
     // visible so an operator can still see the request shape.
     text = text.replace(/(bot_token=)[^&\s"']+/gi, "$1<redacted>");
     text = text.replace(/("bot_token"\s*:\s*")[^"]+/gi, "$1<redacted>");
-    text = text.replace(/Bearer\s+[A-Za-z0-9._~+\/=-]+/g, "Bearer <redacted>");
+    text = text.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer <redacted>");
     text = text.replace(
       /\b(api[_-]?key|token|authorization|wechat[_-]?bot[_-]?token)\b(["']?\s*[:=]\s*["']?)[^"'\s,)]+/gi,
       "$1$2<redacted>",
@@ -131,11 +131,7 @@ type WechatHttpRequestLike = (this: unknown, ...args: unknown[]) => WechatReques
     if (Number(statusCode) < 200 || Number(statusCode) >= 300) return;
     providerStarted = true;
     readyLogged = true;
-    emit(
-      "[wechat] [" +
-        accountIdFromEnv() +
-        "] provider ready (iLink reachable; agent replies use inference.local)",
-    );
+    emit("[wechat] [" + accountIdFromEnv() + "] provider ready (iLink reachable)");
   }
 
   function wrapHttp(mod: WechatHttpModuleLike, methodName: string): void {

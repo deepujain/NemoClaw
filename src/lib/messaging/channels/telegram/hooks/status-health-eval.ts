@@ -73,7 +73,7 @@ export type TelegramProbeInput = {
   // ISO timestamp captured by the orchestrator when the probe ran.
   probedAt: string;
   // Whether the telegram preset is recorded in the sandbox registry.
-  presetInRegistry: boolean;
+  presetApplied: boolean;
   // Whether the telegram preset's network policy is loaded on the gateway,
   // or null when the gateway could not be reached.
   presetOnGateway: boolean | null;
@@ -103,7 +103,7 @@ function configCoverageSignal(input: TelegramProbeInput): DiagnosticSignal {
 }
 
 function policyCoverageSignal(input: TelegramProbeInput): DiagnosticSignal {
-  if (input.presetOnGateway === false && input.presetInRegistry) {
+  if (input.presetOnGateway === false && input.presetApplied) {
     return {
       label: "Policy coverage",
       severity: "fail",
@@ -111,7 +111,7 @@ function policyCoverageSignal(input: TelegramProbeInput): DiagnosticSignal {
       hint: "rebuild the sandbox so the preset is reapplied to the OpenShell gateway",
     };
   }
-  if (!input.presetInRegistry) {
+  if (!input.presetApplied) {
     return {
       label: "Policy coverage",
       severity: "fail",
@@ -387,7 +387,11 @@ export function parseTelegramBreadcrumbs(logLines: readonly string[]): TelegramB
     if (NETWORK_FAIL.test(line)) lastNetworkFail = index;
     if (/bridge did not start within/i.test(line)) lastBridgeNotStarted = index;
     if (/rejected startup probe with HTTP\s+(401|404)/i.test(line)) lastTokenRejected = index;
-    if (/credential placeholder.*(missing|mismatch|unresolved)/i.test(line)) {
+    if (
+      /credential placeholder.*(?:missing|mismatch|unresolved)|runtime TELEGRAM_BOT_TOKEN (?:is an identityless canonical placeholder|placeholder is malformed)|runtime credential available from a non-placeholder source/i.test(
+        line,
+      )
+    ) {
       lastCredentialUnresolved = index;
     }
   });

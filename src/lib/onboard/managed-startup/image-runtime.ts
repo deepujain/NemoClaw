@@ -2,10 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, X509Certificate } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+import { PEM_CERTIFICATE_RE_GLOBAL } from "../corporate-ca-policy";
+import { managedImageRuntimeIdentity } from "../managed-image/agents";
+import {
+  HERMES_RELAY_PLUGIN_STATE_FILE,
+  HERMES_RELAY_PLUGIN_STATE_STAGING_FILE,
+  HERMES_RELAY_PLUGINS_FILE,
+  HERMES_RELAY_PLUGINS_STAGING_FILE,
+  HERMES_SWITCHYARD_DEPLOYMENT_FILE,
+  HERMES_SWITCHYARD_DEPLOYMENT_STAGING_FILE,
+  assertSwitchyardRootApplyEnvironment,
+  readHermesSwitchyardRoutingEnvironment,
+  readSwitchyardProviderBindingsEnvironment,
+  serializeHermesSwitchyardRouting,
+} from "../../hermes-switchyard-routing";
 import {
   type ManagedStartupAgentEnvironment,
   type ManagedStartupAgentMaterial,
@@ -41,16 +55,29 @@ import {
   MANAGED_STARTUP_SHARED_ROLLBACK_RECEIPT_DIRECTORY,
   rollbackManagedStartupSharedStateTransaction,
 } from "./shared-state-transaction";
+import { managedStartupWorkspaceRoot } from "./state-roots";
 import { MANAGED_STARTUP_CA_ENV, MANAGED_STARTUP_PROFILE_ENV } from "./transport";
 
 export { MANAGED_STARTUP_CA_ENV, MANAGED_STARTUP_PROFILE_ENV } from "./transport";
-export const MANAGED_STARTUP_RUNTIME_ENV_FILE = "/run/nemoclaw/managed-startup-runtime.env";
+const MANAGED_STARTUP_EXCHANGE_DIRECTORY = "/tmp";
+export const MANAGED_STARTUP_RUNTIME_ENV_FILE = `${MANAGED_STARTUP_EXCHANGE_DIRECTORY}/nemoclaw-managed-startup-runtime.env`;
 export const MANAGED_STARTUP_RUNTIME_EXECUTABLE =
   "/usr/local/lib/nemoclaw/managed-startup-image-runtime.cjs";
-export const MANAGED_STARTUP_MERGED_CA_FILE = "/run/nemoclaw/managed-startup-ca-bundle.pem";
-export const MANAGED_STARTUP_COMPLETION_FILE = "/run/nemoclaw/managed-startup-complete.json";
+export const MANAGED_STARTUP_MERGED_CA_FILE = `${MANAGED_STARTUP_EXCHANGE_DIRECTORY}/nemoclaw-managed-startup-ca-bundle.pem`;
+export const MANAGED_STARTUP_COMPLETION_FILE = `${MANAGED_STARTUP_EXCHANGE_DIRECTORY}/nemoclaw-managed-startup-complete.json`;
 
 const MANAGED_STARTUP_CORPORATE_CA_FILE = "/usr/local/share/nemoclaw/corporate-ca.pem";
+const MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY = "/usr/local/share/ca-certificates";
+const MANAGED_STARTUP_SYSTEM_CA_ANCHOR_RE = /^nemoclaw-corporate-ca-[0-9]{2}\.crt$/u;
+const SYSTEM_CA_BUNDLE_FILE = "/etc/ssl/certs/ca-certificates.crt";
+const UPDATE_CA_CERTIFICATES_EXECUTABLE = "/usr/sbin/update-ca-certificates";
+const MANAGED_STARTUP_TLS_ENV_NAMES = new Set([
+  "CURL_CA_BUNDLE",
+  "GIT_SSL_CAINFO",
+  "NODE_EXTRA_CA_CERTS",
+  "REQUESTS_CA_BUNDLE",
+  "SSL_CERT_FILE",
+]);
 const MESSAGING_RUNTIME_PLAN_FILE = "/usr/local/share/nemoclaw/messaging-runtime-plan.json";
 const ROOT_STATE_PARENT = "/var/lib/nemoclaw";
 const ROOT_RUNTIME_DIRECTORY = "/run/nemoclaw";
@@ -63,6 +90,9 @@ const HERMES_MANAGED_CONFIG_FILES = [
 const HERMES_GENERATED_MANAGED_POLICY_FILE = "/sandbox/.hermes/managed-policy.json";
 const HERMES_INSTALLED_MANAGED_POLICY_FILE = "/usr/local/share/nemoclaw/hermes-managed-policy.json";
 const MAX_HERMES_MANAGED_POLICY_BYTES = 4 * 1024 * 1024;
+const MAX_HERMES_SWITCHYARD_CONFIG_BYTES = 128 * 1024;
+export const MANAGED_STARTUP_OWNER_RESULT_MAX_BYTES =
+  4 * Math.ceil(MAX_HERMES_MANAGED_POLICY_BYTES / 3) + 4096;
 const FIXED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SHA256_RE = /^[a-f0-9]{64}$/u;
 export const MANAGED_STARTUP_COMPLETION_SCHEMA_VERSION = 1;
@@ -83,14 +113,12 @@ interface ManagedStartupApplyMessagingConstructionActionBase {
   readonly mode: "apply" | "clear";
 }
 
-export interface ManagedStartupApplyMessagingRuntimeConstructionAction
-  extends ManagedStartupApplyMessagingConstructionActionBase {
+export interface ManagedStartupApplyMessagingRuntimeConstructionAction extends ManagedStartupApplyMessagingConstructionActionBase {
   readonly phase: "runtime-setup";
   readonly runAs: "root";
 }
 
-export interface ManagedStartupApplyMessagingConfigConstructionAction
-  extends ManagedStartupApplyMessagingConstructionActionBase {
+export interface ManagedStartupApplyMessagingConfigConstructionAction extends ManagedStartupApplyMessagingConstructionActionBase {
   readonly phase: "post-agent-install";
   readonly runAs: "sandbox";
 }
@@ -141,6 +169,52 @@ export interface ManagedStartupRootApplyResult extends ManagedStartupImageApplyR
 export interface ManagedStartupRootApplyOptions {
   /** One-attempt identity for managed bootstrap; null keeps the direct root-apply contract. */
   readonly bootstrapIdentity?: string | null;
+}
+
+export interface ManagedStartupWorkspaceRootApplyDeps {
+  readonly lstat: (
+    target: string,
+  ) => Pick<fs.Stats, "gid" | "isDirectory" | "isSymbolicLink" | "mode" | "uid">;
+  readonly chown: (target: string, uid: number, gid: number) => void;
+  readonly chmod: (target: string, mode: number) => void;
+}
+
+const defaultWorkspaceRootApplyDeps: ManagedStartupWorkspaceRootApplyDeps = {
+  lstat: (target) => fs.lstatSync(target),
+  chown: (target, uid, gid) => fs.chownSync(target, uid, gid),
+  chmod: (target, mode) => fs.chmodSync(target, mode),
+};
+
+/** Restore the agent-declared ownership contract on OpenShell's persistent workspace root. */
+export function normalizeManagedStartupWorkspaceRoot(
+  agent: ManagedStartupAgent,
+  deps: ManagedStartupWorkspaceRootApplyDeps = defaultWorkspaceRootApplyDeps,
+): void {
+  const target = managedImageRuntimeIdentity(agent).workdir;
+  const before = deps.lstat(target);
+  if (before.isSymbolicLink() || !before.isDirectory()) {
+    fail("managed startup workspace root must be one real directory");
+  }
+  const expected = managedStartupWorkspaceRoot({
+    agent,
+    agentIdentity: managedImageRuntimeIdentity(agent),
+  });
+  try {
+    deps.chown(target, expected.uid, expected.gid);
+    deps.chmod(target, expected.mode);
+  } catch {
+    fail("managed startup workspace-root normalization failed");
+  }
+  const after = deps.lstat(target);
+  if (
+    after.isSymbolicLink() ||
+    !after.isDirectory() ||
+    after.uid !== expected.uid ||
+    after.gid !== expected.gid ||
+    (after.mode & 0o7777) !== expected.mode
+  ) {
+    fail("managed startup workspace root does not match its declared posture");
+  }
 }
 
 export interface ManagedStartupCompletionMarker {
@@ -284,6 +358,21 @@ function modeOf(stat: fs.Stats): number {
   return stat.mode & 0o777;
 }
 
+function requireManagedStartupExchangeDirectory(
+  exchangeDirectory: string = MANAGED_STARTUP_EXCHANGE_DIRECTORY,
+): void {
+  const stat = fs.lstatSync(exchangeDirectory);
+  if (
+    stat.isSymbolicLink() ||
+    !stat.isDirectory() ||
+    stat.uid !== 0 ||
+    stat.gid !== 0 ||
+    (stat.mode & 0o7777) !== 0o1777
+  ) {
+    fail("managed startup exchange directory must be root:root mode 1777");
+  }
+}
+
 function requireRootOwnedDirectory(target: string, mode: number): void {
   let stat: fs.Stats;
   try {
@@ -348,12 +437,14 @@ function requireSafeExistingRootTarget(target: string): void {
 export function atomicWriteRootFile(target: string, contents: string | Buffer, mode: number): void {
   const parent = path.dirname(target);
   const parentStat = fs.lstatSync(parent);
+  const trustedStickyExchange =
+    parent === MANAGED_STARTUP_EXCHANGE_DIRECTORY && (parentStat.mode & 0o7777) === 0o1777;
   if (
     parentStat.isSymbolicLink() ||
     !parentStat.isDirectory() ||
     parentStat.uid !== 0 ||
     parentStat.gid !== 0 ||
-    (modeOf(parentStat) & 0o022) !== 0
+    ((modeOf(parentStat) & 0o022) !== 0 && !trustedStickyExchange)
   ) {
     fail(`refusing unsafe root-owned file parent ${parent}`);
   }
@@ -508,29 +599,13 @@ function execute(
 function generatorCommand(agent: ManagedStartupAgent): readonly string[] {
   switch (agent) {
     case "openclaw":
-      return [
-        "/usr/local/bin/node",
-        "--experimental-strip-types",
-        "/scripts/generate-openclaw-config.mts",
-      ];
+      return ["/usr/local/bin/node", "/scripts/generate-openclaw-config.mts"];
     case "hermes":
-      return [
-        "/usr/local/bin/node",
-        "--experimental-strip-types",
-        "/opt/nemoclaw-hermes-config/generate-config.ts",
-      ];
+      return ["/usr/local/bin/node", "/opt/nemoclaw-hermes-config/generate-config.ts"];
     case "langchain-deepagents-code":
-      return [
-        "/usr/local/bin/node",
-        "--experimental-strip-types",
-        "/opt/nemoclaw-deepagents-code/generate-config.ts",
-      ];
+      return ["/usr/local/bin/node", "/opt/nemoclaw-deepagents-code/generate-config.ts"];
     case "pi":
-      return [
-        "/usr/local/bin/node",
-        "--experimental-strip-types",
-        "/opt/nemoclaw-pi/generate-config.ts",
-      ];
+      return ["/usr/local/bin/node", "/opt/nemoclaw-pi/generate-config.ts"];
   }
 }
 
@@ -541,7 +616,6 @@ function messagingCommand(
 ): readonly string[] {
   return [
     "/usr/local/bin/node",
-    "--experimental-strip-types",
     "/src/lib/messaging/applier/build/messaging-build-applier.mts",
     "--agent",
     agent,
@@ -707,7 +781,7 @@ function verifyMessagingRuntimeTarget(mode: "apply" | "clear"): void {
 }
 
 function runInternalSandboxAction(
-  action: "write-openclaw-hash" | "write-hermes-compat-hash",
+  action: "write-hermes-compat-hash",
   configurationEnvironment: Readonly<Record<string, string>>,
   applicationRuntime: ManagedStartupApplicationRuntimePlan,
   extraEnvironment: Readonly<Record<string, string>> = {},
@@ -720,7 +794,7 @@ function runInternalSandboxAction(
   );
 }
 
-function sealOpenClawConfiguration(
+function validateOpenClawConfiguration(
   configurationEnvironment: Readonly<Record<string, string>>,
   applicationRuntime: ManagedStartupApplicationRuntimePlan,
 ): void {
@@ -747,7 +821,6 @@ function sealOpenClawConfiguration(
   ) {
     fail("OpenClaw rejected the generated managed startup config");
   }
-  runInternalSandboxAction("write-openclaw-hash", configurationEnvironment, applicationRuntime);
 }
 
 export interface StableRegularFile {
@@ -839,13 +912,161 @@ export function installHermesManagedPolicy(
   fs.unlinkSync(source);
 }
 
+export interface HermesSwitchyardRoutingFilePaths {
+  readonly relayPluginStateSource: string;
+  readonly relayPluginStateTarget: string;
+  readonly relayPluginsSource: string;
+  readonly relayPluginsTarget: string;
+  readonly switchyardDeploymentSource: string;
+  readonly switchyardDeploymentTarget: string;
+}
+
+const HERMES_SWITCHYARD_ROUTING_PATHS: HermesSwitchyardRoutingFilePaths = {
+  relayPluginStateSource: `/sandbox/.hermes/${HERMES_RELAY_PLUGIN_STATE_STAGING_FILE}`,
+  relayPluginStateTarget: HERMES_RELAY_PLUGIN_STATE_FILE,
+  relayPluginsSource: `/sandbox/.hermes/${HERMES_RELAY_PLUGINS_STAGING_FILE}`,
+  relayPluginsTarget: HERMES_RELAY_PLUGINS_FILE,
+  switchyardDeploymentSource: `/sandbox/.hermes/${HERMES_SWITCHYARD_DEPLOYMENT_STAGING_FILE}`,
+  switchyardDeploymentTarget: HERMES_SWITCHYARD_DEPLOYMENT_FILE,
+};
+
+function expectedSandboxOwnedRoutingSource(
+  target: string,
+  expected: Buffer,
+  sandboxIdentity: NumericIdentity,
+): StableRegularFile {
+  const source = readStableRegularFileSnapshot(target, MAX_HERMES_SWITCHYARD_CONFIG_BYTES);
+  if (
+    source.stat.uid !== BigInt(sandboxIdentity.uid) ||
+    source.stat.gid !== BigInt(sandboxIdentity.gid) ||
+    Number(source.stat.mode & 0o777n) !== 0o600 ||
+    !source.bytes.equals(expected)
+  ) {
+    fail(`generated Hermes routing artifact is invalid: ${target}`);
+  }
+  return source;
+}
+
+function verifyCommittedRoutingFile(target: string, expected: Buffer): void {
+  const installed = readStableRegularFileSnapshot(target, MAX_HERMES_SWITCHYARD_CONFIG_BYTES);
+  if (
+    installed.stat.uid !== 0n ||
+    installed.stat.gid !== 0n ||
+    Number(installed.stat.mode & 0o777n) !== 0o444 ||
+    !installed.bytes.equals(expected)
+  ) {
+    fail(`committed Hermes routing artifact drifted: ${target}`);
+  }
+}
+
+function assertRoutingFileAbsent(target: string): void {
+  try {
+    fs.lstatSync(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    fail(`could not inspect disabled Hermes routing artifact: ${target}`);
+  }
+  fail(`disabled Hermes routing left a stale artifact: ${target}`);
+}
+
+function removeStableRoutingSource(target: string, snapshot: StableRegularFile): void {
+  const current = fs.lstatSync(target, { bigint: true });
+  if (!sameStableFileMetadata(snapshot.stat, current)) {
+    fail(`Hermes routing artifact changed before source cleanup: ${target}`);
+  }
+  fs.unlinkSync(target);
+}
+
+/** Reconcile generated Switchyard configuration and Relay lifecycle state. */
+export function installHermesSwitchyardRoutingFiles(
+  configurationEnvironment: Readonly<NodeJS.ProcessEnv>,
+  paths: HermesSwitchyardRoutingFilePaths = HERMES_SWITCHYARD_ROUTING_PATHS,
+  sandboxIdentityInput?: NumericIdentity,
+): void {
+  const routing = readHermesSwitchyardRoutingEnvironment(configurationEnvironment);
+  if (!routing) {
+    // Remove activation first so no live Relay configuration can reference a
+    // deployment file while stale state is being cleared.
+    removeSafeRootFile(paths.relayPluginsTarget);
+    removeSafeRootFile(paths.relayPluginStateTarget);
+    removeSafeRootFile(paths.switchyardDeploymentTarget);
+    return;
+  }
+  const serialized = serializeHermesSwitchyardRouting(
+    routing,
+    readSwitchyardProviderBindingsEnvironment(configurationEnvironment, routing),
+  );
+  const expectedRelay = Buffer.from(serialized.relayPluginsToml, "utf8");
+  const expectedRelayState = Buffer.from(serialized.relayPluginStateJson, "utf8");
+  const expectedDeployment = Buffer.from(serialized.switchyardDeploymentToml, "utf8");
+  const sandboxIdentity =
+    sandboxIdentityInput ??
+    (() => {
+      const identity = readSandboxIdentity();
+      return { uid: Number(identity.uid), gid: Number(identity.gid) };
+    })();
+  const relaySource = expectedSandboxOwnedRoutingSource(
+    paths.relayPluginsSource,
+    expectedRelay,
+    sandboxIdentity,
+  );
+  const relayStateSource = expectedSandboxOwnedRoutingSource(
+    paths.relayPluginStateSource,
+    expectedRelayState,
+    sandboxIdentity,
+  );
+  const deploymentSource = expectedSandboxOwnedRoutingSource(
+    paths.switchyardDeploymentSource,
+    expectedDeployment,
+    sandboxIdentity,
+  );
+
+  // Install the referenced deployment and enabled lifecycle state before
+  // making the Relay plugin configuration visible.
+  atomicWriteRootFile(paths.switchyardDeploymentTarget, expectedDeployment, 0o444);
+  atomicWriteRootFile(paths.relayPluginStateTarget, expectedRelayState, 0o444);
+  atomicWriteRootFile(paths.relayPluginsTarget, expectedRelay, 0o444);
+  verifyCommittedRoutingFile(paths.switchyardDeploymentTarget, expectedDeployment);
+  verifyCommittedRoutingFile(paths.relayPluginStateTarget, expectedRelayState);
+  verifyCommittedRoutingFile(paths.relayPluginsTarget, expectedRelay);
+  removeStableRoutingSource(paths.switchyardDeploymentSource, deploymentSource);
+  removeStableRoutingSource(paths.relayPluginStateSource, relayStateSource);
+  removeStableRoutingSource(paths.relayPluginsSource, relaySource);
+}
+
+export function verifyHermesSwitchyardRoutingFiles(
+  configurationEnvironment: Readonly<NodeJS.ProcessEnv>,
+  paths: HermesSwitchyardRoutingFilePaths = HERMES_SWITCHYARD_ROUTING_PATHS,
+): void {
+  const routing = readHermesSwitchyardRoutingEnvironment(configurationEnvironment);
+  if (!routing) {
+    assertRoutingFileAbsent(paths.relayPluginsTarget);
+    assertRoutingFileAbsent(paths.relayPluginStateTarget);
+    assertRoutingFileAbsent(paths.switchyardDeploymentTarget);
+    return;
+  }
+  const serialized = serializeHermesSwitchyardRouting(
+    routing,
+    readSwitchyardProviderBindingsEnvironment(configurationEnvironment, routing),
+  );
+  verifyCommittedRoutingFile(
+    paths.relayPluginsTarget,
+    Buffer.from(serialized.relayPluginsToml, "utf8"),
+  );
+  verifyCommittedRoutingFile(
+    paths.relayPluginStateTarget,
+    Buffer.from(serialized.relayPluginStateJson, "utf8"),
+  );
+  verifyCommittedRoutingFile(
+    paths.switchyardDeploymentTarget,
+    Buffer.from(serialized.switchyardDeploymentToml, "utf8"),
+  );
+}
+
 /**
  * Restore the mutable Hermes image contract after its sandbox-side generator
  * atomically replaces config.yaml or .env with mode 0600. The mode transition
  * is performed through the already-authenticated descriptor, never by path.
- *
- * Shields-up turns these files into root:root 0444 trust anchors. That state is
- * valid on an already-committed replay and must not be made mutable again.
  */
 export function normalizeHermesManagedConfigDescriptor(
   target: string,
@@ -877,13 +1098,12 @@ export function normalizeHermesManagedConfigDescriptor(
       before.uid === BigInt(sandboxIdentity.uid) &&
       before.gid === BigInt(sandboxIdentity.gid) &&
       (beforeMode === 0o600 || beforeMode === 0o640);
-    const shielded = before.uid === 0n && before.gid === 0n && beforeMode === 0o444;
-    if (!before.isFile() || before.nlink !== 1n || (!mutable && !shielded)) {
+    if (!before.isFile() || before.nlink !== 1n || !mutable) {
       fail(`refusing unexpected Hermes managed config descriptor ${target}`);
     }
 
-    const expectedMode = mutable ? 0o640 : 0o444;
-    if (mutable && beforeMode === 0o600) {
+    const expectedMode = 0o640;
+    if (beforeMode === 0o600) {
       try {
         fs.fchmodSync(descriptor, expectedMode);
       } catch {
@@ -898,8 +1118,8 @@ export function normalizeHermesManagedConfigDescriptor(
     } catch {
       fail(`Hermes managed config descriptor disappeared during normalization: ${target}`);
     }
-    const expectedUid = mutable ? BigInt(sandboxIdentity.uid) : 0n;
-    const expectedGid = mutable ? BigInt(sandboxIdentity.gid) : 0n;
+    const expectedUid = BigInt(sandboxIdentity.uid);
+    const expectedGid = BigInt(sandboxIdentity.gid);
     if (
       !after.isFile() ||
       after.nlink !== 1n ||
@@ -944,28 +1164,9 @@ function sealHermesConfiguration(
   const envPath = "/sandbox/.hermes/.env";
   const config = readStableRegularFile(configPath, 4 * 1024 * 1024);
   const env = readStableRegularFile(envPath, 512 * 1024);
-  const digest = execute(
-    [
-      "/opt/hermes/.venv/bin/python3",
-      "-I",
-      "/usr/local/lib/nemoclaw/build-hermes-mcp-digest.py",
-      "--guard",
-      "/usr/local/lib/nemoclaw/hermes-runtime-config-guard.py",
-      "--config",
-      configPath,
-    ],
-    "root",
-    configurationEnvironment,
-    applicationRuntime,
-    true,
-  ).stdout.trim();
-  if (!SHA256_RE.test(digest)) {
-    fail("Hermes MCP digest helper returned an invalid digest");
-  }
   const hashText = [
     `${createHash("sha256").update(config).digest("hex")}  ${configPath}`,
     `${createHash("sha256").update(env).digest("hex")}  ${envPath}`,
-    `# nemoclaw-hermes-mcp-state-v1 intended=${digest} applied=${digest}`,
     "",
   ].join("\n");
   atomicWriteRootFile("/etc/nemoclaw/hermes.config-hash", hashText, 0o444);
@@ -1015,6 +1216,111 @@ function installCorporateCa(corporateCaPath: string | null): void {
   atomicWriteRootFile(MANAGED_STARTUP_CORPORATE_CA_FILE, bytes, 0o444);
 }
 
+function corporateCaCertificateBlocks(corporateCaPath: string): readonly string[] {
+  const corporate = readStableRegularFile(corporateCaPath, 128 * 1024).toString("utf8");
+  const blocks = corporate.match(PEM_CERTIFICATE_RE_GLOBAL);
+  if (!blocks || blocks.length === 0) {
+    fail("corporate CA material contains no certificate");
+  }
+  for (const block of blocks) {
+    try {
+      if (!new X509Certificate(block).ca) {
+        fail("corporate CA material contains a certificate that is not a CA");
+      }
+    } catch (error) {
+      if (error instanceof ManagedStartupImageRuntimeError) throw error;
+      fail("corporate CA material contains an invalid certificate");
+    }
+  }
+  return blocks.map((block) => `${block.trim()}\n`);
+}
+
+function managedSystemCaAnchorNames(): readonly string[] {
+  try {
+    fs.lstatSync(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    fail("could not inspect the managed system CA anchor directory");
+  }
+  requireRootOwnedDirectory(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY, ROOT_OWNED_DIRECTORY_MODE);
+  try {
+    return (fs.readdirSync(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY) as string[])
+      .filter((name) => MANAGED_STARTUP_SYSTEM_CA_ANCHOR_RE.test(name))
+      .sort();
+  } catch (error) {
+    fail("could not inspect the managed system CA anchors");
+  }
+}
+
+function refreshSystemCaBundle(): void {
+  if (!trustedExecutable(UPDATE_CA_CERTIFICATES_EXECUTABLE)) {
+    fail(`a trusted ${UPDATE_CA_CERTIFICATES_EXECUTABLE} executable is required`);
+  }
+  const result = spawnSync(UPDATE_CA_CERTIFICATES_EXECUTABLE, [], {
+    encoding: "utf8",
+    env: { PATH: FIXED_PATH },
+    stdio: "inherit",
+  });
+  if (result.error) {
+    fail(`could not execute ${UPDATE_CA_CERTIFICATES_EXECUTABLE}: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    fail(
+      `${UPDATE_CA_CERTIFICATES_EXECUTABLE} exited with status ${String(result.status ?? "unknown")}`,
+    );
+  }
+}
+
+function requireSystemCaBundleContains(blocks: readonly string[]): void {
+  const systemBundle = safeTrustBundle(SYSTEM_CA_BUNDLE_FILE);
+  if (systemBundle === null) fail("the refreshed system CA bundle is missing");
+  const systemBlocks = systemBundle.toString("utf8").match(PEM_CERTIFICATE_RE_GLOBAL) ?? [];
+  const systemFingerprints = new Set<string>();
+  for (const block of systemBlocks) {
+    try {
+      systemFingerprints.add(new X509Certificate(block).fingerprint256);
+    } catch {
+      fail("the refreshed system CA bundle contains an invalid certificate");
+    }
+  }
+  for (const block of blocks) {
+    if (!systemFingerprints.has(new X509Certificate(block).fingerprint256)) {
+      fail("the refreshed system CA bundle does not contain the corporate CA");
+    }
+  }
+}
+
+export function installCorporateCaSystemAnchors(corporateCaPath: string | null): void {
+  const existingNames = managedSystemCaAnchorNames();
+  if (corporateCaPath === null) {
+    for (const name of existingNames) {
+      removeSafeRootFile(path.join(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY, name));
+    }
+    refreshSystemCaBundle();
+    return;
+  }
+
+  ensureRootOwnedDirectory(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY);
+  const blocks = corporateCaCertificateBlocks(corporateCaPath);
+  const expectedNames = blocks.map(
+    (_block, index) => `nemoclaw-corporate-ca-${String(index + 1).padStart(2, "0")}.crt`,
+  );
+  for (const name of existingNames) {
+    if (!expectedNames.includes(name)) {
+      removeSafeRootFile(path.join(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY, name));
+    }
+  }
+  for (const [index, name] of expectedNames.entries()) {
+    atomicWriteRootFile(
+      path.join(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY, name),
+      blocks[index] as string,
+      0o444,
+    );
+  }
+  refreshSystemCaBundle();
+  requireSystemCaBundleContains(blocks);
+}
+
 function safeTrustBundle(target: string): Buffer | null {
   try {
     const { bytes, stat } = readStableRegularFileSnapshot(target, MAX_TRUST_BUNDLE_BYTES);
@@ -1062,7 +1368,7 @@ function shellSingleQuote(value: string): string {
   if (value.includes("\0") || /[\r\n]/u.test(value)) {
     fail("runtime environment values must be single-line text");
   }
-  return `'${value.replaceAll("'", `'\"'\"'`)}'`;
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 export function serializeManagedStartupRuntimeEnvironment(
@@ -1104,14 +1410,8 @@ function materializeManagedStartupRuntimeEnvironment(
     NEMOCLAW_MANAGED_STARTUP_APPLIED: "1",
   };
   if (corporateCaMerged) {
-    for (const name of [
-      "CURL_CA_BUNDLE",
-      "GIT_SSL_CAINFO",
-      "NODE_EXTRA_CA_CERTS",
-      "REQUESTS_CA_BUNDLE",
-      "SSL_CERT_FILE",
-    ]) {
-      output[name] = MANAGED_STARTUP_MERGED_CA_FILE;
+    for (const name of MANAGED_STARTUP_TLS_ENV_NAMES) {
+      delete output[name];
     }
     output._NEMOCLAW_CORPORATE_CA_MERGED = "1";
   }
@@ -1121,8 +1421,14 @@ function materializeManagedStartupRuntimeEnvironment(
     }
   }
   const unsetNames = new Set([
-    ...Object.keys(configurationEnvironment).filter((name) => !Object.hasOwn(output, name)),
-    ...validatedApplicationRuntime.unsetEnvironment,
+    ...Object.keys(configurationEnvironment).filter(
+      (name) =>
+        !Object.hasOwn(output, name) &&
+        (!corporateCaMerged || !MANAGED_STARTUP_TLS_ENV_NAMES.has(name)),
+    ),
+    ...validatedApplicationRuntime.unsetEnvironment.filter(
+      (name) => !corporateCaMerged || !MANAGED_STARTUP_TLS_ENV_NAMES.has(name),
+    ),
   ]);
   for (const name of validatedApplicationRuntime.unsetEnvironment) {
     if (Object.hasOwn(output, name)) {
@@ -1156,6 +1462,26 @@ export function serializeManagedStartupCompletionMarker(
     runtimeEnvironmentSha256: marker.runtimeEnvironmentSha256,
     schemaVersion: marker.schemaVersion,
   })}\n`;
+}
+
+function publishManagedStartupImageCompletion(
+  agent: ManagedStartupAgent,
+  profileFingerprint: string,
+  runtimeEnvironment: string | Buffer,
+  corporateCaMerged: boolean,
+  completionFile: string = MANAGED_STARTUP_COMPLETION_FILE,
+): void {
+  atomicWriteRootFile(
+    completionFile,
+    serializeManagedStartupCompletionMarker({
+      schemaVersion: MANAGED_STARTUP_COMPLETION_SCHEMA_VERSION,
+      agent,
+      profileFingerprint,
+      runtimeEnvironmentSha256: createHash("sha256").update(runtimeEnvironment).digest("hex"),
+      corporateCaMerged,
+    }),
+    0o444,
+  );
 }
 
 function parseManagedStartupCompletionMarker(text: string): ManagedStartupCompletionMarker {
@@ -1208,6 +1534,11 @@ export function verifyManagedStartupImageCompletion(
   completionFile: string = MANAGED_STARTUP_COMPLETION_FILE,
   runtimeEnvironmentFile: string = MANAGED_STARTUP_RUNTIME_ENV_FILE,
 ): { readonly agent: ManagedStartupAgent; readonly fingerprint: string } {
+  const exchangeDirectory = path.dirname(completionFile);
+  if (path.dirname(runtimeEnvironmentFile) !== exchangeDirectory) {
+    fail("managed startup handoff files must share one exchange directory");
+  }
+  requireManagedStartupExchangeDirectory(exchangeDirectory);
   const expectedAgent = exactAgent(expectedAgentInput);
   if (!SHA256_RE.test(expectedFingerprint)) {
     fail("startup completion expected profile fingerprint is invalid");
@@ -1271,12 +1602,89 @@ export function waitForManagedStartupImageCompletion(
   }
 }
 
+export function publishManagedStartupCompletionAfterCommit(
+  expectedAgentInput: string,
+  expectedFingerprint: string,
+  bootstrapIdentity: string,
+  completionFile: string = MANAGED_STARTUP_COMPLETION_FILE,
+  runtimeEnvironmentFile: string = MANAGED_STARTUP_RUNTIME_ENV_FILE,
+): void {
+  requireRoot();
+  requireManagedStartupExchangeDirectory();
+  const expectedAgent = exactAgent(expectedAgentInput);
+  if (
+    getManagedStartupSharedStateTransactionStatus({
+      agent: expectedAgent,
+      profileFingerprint: expectedFingerprint,
+      bootstrapIdentity,
+    }) !== "committed"
+  ) {
+    fail("managed startup completion requires a committed shared-state transaction");
+  }
+  try {
+    verifyManagedStartupImageCompletion(
+      expectedAgent,
+      expectedFingerprint,
+      completionFile,
+      runtimeEnvironmentFile,
+    );
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const runtimeEnvironment = readStableRegularFileSnapshot(
+    runtimeEnvironmentFile,
+    MAX_MANAGED_STARTUP_RUNTIME_ENVIRONMENT_BYTES,
+  );
+  if (
+    runtimeEnvironment.stat.nlink !== 1n ||
+    runtimeEnvironment.stat.uid !== 0n ||
+    runtimeEnvironment.stat.gid !== 0n ||
+    Number(runtimeEnvironment.stat.mode & 0o777n) !== 0o444
+  ) {
+    fail("managed startup runtime environment must be root:root mode 0444");
+  }
+  const corporateCaMerged = runtimeEnvironment.bytes
+    .toString("utf8")
+    .split("\n")
+    .includes("export _NEMOCLAW_CORPORATE_CA_MERGED='1'");
+  publishManagedStartupImageCompletion(
+    expectedAgent,
+    expectedFingerprint,
+    runtimeEnvironment.bytes,
+    corporateCaMerged,
+    completionFile,
+  );
+  verifyManagedStartupImageCompletion(
+    expectedAgent,
+    expectedFingerprint,
+    completionFile,
+    runtimeEnvironmentFile,
+  );
+}
+
 function applyAdapter(
   context: ManagedStartupAdapterContext,
   mapped: ManagedStartupAgentEnvironment,
 ): void {
   if (mapped.agent !== context.agent) {
     fail(`mapped ${mapped.agent} environment for ${context.agent}`);
+  }
+  if (context.agent === "openclaw") {
+    // A replacement can retain a fresh native owner from another PID namespace.
+    // Prove it has ended before the generator or validator opens restored state.
+    execute(
+      [
+        "/usr/local/bin/node",
+        "/usr/local/lib/nemoclaw/openclaw-legacy-migrations.mts",
+        "--wait-gateway-executable",
+        "/usr/local/bin/openclaw",
+        "2026.10.5",
+      ],
+      "sandbox",
+      mapped.configurationEnvironment,
+      mapped.applicationRuntime,
+    );
   }
   const commandPlan = buildManagedStartupImageActionPlan({
     agent: mapped.agent,
@@ -1316,10 +1724,11 @@ function applyAdapter(
 
   switch (context.agent) {
     case "openclaw":
-      sealOpenClawConfiguration(mapped.configurationEnvironment, mapped.applicationRuntime);
+      validateOpenClawConfiguration(mapped.configurationEnvironment, mapped.applicationRuntime);
       break;
     case "hermes":
       installHermesManagedPolicy();
+      installHermesSwitchyardRoutingFiles(mapped.configurationEnvironment);
       sealHermesConfiguration(mapped.configurationEnvironment, mapped.applicationRuntime);
       // Normalize before the coordinator commits a newly applied profile so
       // the durable transaction never records generator-created 0600 files as
@@ -1331,6 +1740,7 @@ function applyAdapter(
   }
   installRootOwnedMaterials(mapped.materials);
   installCorporateCa(context.corporateCaPath);
+  installCorporateCaSystemAnchors(context.corporateCaPath);
   mergeCorporateCa(context.corporateCaPath);
 }
 
@@ -1344,6 +1754,7 @@ function adapters(mapped: ManagedStartupAgentEnvironment): readonly ManagedStart
 export async function applyManagedStartupImageProfile(
   expectedAgentInput: string,
   env: Environment = process.env,
+  options: { readonly publishCompletion?: boolean } = {},
 ): Promise<ManagedStartupImageApplyResult> {
   requireRoot();
   const expectedAgent = exactAgent(expectedAgentInput);
@@ -1361,6 +1772,14 @@ export async function applyManagedStartupImageProfile(
   if (profile.agent !== expectedAgent) {
     fail(`managed startup profile targets ${profile.agent}, expected ${expectedAgent}`);
   }
+  if (profile.agentConfig.agent === "hermes" && profile.agentConfig.switchyardRouting) {
+    if (!profile.agentConfig.switchyardBindings) fail("Switchyard provider bindings are missing");
+    assertSwitchyardRootApplyEnvironment(env, {
+      routing: profile.agentConfig.switchyardRouting,
+      bindings: profile.agentConfig.switchyardBindings,
+    });
+  }
+  requireManagedStartupExchangeDirectory();
   const mapped = mapManagedStartupProfileToAgentEnvironment(profile, env);
   validateManagedStartupApplicationRuntimePlan(mapped.applicationRuntime);
 
@@ -1380,9 +1799,9 @@ export async function applyManagedStartupImageProfile(
     fail(`mapped ${mapped.agent} environment for ${result.application.profile.agent}`);
   }
   if (expectedAgent === "hermes" && !result.adapterApplied) {
-    // Committed startup replays still repair generator-created 0600 files,
-    // while the descriptor guard preserves root-owned shields-up files.
+    // Committed startup replays still repair generator-created 0600 files.
     normalizeHermesManagedConfiguration();
+    verifyHermesSwitchyardRoutingFiles(mapped.configurationEnvironment);
   }
   let corporateCaMerged: boolean;
   if (result.adapterApplied) {
@@ -1400,6 +1819,7 @@ export async function applyManagedStartupImageProfile(
         fail("committed corporate CA material drifted");
       }
     }
+    installCorporateCaSystemAnchors(result.application.corporateCaPath);
     corporateCaMerged = mergeCorporateCa(result.application.corporateCaPath);
   }
   const runtimeEnvironment = serializeManagedStartupRuntimeEnvironment(
@@ -1413,19 +1833,14 @@ export async function applyManagedStartupImageProfile(
   // contains the secret-free mapped profile environment, never provider
   // credentials or the raw corporate-CA transport.
   atomicWriteRootFile(MANAGED_STARTUP_RUNTIME_ENV_FILE, runtimeEnvironment, 0o444);
-  atomicWriteRootFile(
-    MANAGED_STARTUP_COMPLETION_FILE,
-    serializeManagedStartupCompletionMarker({
-      schemaVersion: MANAGED_STARTUP_COMPLETION_SCHEMA_VERSION,
-      agent: expectedAgent,
-      profileFingerprint: result.application.fingerprint,
-      runtimeEnvironmentSha256: createHash("sha256")
-        .update(runtimeEnvironment, "utf8")
-        .digest("hex"),
+  if (options.publishCompletion !== false) {
+    publishManagedStartupImageCompletion(
+      expectedAgent,
+      result.application.fingerprint,
+      runtimeEnvironment,
       corporateCaMerged,
-    }),
-    0o444,
-  );
+    );
+  }
   return {
     agent: expectedAgent,
     adapterApplied: result.adapterApplied,
@@ -1471,6 +1886,7 @@ export async function applyManagedStartupRootRequest(
   // mutation. A completed same-profile replay must still be allowed to refresh
   // these non-fingerprinted application-runtime values.
   mapManagedStartupProfileToAgentEnvironment(profile, imageEnvironment);
+  normalizeManagedStartupWorkspaceRoot(request.agent);
   const alreadyPublished = completionAlreadyPublished(request);
   const bootstrapIdentity = options.bootstrapIdentity ?? null;
   const transactionStatus =
@@ -1488,7 +1904,9 @@ export async function applyManagedStartupRootRequest(
     ensureRootOwnedDirectory(ROOT_STATE_PARENT);
     beginManagedStartupSharedStateTransaction(profile, { bootstrapIdentity });
   }
-  const result = await applyManagedStartupImageProfile(request.agent, imageEnvironment);
+  const result = await applyManagedStartupImageProfile(request.agent, imageEnvironment, {
+    publishCompletion: bootstrapIdentity === null || alreadyPublished,
+  });
   return {
     ...result,
     transactionPending: !alreadyPublished || transactionStatus === "pending",
@@ -1555,14 +1973,6 @@ function writeSandboxFileAtomically(target: string, contents: string, mode: numb
   }
 }
 
-function internalWriteOpenClawHash(): void {
-  if (process.geteuid?.() === 0) fail("sandbox hash writer must not run as root");
-  const configPath = "/sandbox/.openclaw/openclaw.json";
-  const config = readStableRegularFile(configPath, 16 * 1024 * 1024);
-  const text = `${createHash("sha256").update(config).digest("hex")}  openclaw.json\n`;
-  writeSandboxFileAtomically("/sandbox/.openclaw/.config-hash", text, 0o660);
-}
-
 function internalWriteHermesCompatHash(): void {
   if (process.geteuid?.() === 0) fail("sandbox hash writer must not run as root");
   const encoded = process.env.NEMOCLAW_MANAGED_HERMES_HASH_B64 ?? "";
@@ -1584,7 +1994,7 @@ function readCliAgent(argv: readonly string[], expectedLength = 2): string {
   const index = argv.indexOf("--agent");
   if (index < 0 || index + 1 >= argv.length || argv.length !== expectedLength) {
     fail(
-      "usage: managed-startup-image-runtime [--apply-root-stdin|--wait-for-completion|--verify-completion|--begin-shared-state-transaction|--commit-shared-state-transaction|--clear-shared-state-commit-receipt|--shared-state-transaction-status] --agent <agent>",
+      "usage: managed-startup-image-runtime [--apply-root-stdin|--release-startup-hold|--wait-for-completion|--verify-completion|--begin-shared-state-transaction|--commit-shared-state-transaction|--rollback-shared-state-transaction|--clear-shared-state-commit-receipt|--shared-state-transaction-status] --agent <agent>",
     );
   }
   return argv[index + 1] as string;
@@ -1607,21 +2017,19 @@ function readCliBootstrapIdentity(argv: readonly string[]): string {
 }
 
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<void> {
-  if (argv.length === 1 && argv[0] === "--internal-write-openclaw-hash") {
-    internalWriteOpenClawHash();
-    return;
-  }
   if (argv.length === 1 && argv[0] === "--internal-write-hermes-compat-hash") {
     internalWriteHermesCompatHash();
     return;
   }
-  if (argv.length === 3 && argv[0] === "--apply-root-stdin") {
-    const expectedAgent = exactAgent(readCliAgent(argv, 3));
+  if ((argv.length === 3 || argv.length === 5) && argv[0] === "--apply-root-stdin") {
+    const expectedAgent = exactAgent(readCliAgent(argv, argv.length));
     const request = parseManagedStartupRootApplyRequest(readBoundedRootApplyStdin());
     if (request.agent !== expectedAgent) {
       fail(`root application request targets ${request.agent}, expected ${expectedAgent}`);
     }
-    const result = await applyManagedStartupRootRequest(request);
+    const result = await applyManagedStartupRootRequest(request, process.env, {
+      bootstrapIdentity: argv.length === 5 ? readCliBootstrapIdentity(argv) : null,
+    });
     console.log(
       result.transactionPending
         ? `[managed-startup] applied ${result.agent} profile ${result.fingerprint}; transaction pending`
@@ -1629,12 +2037,21 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     );
     return;
   }
+  if (argv.length === 7 && argv[0] === "--release-startup-hold") {
+    const agent = readCliAgent(argv, 7);
+    const fingerprint = readCliFingerprint(argv);
+    const bootstrapIdentity = readCliBootstrapIdentity(argv);
+    publishManagedStartupCompletionAfterCommit(agent, fingerprint, bootstrapIdentity);
+    console.log(`[managed-startup] released ${agent} profile ${fingerprint} startup hold`);
+    return;
+  }
   if (
-    argv.length === 5 &&
+    (argv.length === 5 || argv.length === 7) &&
     (argv[0] === "--verify-completion" || argv[0] === "--wait-for-completion")
   ) {
-    const agent = readCliAgent(argv, 5);
+    const agent = readCliAgent(argv, argv.length);
     const fingerprint = readCliFingerprint(argv);
+    if (argv.length === 7) readCliBootstrapIdentity(argv);
     const result =
       argv[0] === "--wait-for-completion"
         ? waitForManagedStartupImageCompletion(agent, fingerprint)
@@ -1667,6 +2084,19 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     console.log(`[managed-startup] verified and restored ${agent} shared state`);
     return;
   }
+  if (
+    (argv.length === 3 || argv.length === 5) &&
+    argv[0] === "--rollback-shared-state-transaction"
+  ) {
+    requireRoot();
+    const agent = exactAgent(readCliAgent(argv, argv.length));
+    const rolledBack = rollbackManagedStartupSharedStateTransaction(agent, {
+      bootstrapIdentity: argv.length === 5 ? readCliBootstrapIdentity(argv) : null,
+    });
+    if (!rolledBack) fail("managed startup transaction is missing at rollback");
+    console.log(`[managed-startup] verified and restored ${agent} shared state`);
+    return;
+  }
   if ((argv.length === 3 || argv.length === 5) && argv[0] === "--commit-shared-state-transaction") {
     requireRoot();
     const agent = exactAgent(readCliAgent(argv, argv.length));
@@ -1688,6 +2118,20 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       fail("managed startup durable commit receipt is missing at cleanup");
     }
     console.log(`[managed-startup] cleared ${agent} durable shared-state commit receipt`);
+    return;
+  }
+  if (argv.length === 7 && argv[0] === "--shared-state-transaction-status") {
+    requireRoot();
+    const agent = exactAgent(readCliAgent(argv, 7));
+    const profileFingerprint = readCliFingerprint(argv);
+    const bootstrapIdentity = readCliBootstrapIdentity(argv);
+    process.stdout.write(
+      `${getManagedStartupSharedStateTransactionStatus({
+        agent,
+        profileFingerprint,
+        bootstrapIdentity,
+      })}\n`,
+    );
     return;
   }
   if (

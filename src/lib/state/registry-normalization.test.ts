@@ -1,28 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import {
-  normalizeBaselineExclusions,
-  normalizeBaselineExclusionTransition,
-  normalizeCustomPolicyEntries,
-} from "./registry-normalization";
+import { CLI_NAME } from "../cli/branding";
 
 const originalHome = process.env.HOME;
 const temporaryHomes: string[] = [];
-
-async function loadRegistryWith(
-  sandboxes: Record<string, unknown>,
-  defaultSandbox: unknown = null,
-) {
-  return loadRegistryDocument({ defaultSandbox, sandboxes });
-}
 
 async function loadRegistryDocument(document: unknown) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-registry-normalization-"));
@@ -32,21 +20,117 @@ async function loadRegistryDocument(document: unknown) {
   fs.writeFileSync(path.join(configDir, "sandboxes.json"), JSON.stringify(document), {
     mode: 0o600,
   });
-
   process.env.HOME = home;
   vi.resetModules();
-  return import("./registry");
+  return { home, registry: await import("./registry") };
+}
+
+async function loadRegistryWith(
+  sandboxes: Record<string, unknown>,
+  defaultSandbox: unknown = null,
+) {
+  return (await loadRegistryDocument({ defaultSandbox, sandboxes })).registry;
 }
 
 afterEach(() => {
   process.env.HOME = originalHome;
   vi.resetModules();
-  for (const home of temporaryHomes.splice(0)) {
-    fs.rmSync(home, { recursive: true, force: true });
-  }
+  for (const home of temporaryHomes.splice(0)) fs.rmSync(home, { recursive: true, force: true });
 });
 
 describe("sandbox registry normalization", () => {
+  it("persists only valid gateway-scoped native NVIDIA provider authorities", async () => {
+    const receipt = {
+      schemaVersion: 1 as const,
+      profileId: "nemoclaw-nvidia-inference-v1" as const,
+      providerName: "nemoclaw-nvidia-prod-v1" as const,
+      providerId: "11111111-2222-4333-8444-555555555555",
+    };
+    const { registry } = await loadRegistryDocument({
+      defaultSandbox: null,
+      sandboxes: {
+        alpha: {
+          name: "alpha",
+          gatewayName: "nemoclaw-19080",
+          provider: "openai-api",
+          nativeNvidiaProviderAuthority: receipt,
+        },
+        beta: {
+          name: "beta",
+          gatewayName: "nemoclaw-19080",
+          provider: "nvidia-prod",
+          nativeNvidiaProviderAttachment: receipt,
+          nativeNvidiaProviderAuthority: receipt,
+        },
+        gamma: {
+          name: "gamma",
+          gatewayName: "nemoclaw-19081",
+          provider: "openai-api",
+          nativeNvidiaProviderAuthority: {
+            ...receipt,
+            providerId: "22222222-3333-4444-8555-666666666666",
+          },
+        },
+      },
+      nativeNvidiaProviderAuthorities: {
+        broken: { ...receipt, providerId: "" },
+        "nemoclaw-19080": receipt,
+      },
+    });
+
+    expect(registry.getNativeNvidiaProviderAuthority("broken")).toBeUndefined();
+    expect(registry.getNativeNvidiaProviderAuthority("nemoclaw-19080")).toEqual(receipt);
+    registry.setNativeNvidiaProviderAuthority("nemoclaw-19081", {
+      ...receipt,
+      providerId: "22222222-3333-4444-8555-666666666666",
+    });
+    expect(registry.load().nativeNvidiaProviderAuthorities).toEqual({
+      "nemoclaw-19080": receipt,
+      "nemoclaw-19081": { ...receipt, providerId: "22222222-3333-4444-8555-666666666666" },
+    });
+    registry.clearNativeNvidiaProviderAuthority("nemoclaw-19080");
+    expect(registry.getNativeNvidiaProviderAuthority("nemoclaw-19080")).toBeUndefined();
+    expect(registry.getSandbox("alpha")).not.toHaveProperty("nativeNvidiaProviderAuthority");
+    expect(registry.getSandbox("beta")).not.toHaveProperty("nativeNvidiaProviderAuthority");
+    expect(registry.getSandbox("beta")?.nativeNvidiaProviderAttachment).toEqual(receipt);
+    expect(registry.getSandbox("gamma")).not.toHaveProperty("nativeNvidiaProviderAuthority");
+  });
+
+  it("persists incomplete OpenClaw synchronization until explicit completion", async () => {
+    const registry = await loadRegistryWith({
+      alpha: { name: "alpha", agent: "openclaw", provider: "nvidia-prod", model: "old" },
+    });
+
+    expect(registry.updateSandbox("alpha", { model: "new", openClawConfigSyncPending: true })).toBe(
+      true,
+    );
+    expect(registry.getSandbox("alpha")).toMatchObject({
+      model: "new",
+      openClawConfigSyncPending: true,
+    });
+    registry.updateSandbox("alpha", { agentVersion: "updated" });
+    expect(registry.load().sandboxes.alpha.openClawConfigSyncPending).toBe(true);
+
+    registry.updateSandbox("alpha", { openClawConfigSyncPending: undefined });
+    expect(registry.load().sandboxes.alpha).not.toHaveProperty("openClawConfigSyncPending");
+  });
+
+  it("does not carry incomplete OpenClaw synchronization into a replacement registration", async () => {
+    const registry = await loadRegistryWith({
+      alpha: {
+        name: "alpha",
+        agent: "openclaw",
+        provider: "nvidia-prod",
+        model: "new",
+        openClawConfigSyncPending: true,
+      },
+    });
+
+    registry.registerSandbox(registry.getSandbox("alpha")!);
+
+    expect(registry.getSandbox("alpha")).not.toHaveProperty("openClawConfigSyncPending");
+  });
+
   const servingProfileProvenance = {
     schemaVersion: 1,
     catalogDigest: `sha256:${"1".repeat(64)}`,
@@ -67,19 +151,35 @@ describe("sandbox registry normalization", () => {
     estimatedModelDownloadBytes: null,
   } as const;
 
-  it.each([
-    null,
-    [],
-    42,
-    "invalid",
-  ])("treats a non-object top-level registry document as empty: %j", async (document) => {
-    const registry = await loadRegistryDocument(document);
+  it("reads an explicitly scoped home without using the process registry", async () => {
+    const { registry } = await loadRegistryDocument({
+      defaultSandbox: "process-owned",
+      sandboxes: { "process-owned": { name: "process-owned" } },
+    });
+    const explicitHome = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-registry-explicit-home-"));
+    temporaryHomes.push(explicitHome);
+    const explicitConfigDir = path.join(explicitHome, ".nemoclaw");
+    fs.mkdirSync(explicitConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(explicitConfigDir, "sandboxes.json"),
+      JSON.stringify({
+        defaultSandbox: "environment-owned",
+        sandboxes: { "environment-owned": { name: "environment-owned" } },
+      }),
+      { mode: 0o600 },
+    );
+    const persistence = await import("./registry/persistence");
 
-    expect(registry.listSandboxes()).toEqual({ sandboxes: [], defaultSandbox: null });
+    expect(persistence.loadFromEnvironment({ HOME: explicitHome })).toMatchObject({
+      defaultSandbox: "environment-owned",
+      sandboxes: { "environment-owned": { name: "environment-owned" } },
+    });
+    expect(registry.getSandbox("process-owned")).toMatchObject({ name: "process-owned" });
+    expect(registry.getSandbox("environment-owned")).toBeNull();
   });
 
   it("drops a malformed sandboxes container at the file boundary", async () => {
-    const registry = await loadRegistryDocument({
+    const { registry } = await loadRegistryDocument({
       defaultSandbox: 42,
       sandboxes: "not-an-object",
     });
@@ -100,6 +200,79 @@ describe("sandbox registry normalization", () => {
     expect(registry.listSandboxes().sandboxes).toEqual([
       { name: "valid", createdAt: "2026-07-09T00:00:00.000Z" },
     ]);
+  });
+
+  it("drops legacy CUA readiness while preserving ordinary sandbox data (#9649)", async () => {
+    const registry = await loadRegistryWith({
+      alpha: {
+        name: "alpha",
+        agent: "nemocua",
+        provider: "nvidia",
+        model: "model-a",
+        cuaRuntimeReadiness: { schemaVersion: 1, digest: "legacy" },
+      },
+    });
+
+    expect(registry.getSandbox("alpha")).toMatchObject({
+      name: "alpha",
+      agent: "nemocua",
+      provider: "nvidia",
+      model: "model-a",
+    });
+    expect(registry.getSandbox("alpha")).not.toHaveProperty("cuaRuntimeReadiness");
+
+    registry.save(registry.load());
+    const persisted = JSON.parse(
+      fs.readFileSync(path.join(process.env.HOME!, ".nemoclaw", "sandboxes.json"), "utf8"),
+    ) as { sandboxes?: { alpha?: Record<string, unknown> } };
+    expect(persisted.sandboxes?.alpha).toMatchObject({
+      name: "alpha",
+      agent: "nemocua",
+      provider: "nvidia",
+      model: "model-a",
+    });
+    expect(persisted.sandboxes?.alpha).not.toHaveProperty("cuaRuntimeReadiness");
+  });
+
+  it.each(["alpha", "beta"])(
+    "preserves legacy ownership across an unrelated update to %s until explicit retirement",
+    async (updatedSandbox) => {
+      const legacy = { bridges: { github: { providerId: "owned-provider" } } };
+      const { home, registry } = await loadRegistryDocument({
+        sandboxes: { alpha: { name: "alpha", mcp: legacy }, beta: { name: "beta" } },
+      });
+      const { readLegacyMcpRegistryProjection, removeLegacyMcpRegistryEntry } =
+        await import("./registry/legacy-mcp");
+
+      expect(registry.updateSandbox(updatedSandbox, { model: "replacement" })).toBe(true);
+      expect(readLegacyMcpRegistryProjection("alpha")).toEqual(legacy);
+      expect(registry.getSandbox("alpha")).not.toHaveProperty("mcp");
+      expect(registry.getSandbox(updatedSandbox)?.model).toBe("replacement");
+      const staleRuntimeSnapshot = registry.load();
+      removeLegacyMcpRegistryEntry("alpha", "github", legacy);
+      registry.save(staleRuntimeSnapshot);
+      registry.updateSandbox(updatedSandbox, { agentVersion: "new-version" });
+      expect(readLegacyMcpRegistryProjection("alpha")).toBeUndefined();
+      const persisted = JSON.parse(
+        fs.readFileSync(path.join(home, ".nemoclaw", "sandboxes.json"), "utf8"),
+      );
+      expect(persisted.sandboxes.alpha).not.toHaveProperty("mcp");
+      expect(persisted.sandboxes[updatedSandbox].agentVersion).toBe("new-version");
+    },
+  );
+
+  it("preserves only persisted legacy ownership, not a caller-supplied replacement", async () => {
+    const legacy = { bridges: { github: { providerId: "owned-provider" } } };
+    const { registry } = await loadRegistryDocument({
+      sandboxes: { alpha: { name: "alpha", mcp: legacy }, beta: { name: "beta" } },
+    });
+    const { readLegacyMcpRegistryProjection } = await import("./registry/legacy-mcp");
+    const updates = { model: "replacement", mcp: { bridges: {} } };
+    registry.updateSandbox("alpha", updates);
+    registry.updateSandbox("beta", updates);
+    expect(readLegacyMcpRegistryProjection("alpha")).toEqual(legacy);
+    expect(readLegacyMcpRegistryProjection("beta")).toBeUndefined();
+    expect(registry.getSandbox("alpha")).not.toHaveProperty("mcp");
   });
 
   it("preserves a stale pointer for diagnostics but repairs it on registration", async () => {
@@ -161,11 +334,44 @@ describe("sandbox registry normalization", () => {
     });
   });
 
+  it("round-trips the persisted external dashboard URL (#11439)", async () => {
+    const registry = await loadRegistryWith({});
+    registry.registerSandbox({
+      name: "proxied",
+      dashboardPort: 18_789,
+      dashboardExternalUrl: "https://dash.example.com:18789",
+    });
+
+    vi.resetModules();
+    const reloadedRegistry = await import("./registry");
+    expect(reloadedRegistry.getSandbox("proxied")).toMatchObject({
+      dashboardPort: 18_789,
+      dashboardExternalUrl: "https://dash.example.com:18789",
+    });
+  });
+
+  it("preserves a persisted external dashboard URL when only the port is updated (#11439)", async () => {
+    const registry = await loadRegistryWith({});
+    registry.registerSandbox({
+      name: "proxied",
+      dashboardPort: 18_789,
+      dashboardExternalUrl: "https://dash.example.com:18789",
+    });
+
+    // Mirror the non-clearing persistDashboardPort update: a loopback re-onboard
+    // must not overwrite the external URL with null.
+    registry.updateSandbox("proxied", { dashboardPort: 18_790 });
+
+    expect(registry.getSandbox("proxied")).toMatchObject({
+      dashboardPort: 18_790,
+      dashboardExternalUrl: "https://dash.example.com:18789",
+    });
+  });
+
   it("backfills a lifecycle generation only for the unchanged legacy Docker row (#8584)", async () => {
     const registry = await loadRegistryWith({});
-    const { compareAndSetLegacySandboxLifecycleGeneration } = await import(
-      "./registry/lifecycle-generation"
-    );
+    const { compareAndSetLegacySandboxLifecycleGeneration } =
+      await import("./registry/lifecycle-generation");
     registry.registerSandbox({ name: "portable", openshellDriver: "docker" });
     const expected = registry.getSandbox("portable")!;
 
@@ -177,6 +383,268 @@ describe("sandbox registry normalization", () => {
     const stale = registry.getSandbox("changed")!;
     registry.updateSandbox("changed", { model: "replacement" });
     expect(compareAndSetLegacySandboxLifecycleGeneration(stale, "c".repeat(64))).toBe(false);
+  });
+
+  const generation = "22222222-2222-4222-8222-222222222222";
+  const fingerprint = "b".repeat(64);
+
+  async function prepareMessagingIdentityRecovery(
+    entry: Partial<import("./registry").SandboxEntry> = {},
+  ) {
+    vi.stubEnv("NEMOCLAW_GATEWAY_PORT", "8080");
+    const registry = await loadRegistryWith({
+      legacy: {
+        name: "legacy",
+        agent: "openclaw",
+        gatewayName: "nemoclaw",
+        gatewayPort: 8080,
+        ...entry,
+      },
+    });
+    const expected = registry.getSandbox("legacy")!;
+    const sessionStore = await import("./onboard-session");
+    const { deriveCheckpointFromSession } = await import("./onboard-checkpoint-migrate");
+    const { policyChannelDependencies } =
+      await import("../actions/sandbox/policy-channel-dependencies");
+    const { revalidateMessagingProviderAttachmentTarget } =
+      await import("../actions/sandbox/policy-channel");
+    const session = sessionStore.createSession({ sandboxName: "legacy", agent: "openclaw" });
+    session.status = "complete";
+    session.sandboxPromptProgress.sandboxName = true;
+    session.machine = { ...session.machine, state: "complete" };
+    session.checkpoint = {
+      ...deriveCheckpointFromSession(session),
+      gatewayAuthority: {
+        kind: "selected",
+        value: {
+          gatewayName: "nemoclaw",
+          gatewayPort: 8080,
+          mode: "nemoclaw-managed",
+          source: "standalone",
+          endpoint: null,
+          stateDir: null,
+          supervisor: null,
+          requiredCapabilities: [],
+        },
+      },
+      sandboxRecreate: {
+        version: 1,
+        id: "11111111-1111-4111-8111-111111111111",
+        revision: 6,
+        sandboxName: "legacy",
+        gatewayName: "nemoclaw",
+        gatewayPort: 8080,
+        sourceRegistryFingerprint: "a".repeat(64),
+        sourceLiveIdentityFingerprint: null,
+        sourceWorkload: null,
+        targetIntentFingerprint: "c".repeat(64),
+        targetGeneration: generation,
+        targetLiveIdentityFingerprint: fingerprint,
+        phase: "completed",
+        startedAt: session.startedAt,
+        updatedAt: session.updatedAt,
+      },
+    };
+    sessionStore.saveSession(session);
+    const before = sessionStore.loadSession();
+    expect(before?.checkpoint?.sandboxRecreate?.phase).toBe("completed");
+    const inspect = vi
+      .spyOn(policyChannelDependencies, "inspectMessagingProviderAttachmentTarget")
+      .mockReturnValue(fingerprint);
+    return {
+      registry,
+      expected,
+      sessionStore,
+      before,
+      inspect,
+      validate: () => revalidateMessagingProviderAttachmentTarget("legacy", "nemoclaw"),
+    };
+  }
+
+  it.each([
+    { field: "both fields", entry: {} },
+    { field: "fingerprint", entry: { lifecycleGeneration: generation } },
+    { field: "generation", entry: { lifecycleLiveIdentityFingerprint: fingerprint } },
+  ])("recovers missing $field from a completed lifecycle receipt", async ({ entry }) => {
+    const f = await prepareMessagingIdentityRecovery(entry);
+
+    expect(f.validate).not.toThrow();
+    expect(f.registry.getSandbox("legacy")).toEqual({
+      ...f.expected,
+      lifecycleGeneration: generation,
+      lifecycleLiveIdentityFingerprint: fingerprint,
+    });
+    expect(f.sessionStore.loadSession()).toEqual(f.before);
+    expect(f.sessionStore.isOnboardLockHeldByCurrentProcess()).toBe(false);
+  });
+
+  it.each([
+    {
+      label: "missing proof",
+      mutate: (session: import("./onboard-session").Session) => ({ ...session, checkpoint: null }),
+    },
+    {
+      label: "unfinished session",
+      mutate: (session: import("./onboard-session").Session) => ({
+        ...session,
+        status: "in_progress",
+      }),
+    },
+    {
+      label: "another sandbox",
+      mutate: (session: import("./onboard-session").Session) => ({
+        ...session,
+        sandboxName: "other",
+      }),
+    },
+    {
+      label: "another gateway",
+      mutate: (session: import("./onboard-session").Session) => ({
+        ...session,
+        metadata: { ...session.metadata, gatewayName: "nemoclaw-8081" },
+      }),
+    },
+    {
+      label: "another session",
+      mutate: (session: import("./onboard-session").Session) => ({
+        ...session,
+        checkpoint: { ...session.checkpoint!, sessionId: "other-session" },
+      }),
+    },
+    {
+      label: "unfinished transaction",
+      mutate: (session: import("./onboard-session").Session) => ({
+        ...session,
+        checkpoint: {
+          ...session.checkpoint!,
+          sandboxRecreate: { ...session.checkpoint!.sandboxRecreate!, phase: "created" as const },
+        },
+      }),
+    },
+  ])("preserves legacy state with $label", async ({ mutate }) => {
+    const f = await prepareMessagingIdentityRecovery();
+    f.sessionStore.saveSession(mutate(f.before!));
+
+    let validationError: unknown;
+    try {
+      f.validate();
+    } catch (error) {
+      validationError = error;
+    }
+    expect(validationError).toBeInstanceOf(Error);
+    expect((validationError as Error).message).toContain("incomplete lifecycle identity");
+    expect((validationError as Error).message).toContain(
+      `Run \`${CLI_NAME} legacy rebuild --yes\` to record its lifecycle identity, then rerun this command.`,
+    );
+    expect(f.registry.getSandbox("legacy")).toEqual(f.expected);
+    expect(f.inspect).not.toHaveBeenCalled();
+    expect(f.sessionStore.isOnboardLockHeldByCurrentProcess()).toBe(false);
+  });
+
+  it("omits the rebuild remedy when the recorded gateway differs from the target", async () => {
+    const f = await prepareMessagingIdentityRecovery({
+      gatewayName: "nemoclaw-8081",
+      gatewayPort: 8081,
+    });
+
+    expect(f.validate).toThrow(
+      /^Sandbox 'legacy' has incomplete lifecycle identity for messaging provider attachment\.$/u,
+    );
+    expect(f.registry.getSandbox("legacy")).toEqual(f.expected);
+    expect(f.inspect).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { lifecycleGeneration: "33333333-3333-4333-8333-333333333333" },
+    { lifecycleLiveIdentityFingerprint: "f".repeat(64) },
+    { pendingRouteReservation: true as const },
+  ])("does not overwrite conflicting registry identity %j", async (entry) => {
+    const f = await prepareMessagingIdentityRecovery(entry);
+
+    expect(f.validate).toThrow("incomplete lifecycle identity");
+    expect(f.registry.getSandbox("legacy")).toEqual(f.expected);
+  });
+
+  it.each([0, 1])(
+    "rejects a live identity change after %s successful observations",
+    async (successful) => {
+      const f = await prepareMessagingIdentityRecovery();
+      const observations = [fingerprint, "f".repeat(64)];
+      let index = 1 - successful;
+      f.inspect.mockImplementation(() => observations[index++] ?? "f".repeat(64));
+
+      expect(f.validate).toThrow("lifecycle identity changed");
+      expect(f.registry.getSandbox("legacy")).toEqual(f.expected);
+      expect(f.sessionStore.isOnboardLockHeldByCurrentProcess()).toBe(false);
+    },
+  );
+
+  it("preserves a registry change made while live identity is inspected", async () => {
+    const f = await prepareMessagingIdentityRecovery();
+    f.inspect.mockImplementationOnce(() => {
+      f.registry.updateSandbox("legacy", { model: "changed" });
+      return fingerprint;
+    });
+
+    expect(f.validate).toThrow("incomplete lifecycle identity");
+    expect(f.registry.getSandbox("legacy")).toEqual({ ...f.expected, model: "changed" });
+  });
+
+  it("rechecks the complete registry row after locked identity validation", async () => {
+    const f = await prepareMessagingIdentityRecovery();
+    f.inspect.mockReturnValueOnce(fingerprint).mockImplementationOnce(() => {
+      const document = f.registry.load();
+      document.sandboxes.legacy.model = "changed-without-lock";
+      f.registry.save(document);
+      return fingerprint;
+    });
+
+    expect(f.validate).toThrow("incomplete lifecycle identity");
+    expect(f.registry.getSandbox("legacy")).toEqual({
+      ...f.expected,
+      model: "changed-without-lock",
+    });
+  });
+
+  it("rejects receipt replacement during live identity validation", async () => {
+    const f = await prepareMessagingIdentityRecovery();
+    f.inspect.mockImplementationOnce(() => {
+      f.sessionStore.saveSession({ ...f.before!, sessionId: "replacement" });
+      return fingerprint;
+    });
+
+    expect(f.validate).toThrow("lifecycle identity changed");
+    expect(f.registry.getSandbox("legacy")).toEqual(f.expected);
+    expect(f.sessionStore.isOnboardLockHeldByCurrentProcess()).toBe(false);
+  });
+
+  it("refuses recovery while another onboarding writer owns the lock", async () => {
+    const f = await prepareMessagingIdentityRecovery();
+    vi.spyOn(f.sessionStore, "acquireOnboardLock").mockReturnValue({
+      acquired: false,
+      lockFile: "locked",
+      stale: false,
+    });
+
+    expect(f.validate).toThrow("another onboarding writer is active");
+    expect(f.registry.getSandbox("legacy")).toEqual(f.expected);
+    expect(f.inspect).not.toHaveBeenCalled();
+  });
+
+  it("preserves an onboarding lock already held by the caller", async () => {
+    const f = await prepareMessagingIdentityRecovery();
+    expect(f.sessionStore.acquireOnboardLock("test lifecycle recovery").acquired).toBe(true);
+    try {
+      expect(f.validate).not.toThrow();
+      expect(f.registry.getSandbox("legacy")).toEqual({
+        ...f.expected,
+        lifecycleGeneration: generation,
+        lifecycleLiveIdentityFingerprint: fingerprint,
+      });
+      expect(f.sessionStore.isOnboardLockHeldByCurrentProcess()).toBe(true);
+    } finally {
+      f.sessionStore.releaseOnboardLock();
+    }
   });
 
   it("round-trips immutable serving profile provenance while preserving legacy rows (#8246)", async () => {
@@ -191,6 +659,78 @@ describe("sandbox registry normalization", () => {
     );
   });
 
+  it.each([
+    null,
+    "http://host.openshell.internal:8000/v1",
+    "http://host.openshell.internal:18000/v1",
+  ])(
+    "round-trips valid Deferred N1x preview acceptance with endpoint %s (#11510)",
+    async (endpointUrl) => {
+      const registry = await loadRegistryWith({ legacy: { name: "legacy" } });
+      registry.registerSandbox({
+        name: "preview",
+        provider: "vllm-local",
+        model: "nvidia/Qwen3.6-35B-A3B-NVFP4",
+        endpointUrl,
+        endpointSource: null,
+        openshellDriver: "docker",
+        deferredN1xManagedVllmAccepted: true,
+      });
+      vi.resetModules();
+      const reloadedRegistry = await import("./registry");
+
+      expect(reloadedRegistry.getSandbox("preview")).toMatchObject({
+        endpointUrl,
+        deferredN1xManagedVllmAccepted: true,
+      });
+    },
+  );
+
+  it("rejects malformed Deferred N1x preview acceptance (#10959)", async () => {
+    const malformed = await loadRegistryWith({
+      malformed: {
+        name: "malformed",
+        deferredN1xManagedVllmAccepted: "true",
+      },
+    });
+    expect(() => malformed.getSandbox("malformed")).toThrow("invalid N1x preview acceptance");
+    const mismatchedRoute = await loadRegistryWith({
+      mismatched: {
+        name: "mismatched",
+        provider: "vllm-local",
+        model: "nvidia/Qwen3.6-35B-A3B-NVFP4",
+        endpointUrl: null,
+        endpointSource: "inference-set",
+        openshellDriver: "docker",
+        deferredN1xManagedVllmAccepted: true,
+      },
+    });
+    expect(() => mismatchedRoute.getSandbox("mismatched")).toThrow(
+      "invalid N1x preview acceptance",
+    );
+  });
+
+  it("clears Deferred N1x acceptance when route authority changes (#10959)", async () => {
+    const registry = await loadRegistryWith({});
+    registry.registerSandbox({
+      name: "preview",
+      provider: "vllm-local",
+      model: "nvidia/Qwen3.6-35B-A3B-NVFP4",
+      endpointUrl: null,
+      endpointSource: null,
+      openshellDriver: "docker",
+      deferredN1xManagedVllmAccepted: true,
+    });
+    registry.updateSandbox("preview", { dashboardPort: 18_789 });
+    const afterUnrelatedUpdate = registry.getSandbox("preview")?.deferredN1xManagedVllmAccepted;
+    registry.updateSandbox("preview", { model: "other/model" });
+
+    expect({
+      afterUnrelatedUpdate,
+      afterRouteUpdate: registry.getSandbox("preview")?.deferredN1xManagedVllmAccepted,
+    }).toEqual({ afterUnrelatedUpdate: true, afterRouteUpdate: undefined });
+  });
+
   it("fails closed when persisted serving profile provenance is malformed (#8246)", async () => {
     const registry = await loadRegistryWith({
       profile: {
@@ -200,350 +740,170 @@ describe("sandbox registry normalization", () => {
     });
     expect(() => registry.getSandbox("profile")).toThrow("invalid serving profile provenance");
   });
-});
 
-describe("custom policy pin receipt normalization (#8176)", () => {
-  const content = `network_policies:
-  private-api:
-    endpoints:
-      - host: api.corp.example
-        allowed_ips: [10.20.30.40]
-`;
-  const receipt = {
-    version: 1 as const,
-    contentDigest: createHash("sha256").update(content).digest("hex"),
-  };
+  it.each([null, [], 42, "invalid"])(
+    "treats a non-object registry document as empty: %j",
+    async (document) => {
+      const { registry } = await loadRegistryDocument(document);
+      expect(registry.listSandboxes()).toEqual({ sandboxes: [], defaultSandbox: null });
+    },
+  );
 
-  it("keeps exact generated-pin authority bound to custom policy content", () => {
-    expect(
-      normalizeCustomPolicyEntries([
-        {
-          name: "private-api",
-          content,
-          sourcePath: "/tmp/private-api.yaml",
-          trustedPrivatePins: receipt,
-        },
+  it("drops malformed sandbox rows", async () => {
+    const { registry } = await loadRegistryDocument({
+      defaultSandbox: "alpha",
+      sandboxes: { alpha: { name: "different" }, beta: { name: "beta" } },
+    });
+    expect(registry.listSandboxes()).toEqual({
+      sandboxes: [expect.objectContaining({ name: "beta" })],
+      defaultSandbox: "alpha",
+    });
+  });
+
+  it("removes every legacy policy shadow field without replaying it", async () => {
+    const legacy = {
+      name: "alpha",
+      gatewayName: "nemoclaw",
+      customPolicies: [{ name: "corp", content: "network_policies: {}" }],
+      baselineExclusions: [{ key: "npm", digest: "a".repeat(64) }],
+      baselineExclusionTransition: { operation: "exclude" },
+      policyCreationReceipt: { schemaVersion: 1 },
+      pendingPolicyVerification: { expectedHash: "legacy" },
+      policyHash: "sha256:legacy",
+      policyVersion: 17,
+      observedPolicyAuthority: { source: "sandbox", owner: "nemoclaw" },
+    };
+    const { home, registry } = await loadRegistryDocument({
+      defaultSandbox: "alpha",
+      sandboxes: { alpha: legacy },
+    });
+
+    const sandbox = registry.getSandbox("alpha") as unknown as Record<string, unknown>;
+    expect(Object.keys(sandbox)).not.toEqual(
+      expect.arrayContaining([
+        "policies",
+        "customPolicies",
+        "baselineExclusions",
+        "baselineExclusionTransition",
+        "policyAuthority",
+        "policyCreationReceipt",
+        "pendingPolicyVerification",
+        "policyHash",
+        "policyPresetsFinalized",
+        "policyTier",
+        "policyVersion",
+        "observedPolicyAuthority",
       ]),
-    ).toEqual([
-      {
-        name: "private-api",
-        content,
-        sourcePath: "/tmp/private-api.yaml",
-        trustedPrivatePins: receipt,
+    );
+
+    registry.updateSandbox("alpha", { gatewayName: "nemoclaw" });
+    const persisted = JSON.parse(
+      fs.readFileSync(path.join(home, ".nemoclaw", "sandboxes.json"), "utf8"),
+    );
+    expect(persisted.sandboxes.alpha).toEqual(sandbox);
+  });
+
+  it("retains only the bounded generic create checkpoint", async () => {
+    const checkpoint = {
+      schemaVersion: 1 as const,
+      state: "verified-create" as const,
+      gatewayName: "nemoclaw",
+      gatewayPort: 8080,
+      openshellGatewayStateDir: "/home/tester/custom-gateway-state",
+      sandboxName: "alpha",
+      lifecycleGeneration: "generation",
+      sandboxIdentityFingerprint: "a".repeat(64),
+      route: "compatibility" as const,
+      exactFinalHandoffCommitStarted: true as const,
+      exactFinalHandoffRuntimeId: "b".repeat(64),
+      exactFinalHandoffAcknowledged: true as const,
+      policyHash: "legacy",
+    };
+    const { registry } = await loadRegistryDocument({
+      defaultSandbox: null,
+      sandboxes: {
+        alpha: {
+          name: "alpha",
+          pendingRouteReservation: true,
+          pendingCreateIdentity: checkpoint,
+        },
       },
-    ]);
-  });
-
-  it("fails closed when persisted pin authority does not match exact content", () => {
-    expect(() =>
-      normalizeCustomPolicyEntries([
-        {
-          name: "private-api",
-          content: `${content}\n# changed`,
-          trustedPrivatePins: receipt,
-        },
-      ]),
-    ).toThrow(/invalid trusted-private pin authority.*before rebuilding/i);
-    expect(() =>
-      normalizeCustomPolicyEntries([
-        {
-          name: "private-api",
-          content,
-          trustedPrivatePins: { contentDigest: receipt.contentDigest },
-        },
-      ]),
-    ).toThrow(/invalid trusted-private pin authority.*before rebuilding/i);
-  });
-});
-
-describe("baseline exclusion normalization (#7178)", () => {
-  const digest = "a".repeat(64);
-  const entry = {
-    version: 1 as const,
-    agent: "hermes",
-    key: "nous_research",
-    digest,
-    acknowledgedAt: "2026-07-19T00:00:00.000Z",
-  };
-
-  it("keeps an exact versioned, agent-bound entry", () => {
-    expect(
-      normalizeBaselineExclusions([
-        {
-          ...entry,
-          appliedAgentVersion: "1",
-        },
-      ]),
-    ).toEqual([{ ...entry, appliedAgentVersion: "1" }]);
-  });
-
-  it("preserves an explicitly unknown applied agent version", () => {
-    expect(normalizeBaselineExclusions([{ ...entry, appliedAgentVersion: null }])).toEqual([
-      { ...entry, appliedAgentVersion: null },
-    ]);
-  });
-
-  it("fails closed when any persisted record is malformed", () => {
-    expect(() => normalizeBaselineExclusions([entry, { ...entry, key: "" }])).toThrow(
-      /invalid versioned baseline exclusion.*before rebuilding/i,
-    );
-    expect(() => normalizeBaselineExclusions(["not-an-object"])).toThrow(
-      /malformed baseline exclusion.*before rebuilding/i,
-    );
-  });
-
-  it("rejects an unversioned record so its baseline source is never guessed (#7194)", () => {
-    expect(() => normalizeBaselineExclusions([{ key: entry.key, digest }])).toThrow(
-      /invalid versioned baseline exclusion.*before rebuilding/i,
-    );
-  });
-
-  it("collapses duplicate keys, last wins", () => {
-    expect(
-      normalizeBaselineExclusions([
-        { ...entry, key: "dup", digest: "b".repeat(64) },
-        { ...entry, key: "dup", digest: "c".repeat(64) },
-      ]),
-    ).toEqual([{ ...entry, key: "dup", digest: "c".repeat(64) }]);
-  });
-
-  it("returns undefined only for a legacy registry without the field", () => {
-    expect(normalizeBaselineExclusions(undefined)).toBeUndefined();
-    expect(normalizeBaselineExclusions([])).toBeUndefined();
-    expect(() => normalizeBaselineExclusions("nope")).toThrow(/must be an array/i);
-    expect(() => normalizeBaselineExclusions([{ ...entry, key: "" }])).toThrow(
-      /invalid versioned baseline exclusion/i,
-    );
-  });
-});
-
-describe("baseline exclusion transition normalization (#7178)", () => {
-  const sourceDigest = "a".repeat(64);
-  const targetDigest = "b".repeat(64);
-  const restoreTransition = {
-    id: "123e4567-e89b-42d3-a456-426614174000",
-    operation: "restore" as const,
-    exclusion: { version: 1 as const, agent: "hermes", key: "nous_research", digest: sourceDigest },
-    targetLiveDigest: targetDigest,
-    startedAt: "2026-07-19T00:00:00.000Z",
-  };
-
-  it("preserves an exact well-formed journal", () => {
-    expect(normalizeBaselineExclusionTransition(restoreTransition)).toEqual(restoreTransition);
-    expect(normalizeBaselineExclusionTransition(undefined)).toBeUndefined();
-  });
-
-  it("fails closed for partial operations or invalid live targets", () => {
-    expect(() =>
-      normalizeBaselineExclusionTransition({ ...restoreTransition, operation: "unknown" }),
-    ).toThrow(/incomplete baseline exclusion transition.*before rebuilding/i);
-    expect(() =>
-      normalizeBaselineExclusionTransition({ ...restoreTransition, targetLiveDigest: null }),
-    ).toThrow(/invalid live target.*before rebuilding/i);
-    expect(() =>
-      normalizeBaselineExclusionTransition({
-        ...restoreTransition,
-        operation: "exclude",
-        targetLiveDigest: "must-be-absent",
-      }),
-    ).toThrow(/invalid live target.*before rebuilding/i);
+    });
+    expect(registry.getSandbox("alpha")?.pendingCreateIdentity).toEqual({
+      schemaVersion: 1,
+      state: "verified-create",
+      gatewayName: "nemoclaw",
+      gatewayPort: 8080,
+      openshellGatewayStateDir: "/home/tester/custom-gateway-state",
+      sandboxName: "alpha",
+      lifecycleGeneration: "generation",
+      sandboxIdentityFingerprint: "a".repeat(64),
+      route: "compatibility",
+      exactFinalHandoffCommitStarted: true,
+      exactFinalHandoffRuntimeId: "b".repeat(64),
+      exactFinalHandoffAcknowledged: true,
+    });
   });
 
   it.each([
-    ["non-UUID id", { id: "tx-1" }],
-    ["non-canonical timestamp", { startedAt: "yesterday" }],
+    ["a relative gateway state directory", { openshellGatewayStateDir: "relative/state" }],
+    ["a noncanonical gateway state directory", { openshellGatewayStateDir: "/custom/../state" }],
+    ["a non-string gateway state directory", { openshellGatewayStateDir: 7 }],
+    ["an acknowledgement without a commit fence", { exactFinalHandoffAcknowledged: true }],
+    ["a false commit fence", { exactFinalHandoffCommitStarted: false }],
+    ["a false acknowledgement", { exactFinalHandoffAcknowledged: false }],
     [
-      "unsafe key",
-      { exclusion: { version: 1, agent: "hermes", key: "bad key\nnext", digest: sourceDigest } },
+      "a compatibility fence without exact runtime authority",
+      { exactFinalHandoffCommitStarted: true },
     ],
+    ["runtime authority without a commit fence", { exactFinalHandoffRuntimeId: "b".repeat(64) }],
     [
-      "non-SHA source digest",
-      { exclusion: { version: 1, agent: "hermes", key: "nous_research", digest: "short" } },
+      "malformed runtime authority",
+      { exactFinalHandoffCommitStarted: true, exactFinalHandoffRuntimeId: "short" },
     ],
-    ["non-SHA target digest", { targetLiveDigest: "short" }],
-  ])("rejects a journal with %s (#7178)", (_label, override) => {
-    expect(() =>
-      normalizeBaselineExclusionTransition({ ...restoreTransition, ...override }),
-    ).toThrow(
-      /(?:baseline exclusion transition|invalid versioned baseline exclusion).*before rebuilding/i,
-    );
-  });
-});
-
-describe("baseline exclusion registry helpers (#7178)", () => {
-  it("round-trips add, get, and remove keyed by baseline entry", async () => {
-    const registry = await loadRegistryWith({});
-    registry.registerSandbox({ name: "alpha", agent: "hermes" });
-
-    expect(registry.getBaselineExclusions("alpha")).toEqual([]);
-
-    expect(
-      registry.addBaselineExclusion("alpha", {
-        version: 1 as const,
-        agent: "hermes",
-        key: "nous_research",
-        digest: "d".repeat(64),
-        appliedAgentVersion: null,
-      }),
-    ).toBe(true);
-    const stored = registry.getBaselineExclusions("alpha");
-    expect(stored).toHaveLength(1);
-    expect(stored[0]).toMatchObject({
-      key: "nous_research",
-      digest: "d".repeat(64),
-      appliedAgentVersion: null,
-    });
-    expect(typeof stored[0].acknowledgedAt).toBe("string");
-
-    expect(registry.removeBaselineExclusion("alpha", "nous_research")).toBe(true);
-    expect(registry.getBaselineExclusions("alpha")).toEqual([]);
-    expect(registry.removeBaselineExclusion("alpha", "nous_research")).toBe(false);
-  });
-
-  it("keeps exclusions independent from a same-named custom preset", async () => {
-    const registry = await loadRegistryWith({});
-    registry.registerSandbox({ name: "alpha", agent: "hermes" });
-
-    registry.addCustomPolicy("alpha", { name: "brave", content: "version: 1\n" });
-    registry.addBaselineExclusion("alpha", {
-      version: 1,
-      agent: "hermes",
-      key: "brave",
-      digest: "d".repeat(64),
-    });
-
-    expect(registry.getCustomPolicies("alpha").map((p) => p.name)).toEqual(["brave"]);
-    expect(registry.getBaselineExclusions("alpha").map((e) => e.key)).toEqual(["brave"]);
-
-    registry.removeBaselineExclusion("alpha", "brave");
-    expect(registry.getCustomPolicies("alpha").map((p) => p.name)).toEqual(["brave"]);
-    expect(registry.getBaselineExclusions("alpha")).toEqual([]);
-  });
-
-  it("journals and atomically commits an exclude or restore transition", async () => {
-    const registry = await loadRegistryWith({});
-    registry.registerSandbox({ name: "alpha", agent: "hermes" });
-    const exclude = {
-      id: "123e4567-e89b-42d3-a456-426614174001",
-      operation: "exclude" as const,
-      exclusion: {
-        version: 1 as const,
-        agent: "hermes",
-        key: "nous_research",
-        digest: "a".repeat(64),
-        acknowledgedAt: "2026-07-19T00:00:00.000Z",
-      },
-      targetLiveDigest: null,
-      startedAt: "2026-07-19T00:00:01.000Z",
-    };
-
-    expect(registry.beginBaselineExclusionTransition("alpha", exclude)).toBe(true);
-    expect(
-      registry.beginBaselineExclusionTransition("alpha", {
-        ...exclude,
-        id: "123e4567-e89b-42d3-a456-426614174002",
-      }),
-    ).toBe(false);
-    expect(registry.getBaselineExclusionTransition("alpha")).toEqual(exclude);
-    expect(registry.getBaselineExclusions("alpha")).toEqual([]);
-    expect(registry.commitBaselineExclusionTransition("alpha", "wrong-id")).toBe(false);
-    expect(registry.commitBaselineExclusionTransition("alpha", exclude.id)).toBe(true);
-    expect(registry.getBaselineExclusionTransition("alpha")).toBeNull();
-    expect(registry.getBaselineExclusions("alpha")).toEqual([exclude.exclusion]);
-
-    const restore = {
-      id: "123e4567-e89b-42d3-a456-426614174003",
-      operation: "restore" as const,
-      exclusion: exclude.exclusion,
-      targetLiveDigest: "b".repeat(64),
-      startedAt: "2026-07-19T00:00:02.000Z",
-    };
-    expect(registry.beginBaselineExclusionTransition("alpha", restore)).toBe(true);
-    expect(registry.commitBaselineExclusionTransition("alpha", restore.id)).toBe(true);
-    expect(registry.getBaselineExclusions("alpha")).toEqual([]);
-    expect(registry.getBaselineExclusionTransition("alpha")).toBeNull();
-  });
-
-  it("clears only the exact journal without changing committed exclusions", async () => {
-    const registry = await loadRegistryWith({});
-    registry.registerSandbox({
-      name: "alpha",
-      baselineExclusions: [
-        { version: 1, agent: "hermes", key: "nous_research", digest: "d".repeat(64) },
-      ],
-    });
-    const transition = {
-      id: "123e4567-e89b-42d3-a456-426614174004",
-      operation: "restore" as const,
-      exclusion: {
-        version: 1 as const,
-        agent: "hermes",
-        key: "nous_research",
-        digest: "a".repeat(64),
-      },
-      targetLiveDigest: "b".repeat(64),
-      startedAt: "2026-07-19T00:00:02.000Z",
-    };
-    expect(registry.beginBaselineExclusionTransition("alpha", transition)).toBe(true);
-    expect(
-      registry.addBaselineExclusion("alpha", {
-        version: 1,
-        agent: "hermes",
-        key: "other",
-        digest: "e".repeat(64),
-      }),
-    ).toBe(false);
-    expect(registry.removeBaselineExclusion("alpha", "nous_research")).toBe(false);
-    expect(registry.clearBaselineExclusionTransition("alpha", "wrong-id")).toBe(false);
-    expect(registry.clearBaselineExclusionTransition("alpha", transition.id)).toBe(true);
-    expect(registry.getBaselineExclusions("alpha")).toEqual([
-      expect.objectContaining({ key: "nous_research", digest: "d".repeat(64) }),
-    ]);
-  });
-
-  it("preserves a restore journal when the committed exclusion changed (#7178)", async () => {
-    const source = {
-      version: 1 as const,
-      agent: "hermes",
-      key: "nous_research",
-      digest: "a".repeat(64),
-      acknowledgedAt: "2026-07-19T00:00:00.000Z",
-    };
-    const registry = await loadRegistryWith({});
-    registry.registerSandbox({ name: "alpha", baselineExclusions: [source] });
-    const transition = {
-      id: "123e4567-e89b-42d3-a456-426614174005",
-      operation: "restore" as const,
-      exclusion: source,
-      targetLiveDigest: "b".repeat(64),
-      startedAt: "2026-07-19T00:00:01.000Z",
-    };
-    expect(registry.beginBaselineExclusionTransition("alpha", transition)).toBe(true);
-
-    const document = registry.load();
-    document.sandboxes.alpha.baselineExclusions = [{ ...source, digest: "c".repeat(64) }];
-    registry.save(document);
-
-    expect(registry.commitBaselineExclusionTransition("alpha", transition.id)).toBe(false);
-    expect(registry.getBaselineExclusionTransition("alpha")).toEqual(transition);
-    expect(registry.getBaselineExclusions("alpha")).toEqual([
-      { ...source, digest: "c".repeat(64) },
-    ]);
-  });
-
-  it("refuses to load mixed valid and malformed persisted exclusions", async () => {
+  ])("rejects %s in a pending create checkpoint", async (_case, receipt) => {
     const registry = await loadRegistryWith({
       alpha: {
         name: "alpha",
-        baselineExclusions: [
-          { version: 1, agent: "hermes", key: "good", digest: "d".repeat(64) },
-          { version: 1, agent: "hermes", key: "", digest: "e".repeat(64) },
-        ],
+        pendingRouteReservation: true,
+        pendingCreateIdentity: {
+          schemaVersion: 1,
+          state: "verified-create",
+          gatewayName: "nemoclaw",
+          gatewayPort: 8080,
+          sandboxName: "alpha",
+          lifecycleGeneration: "generation",
+          sandboxIdentityFingerprint: "a".repeat(64),
+          route: "compatibility",
+          ...receipt,
+        },
       },
     });
 
-    expect(() => registry.listSandboxes()).toThrow(
-      /invalid versioned baseline exclusion.*before rebuilding/i,
+    expect(() => registry.getSandbox("alpha")).toThrow(
+      /invalid pending sandbox create verification/u,
     );
+  });
+
+  it("sets a gateway port only while the complete qualified row remains current", async () => {
+    const registry = await loadRegistryWith({
+      alpha: {
+        name: "alpha",
+        agent: "hermes",
+        gatewayName: "nemoclaw",
+        lifecycleGeneration: "11111111-1111-4111-8111-111111111111",
+        model: "qualified",
+      },
+    });
+    const qualified = registry.getSandbox("alpha")!;
+
+    expect(registry.updateSandbox("alpha", { model: "replacement" })).toBe(true);
+    expect(registry.compareAndSetSandboxGatewayPort("alpha", qualified, 8080)).toBe(false);
+    const replacement = registry.getSandbox("alpha")!;
+    expect(replacement).toMatchObject({ model: "replacement", gatewayName: "nemoclaw" });
+    expect(replacement).not.toHaveProperty("gatewayPort");
+
+    expect(registry.compareAndSetSandboxGatewayPort("alpha", replacement, 8080)).toBe(true);
+    expect(registry.getSandbox("alpha")).toEqual({ ...replacement, gatewayPort: 8080 });
   });
 });

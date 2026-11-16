@@ -24,7 +24,8 @@ $$nemoclaw onboard
 ```
 
 The explicit variable fails onboarding when the file is missing, invalid, unsafe, or a merged operating-system trust store.
-Use `$$nemoclaw <name> rebuild` after adding or changing the CA for an existing sandbox.
+Managed-image rebuilds preserve the recorded CA profile and do not import a newly exported bundle.
+For an existing sandbox, use the [explicit recreation command `NEMOCLAW_CORPORATE_CA_BUNDLE=/path/to/corporate-ca.pem $$nemoclaw onboard --fresh --name <sandbox-name> --recreate-sandbox`](../reference/commands#--resume-and--fresh), subject to the [state-preservation and recovery limits](../manage-sandboxes/operate-sandboxes/recover-and-rebuild-sandboxes#continue-an-interrupted-replacement).
 
 ## Understand Image and Runtime Trust
 
@@ -39,8 +40,8 @@ When onboarding supplies a corporate CA, the Dockerfile sets `NODE_EXTRA_CA_CERT
 This includes registry-backed npm remediation and runtime dependency installation that cross a TLS-inspecting proxy.
 The build does not retain either variable in the image configuration.
 
-When NemoClaw selects a corporate CA, it sets `NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=root` for the image build.
-The OpenClaw managed startup runtime creates `/run/nemoclaw/managed-startup-ca-bundle.pem` as `root:root` with mode `0444` before it starts agent commands as the `sandbox` user.
+NemoClaw keeps `NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=sandbox` for OpenShell 0.0.116.
+The OpenClaw managed startup runtime creates `/tmp/nemoclaw-managed-startup-ca-bundle.pem` as `root:root` with mode `0444` before it releases the sandbox-user startup command.
 The `sandbox` user can read the merged bundle but cannot modify or replace it.
 Sandboxes still using the staged legacy direct-start path create `/tmp/nemoclaw-ca-bundle.pem` with mode `0444` as the same `sandbox` identity that runs the entrypoint and agent, so that compatibility path is read-only by mode but is not a privilege boundary.
 
@@ -109,7 +110,7 @@ In the final image stage, an OpenClaw custom Dockerfile must declare exactly one
 Dockerfile instruction keywords are case-insensitive, but the argument name must match exactly.
 Before the final entrypoint, the stage must set `USER ${NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER}`.
 The final entrypoint must use the trusted exec form `ENTRYPOINT ["/usr/local/bin/nemoclaw-start"]`.
-NemoClaw selects `root` when it bakes the corporate CA so the entrypoint can create the root-owned merged bundle before it starts agent commands.
+NemoClaw preserves `sandbox` when it bakes the corporate CA; managed startup creates the root-owned merged bundle before it releases the entrypoint.
 Automatic fallback and host-store sources are a no-op unless the Dockerfile declares `NEMOCLAW_CORPORATE_CA_B64` and meets this startup contract.
 The explicit `NEMOCLAW_CORPORATE_CA_BUNDLE` path fails onboarding if either condition is not met.
 

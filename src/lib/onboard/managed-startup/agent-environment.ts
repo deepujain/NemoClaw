@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { Buffer } from "node:buffer";
+import { PROVIDERLESS_INFERENCE_ENV } from "../../providerless-inference";
+import {
+  encodeHermesSwitchyardRoutingIntent,
+  encodeSwitchyardProviderBindings,
+  HERMES_SWITCHYARD_BINDINGS_ENV,
+  HERMES_SWITCHYARD_ROUTING_ENV,
+} from "../../hermes-switchyard-routing";
 
 import { parseSandboxMessagingPlan } from "../../messaging/plan-validation";
 import {
@@ -32,6 +39,7 @@ export interface ManagedStartupRootOwnedFileMaterial {
   readonly legacyInput:
     | "NEMOCLAW_DCODE_AUTO_APPROVAL"
     | "NEMOCLAW_INFERENCE_BASE_URL"
+    | "NEMOCLAW_INFERENCE_PROVIDER_ID"
     | "NEMOCLAW_PROXY_HOST"
     | "NEMOCLAW_PROXY_PORT"
     | "NEMOCLAW_REASONING_EFFORT"
@@ -43,6 +51,8 @@ export interface ManagedStartupRootOwnedFileMaterial {
     | "/usr/local/share/nemoclaw/dcode-proxy-port"
     | "/usr/local/share/nemoclaw/dcode-reasoning-effort"
     | "/usr/local/share/nemoclaw/dcode-upstream-provider"
+    | "/usr/local/share/nemoclaw/dcode-provider-route"
+    | "/usr/local/share/nemoclaw/openclaw-proxy-url"
     | "/usr/local/share/nemoclaw/pi-proxy-host"
     | "/usr/local/share/nemoclaw/pi-proxy-port";
   readonly contents: string;
@@ -227,6 +237,8 @@ function applicationRuntimePlan(
 }
 
 function commonConfigurationEnvironment(profile: ManagedStartupProfile): MutableEnvironment {
+  if (profile.inference === null)
+    return { ...PROVIDERLESS_INFERENCE_ENV, NEMOCLAW_TOOL_DISCLOSURE: profile.tools.disclosure };
   return {
     NEMOCLAW_INFERENCE_API: profile.inference.api,
     NEMOCLAW_INFERENCE_BASE_URL: profile.inference.routedBaseUrl,
@@ -357,8 +369,8 @@ function mapOpenClawProfile(
     profile.agent !== "openclaw" ||
     profile.agentConfig.agent !== "openclaw" ||
     profile.dashboard.agent !== "openclaw" ||
-    profile.inference.primaryModelRef === null ||
-    profile.inference.inputModalities === null ||
+    (profile.inference !== null &&
+      (profile.inference.primaryModelRef === null || profile.inference.inputModalities === null)) ||
     profile.tuning.contextWindow === null ||
     profile.tuning.maxTokens === null ||
     profile.tuning.reasoning === null ||
@@ -376,21 +388,20 @@ function mapOpenClawProfile(
     NEMOCLAW_CONTEXT_WINDOW: String(profile.tuning.contextWindow),
     NEMOCLAW_DASHBOARD_BIND:
       profile.dashboard.bindAddress === "0.0.0.0" ? profile.dashboard.bindAddress : "",
-    NEMOCLAW_DISABLE_DEVICE_AUTH: booleanFlag(profile.agentConfig.deviceAuth.disabled),
-    NEMOCLAW_DEVICE_AUTH_OPT_OUT_SOURCE: profile.agentConfig.deviceAuth.optOutSource,
     NEMOCLAW_EXTRA_AGENTS_JSON_B64: encodeCanonicalJson(profile.agentConfig.extraAgents),
-    NEMOCLAW_INFERENCE_COMPAT_B64: encodeCanonicalJson(profile.inference.compatibility),
-    NEMOCLAW_INFERENCE_INPUTS: profile.inference.inputModalities.join(","),
+    NEMOCLAW_INFERENCE_COMPAT_B64: encodeCanonicalJson(profile.inference?.compatibility ?? {}),
+    NEMOCLAW_INFERENCE_INPUTS: profile.inference?.inputModalities?.join(",") ?? "text",
     NEMOCLAW_MAX_TOKENS: String(profile.tuning.maxTokens),
     NEMOCLAW_OPENCLAW_OTEL: booleanFlag(profile.agentConfig.otel.enabled),
     NEMOCLAW_OPENCLAW_OTEL_ENDPOINT: profile.agentConfig.otel.endpointUrl,
     NEMOCLAW_OPENCLAW_OTEL_SAMPLE_RATE: String(profile.agentConfig.otel.sampleRate),
     NEMOCLAW_OPENCLAW_OTEL_SERVICE_NAME: profile.agentConfig.otel.serviceName,
-    NEMOCLAW_PRIMARY_MODEL_REF: profile.inference.primaryModelRef,
+    NEMOCLAW_PRIMARY_MODEL_REF: profile.inference?.primaryModelRef ?? "",
     NEMOCLAW_PROXY_HOST: profile.proxy.managedHost,
     NEMOCLAW_PROXY_PORT: String(profile.proxy.managedPort),
     NEMOCLAW_REASONING: String(profile.tuning.reasoning),
     NEMOCLAW_REASONING_EFFORT: profile.tuning.reasoningEffort,
+    NEMOCLAW_SERVING_PRESET: profile.inference?.servingPreset ?? "",
     NEMOCLAW_WEB_SEARCH_ENABLED: booleanFlag(profile.agentConfig.webSearch.enabled),
     NEMOCLAW_WEB_SEARCH_PROVIDER: profile.agentConfig.webSearch.provider,
     NEMOCLAW_WSL_DASHBOARD_EXPOSURE: booleanFlag(profile.dashboard.wslExposure),
@@ -408,7 +419,14 @@ function mapOpenClawProfile(
     configurationEnvironment: sortedEnvironment(configurationEnvironment),
     runtimeEnvironment: sortedEnvironment(runtimeEnvironment),
     applicationRuntime: applicationRuntimePlan(profile, environment),
-    materials: Object.freeze([corporateCaMaterial(profile)]),
+    materials: Object.freeze([
+      corporateCaMaterial(profile),
+      rootOwnedFile(
+        "NEMOCLAW_PROXY_HOST",
+        "/usr/local/share/nemoclaw/openclaw-proxy-url",
+        `http://${profile.proxy.managedHost}:${profile.proxy.managedPort}`,
+      ),
+    ]),
     actions: applicationActions(profile, "openclaw"),
   });
 }
@@ -425,20 +443,46 @@ function mapHermesProfile(
     throw new ManagedStartupAgentEnvironmentError("Hermes profile state is inconsistent");
   }
 
+  let chatUiUrl = profile.dashboard.browserUrl ?? profile.dashboard.url;
+  if (profile.dashboard.mode === "loopback-forwarded") {
+    if (profile.dashboard.browserUrl === undefined) {
+      throw new ManagedStartupAgentEnvironmentError(
+        "Cannot start the Hermes dashboard because its managed startup profile has no recorded browser URL. Rerun onboarding before starting the sandbox.",
+      );
+    }
+    chatUiUrl = profile.dashboard.browserUrl;
+  }
+
   const configurationEnvironment: MutableEnvironment = {
     ...commonConfigurationEnvironment(profile),
     ...messagingEnvironment(profile, "hermes"),
-    CHAT_UI_URL: profile.dashboard.url,
+    CHAT_UI_URL: chatUiUrl,
     NEMOCLAW_CONTEXT_WINDOW:
       profile.tuning.contextWindow === null ? "" : String(profile.tuning.contextWindow),
     NEMOCLAW_HERMES_TOOL_GATEWAY_BROKER: booleanFlag(profile.tools.enabledGateways.length > 0),
     NEMOCLAW_HERMES_TOOL_GATEWAY_PRESETS_B64: encodeCanonicalJson(profile.tools.enabledGateways),
     NEMOCLAW_WEB_SEARCH_ENABLED: booleanFlag(profile.agentConfig.webSearch.enabled),
     NEMOCLAW_WEB_SEARCH_PROVIDER: profile.agentConfig.webSearch.provider,
+    [HERMES_SWITCHYARD_ROUTING_ENV]: profile.agentConfig.switchyardRouting
+      ? encodeHermesSwitchyardRoutingIntent(profile.agentConfig.switchyardRouting)
+      : "",
+    [HERMES_SWITCHYARD_BINDINGS_ENV]:
+      profile.agentConfig.switchyardRouting && profile.agentConfig.switchyardBindings
+        ? encodeSwitchyardProviderBindings(
+            profile.agentConfig.switchyardBindings,
+            profile.agentConfig.switchyardRouting,
+          )
+        : "",
   };
 
-  const runtimeEnvironment: MutableEnvironment = { ...configurationEnvironment };
+  const runtimeEnvironment: MutableEnvironment = {
+    ...configurationEnvironment,
+    HERMES_HOME: "/sandbox/.hermes",
+    HERMES_LAZY_INSTALL_TARGET: "/sandbox/.hermes/lazy-packages",
+  };
   delete runtimeEnvironment.NEMOCLAW_MESSAGING_PLAN_B64;
+  delete runtimeEnvironment[HERMES_SWITCHYARD_ROUTING_ENV];
+  delete runtimeEnvironment[HERMES_SWITCHYARD_BINDINGS_ENV];
   runtimeEnvironment.NEMOCLAW_DASHBOARD_PORT =
     profile.dashboard.publicPort === null ? "" : String(profile.dashboard.publicPort);
   runtimeEnvironment.NEMOCLAW_HERMES_DASHBOARD =
@@ -471,7 +515,8 @@ function mapDcodeProfile(
     profile.agent !== "langchain-deepagents-code" ||
     profile.agentConfig.agent !== "langchain-deepagents-code" ||
     profile.dashboard.agent !== "langchain-deepagents-code" ||
-    profile.messaging.plan !== null
+    profile.messaging.plan !== null ||
+    profile.inference === null
   ) {
     throw new ManagedStartupAgentEnvironmentError(
       "LangChain Deep Agents Code profile state is inconsistent",
@@ -526,6 +571,11 @@ function mapDcodeProfile(
       profile.inference.upstreamProvider,
     ),
     rootOwnedFile(
+      "NEMOCLAW_INFERENCE_PROVIDER_ID",
+      "/usr/local/share/nemoclaw/dcode-provider-route",
+      profile.inference.routeProvider,
+    ),
+    rootOwnedFile(
       "NEMOCLAW_PROXY_HOST",
       "/usr/local/share/nemoclaw/dcode-proxy-host",
       profile.proxy.managedHost,
@@ -571,8 +621,7 @@ function mapPiProfile(
     NEMOCLAW_CONTEXT_WINDOW:
       profile.tuning.contextWindow === null ? "" : String(profile.tuning.contextWindow),
     NEMOCLAW_MAX_TOKENS: profile.tuning.maxTokens === null ? "" : String(profile.tuning.maxTokens),
-    NEMOCLAW_REASONING:
-      profile.tuning.reasoning === null ? "" : String(profile.tuning.reasoning),
+    NEMOCLAW_REASONING: profile.tuning.reasoning === null ? "" : String(profile.tuning.reasoning),
   };
   appendHostProxyEnvironment(configurationEnvironment, profile);
   const runtimeEnvironment: MutableEnvironment = { ...configurationEnvironment };

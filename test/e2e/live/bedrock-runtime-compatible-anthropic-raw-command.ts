@@ -1,16 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { performance } from "node:perf_hooks";
+
 import type { ArtifactSink } from "../fixtures/artifacts.ts";
 import { spawnObservedChild } from "../fixtures/observed-child-process.ts";
 import { REPO_ROOT } from "../fixtures/paths.ts";
 import type { TestProgress, TestProgressCapability } from "../fixtures/progress.ts";
 import { redactString } from "../fixtures/redaction.ts";
-import { resolveLiveE2eWorkloadSourceEnv } from "../fixtures/workload-source-env.ts";
-import {
-  projectRawOutputForArtifact,
-  type RawArtifactOutputMode,
-} from "./bedrock-runtime-compatible-anthropic-artifacts.ts";
+import { resolveLiveE2eWorkloadSourceEnv } from "../fixtures/shell-probe.ts";
 
 const MAX_RAW_COMMAND_OUTPUT_BYTES = 10 * 1024 * 1024;
 const RAW_COMMAND_OUTPUT_LIMIT_MARKER = "[bedrock raw-command output exceeded safe capture limit]";
@@ -53,9 +51,9 @@ export interface RawRunResult {
 export interface RawRunOptions {
   readonly artifactName: string;
   readonly artifacts: ArtifactSink;
-  readonly artifactOutputMode?: RawArtifactOutputMode;
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
+  readonly stdin?: string;
   readonly progress: Pick<TestProgress, "activity" | "event" | "onOutput"> & TestProgressCapability;
   readonly redactionValues?: readonly string[];
   readonly timeoutMs?: number;
@@ -84,6 +82,10 @@ export async function runRawCommand(
   args: readonly string[],
   options: RawRunOptions,
 ): Promise<RawRunResult> {
+  const startedAtMs = performance.now();
+  let lastStdoutAtMs: number | null = null;
+  let lastStderrAtMs: number | null = null;
+  let timeoutAtMs: number | null = null;
   const timeoutMs = options.timeoutMs ?? 60_000;
   const redactionValues = [...(options.redactionValues ?? [])];
   const progressName = progressCommandName(options.artifactName);
@@ -97,7 +99,7 @@ export async function runRawCommand(
         cwd: options.cwd ?? REPO_ROOT,
         detached: true,
         env: resolveLiveE2eWorkloadSourceEnv({ ...(options.env ?? {}) }),
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       },
     });
   } catch (error) {
@@ -134,6 +136,7 @@ export async function runRawCommand(
 
   const timeout = setTimeout(() => {
     timedOut = true;
+    timeoutAtMs = performance.now() - startedAtMs;
     emitProgressEvent(
       options.progress,
       `command ${progressName} timeout fired after ${timeoutMs}ms`,
@@ -144,14 +147,22 @@ export async function runRawCommand(
   timeout.unref();
 
   child.stdout?.on("data", (chunk: Buffer) => {
+    lastStdoutAtMs = performance.now() - startedAtMs;
     captureOutput(stdoutCapture, chunk);
   });
   child.stderr?.on("data", (chunk: Buffer) => {
+    lastStderrAtMs = performance.now() - startedAtMs;
     captureOutput(stderrCapture, chunk);
   });
   child.on("error", (error) => {
     spawnError = error;
   });
+  if (options.stdin !== undefined) {
+    child.stdin?.on("error", () => {
+      // The child may reject or close bounded input before the parent finishes writing it.
+    });
+    child.stdin?.end(options.stdin);
+  }
 
   const { exitCode, signal } = await new Promise<{
     exitCode: number | null;
@@ -159,6 +170,7 @@ export async function runRawCommand(
   }>((resolve) => {
     child.on("close", (code, closeSignal) => resolve({ exitCode: code, signal: closeSignal }));
   });
+  const durationMs = performance.now() - startedAtMs;
   clearTimeout(timeout);
   emitProgressEvent(
     options.progress,
@@ -178,13 +190,8 @@ export async function runRawCommand(
     : capturedOutput(stderrCapture);
   const redactedStdout = redactString(stdout, redactionValues);
   const redactedStderr = redactString(stderr, redactionValues);
-  const artifactOutputMode = options.artifactOutputMode ?? "content";
-  const artifactStdout = captureLimitExceeded
-    ? RAW_COMMAND_OUTPUT_LIMIT_MARKER
-    : projectRawOutputForArtifact(redactedStdout, "stdout", artifactOutputMode);
-  const artifactStderr = captureLimitExceeded
-    ? RAW_COMMAND_OUTPUT_LIMIT_MARKER
-    : projectRawOutputForArtifact(redactedStderr, "stderr", artifactOutputMode);
+  const artifactStdout = captureLimitExceeded ? RAW_COMMAND_OUTPUT_LIMIT_MARKER : redactedStdout;
+  const artifactStderr = captureLimitExceeded ? RAW_COMMAND_OUTPUT_LIMIT_MARKER : redactedStderr;
   await options.artifacts.writeText(`raw-shell/${options.artifactName}.stdout.txt`, artifactStdout);
   await options.artifacts.writeText(`raw-shell/${options.artifactName}.stderr.txt`, artifactStderr);
   await options.artifacts.writeJson(`raw-shell/${options.artifactName}.result.json`, {
@@ -193,6 +200,7 @@ export async function runRawCommand(
     signal,
     timedOut,
     captureLimitExceeded,
+    timing: { durationMs, lastStdoutAtMs, lastStderrAtMs, timeoutAtMs },
     stdout: artifactStdout,
     stderr: artifactStderr,
   });

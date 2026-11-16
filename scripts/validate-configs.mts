@@ -57,18 +57,11 @@ function discoverTargets(): ConfigTarget[] {
     },
     {
       schema: "schemas/sandbox-policy.schema.json",
-      files: [
-        "nemoclaw-blueprint/policies/openclaw-sandbox.yaml",
-        "nemoclaw-blueprint/policies/openclaw-sandbox-permissive.yaml",
-      ],
+      files: ["nemoclaw-blueprint/policies/openclaw-sandbox.yaml"],
     },
     {
       schema: "schemas/openclaw-plugin.schema.json",
       files: ["nemoclaw/openclaw.plugin.json"],
-    },
-    {
-      schema: "schemas/router-pool-config.schema.json",
-      files: ["nemoclaw-blueprint/router/pool-config.yaml"],
     },
     {
       schema: "schemas/onboard-config.schema.json",
@@ -82,7 +75,7 @@ function discoverTargets(): ConfigTarget[] {
       .filter((entry) => entry.isDirectory())
       .flatMap((entry) => {
         const base = `agents/${entry.name}`;
-        return [`${base}/policy-additions.yaml`, `${base}/policy-permissive.yaml`];
+        return [`${base}/policy-additions.yaml`];
       })
       .filter((file) => existsSync(join(REPO_ROOT, file)));
     if (agentPolicyFiles.length > 0) {

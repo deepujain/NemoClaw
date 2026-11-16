@@ -3,6 +3,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { requireValue } from "../core/require-value";
+import * as localModelDocker from "../adapters/docker/run";
+import { resolveVllmModelAlias } from "../inference/vllm-models";
+import { getLegacyHostLocalManagedVllmBridgeHost } from "../inference/serving/vllm-host-local-lifecycle";
+import { bindStationExpressProviderSelection } from "./station-express-resume";
 import type { SetupNimSelectionState } from "./setup-nim-flow";
 import {
   buildDgxSparkExistingVllmHeadroomWarning,
@@ -59,7 +63,97 @@ beforeEach(() => {
 
 afterEach(() => vi.restoreAllMocks());
 
+function reviewedStationSelection(
+  options: {
+    automatic?: boolean;
+    unmanaged?: boolean;
+    missingReceipt?: boolean;
+    changedField?: "catalogDigest" | "presetId" | "presetDigest" | "recipeId" | "recipeDigest";
+    root?: string;
+  } = {},
+) {
+  const model = requireValue(
+    resolveVllmModelAlias("nemotron-3.5-super-vl-120b"),
+    "Expected Super VL catalog model",
+  );
+  const variant = requireValue(
+    model.runtimeVariants?.find((entry) => entry.platforms?.includes("station")),
+    "Expected Station runtime",
+  );
+  const serving = {
+    ...requireValue(variant.servingCatalog, "Expected catalog receipt"),
+    ...(options.changedField ? { [options.changedField]: `sha256:${"f".repeat(64)}` } : {}),
+  };
+  const raw = JSON.stringify({
+    data: [
+      {
+        id: variant.servedModelId,
+        root: options.root ?? "/tmp/nemoclaw-reviewed-model-fixture/model",
+      },
+    ],
+  });
+  const selection = state(options.automatic ? null : variant.servedModelId);
+  const handler = createSetupNimVllmHandler(
+    deps({
+      getManagedVllmProviderBinding: () =>
+        options.unmanaged
+          ? null
+          : {
+              baseUrl: "http://host.openshell.internal:8000/v1",
+              validationBaseUrl: "http://127.0.0.1:8000/v1",
+              apiKey: "a".repeat(64),
+              ...(options.missingReceipt ? {} : { serving }),
+            },
+      queryVllmModels: () => raw,
+      runCapture: () => raw,
+    }),
+  );
+  const bind = () =>
+    bindStationExpressProviderSelection(
+      { version: 1, model: model.envValue, sandboxName: "station-test" },
+      selection.provider,
+      selection.model,
+      selection.vllmModelIdentity,
+    );
+  return { handler, selection, bind, model, variant };
+}
+
 describe("setupNim vLLM route containment", () => {
+  it.each([false, true])(
+    "binds a reviewed Station snapshot through its verified recipe identity (automatic=%s)",
+    async (automatic) => {
+      const { handler, selection, bind, model, variant } = reviewedStationSelection({ automatic });
+      await expect(handler(selection, { managedInstall: !automatic })).resolves.toBe("selected");
+      expect(selection.vllmModelIdentity).toBe(model.id);
+      expect(bind()).toMatchObject({
+        servedModel: variant.servedModelId,
+        checkpointModel: model.id,
+      });
+    },
+  );
+
+  it.each([
+    ["unmanaged endpoint", { unmanaged: true }],
+    ["missing receipt", { missingReceipt: true }],
+    ["different catalog", { changedField: "catalogDigest" }],
+    ["different preset", { changedField: "presetId" }],
+    ["different preset digest", { changedField: "presetDigest" }],
+    ["different recipe", { changedField: "recipeId" }],
+    ["different recipe digest", { changedField: "recipeDigest" }],
+    ["different checkpoint", { root: "other/checkpoint" }],
+    ["automatic unmanaged endpoint", { automatic: true, unmanaged: true }],
+    ["automatic missing receipt", { automatic: true, missingReceipt: true }],
+    ["automatic different recipe", { automatic: true, changedField: "recipeDigest" }],
+    ["automatic different checkpoint", { automatic: true, root: "other/checkpoint" }],
+  ] as const)("refuses Station snapshot binding for a %s", async (_name, options) => {
+    const selectionOptions = { automatic: false, ...options };
+    const { handler, selection, bind } = reviewedStationSelection(selectionOptions);
+    await expect(handler(selection, { managedInstall: !selectionOptions.automatic })).resolves.toBe(
+      "selected",
+    );
+    expect(bind).toThrow("Cannot record an invalid DGX Station Express provider selection");
+  });
+
   it("preflights before discovery and exact-checks the detected model before validation (#6315)", async () => {
     const events: string[] = [];
     const selection = state(null);
@@ -216,6 +310,52 @@ describe("setupNim vLLM route containment", () => {
       "  To install 'required/model', stop the managed vLLM deployment, then rerun the original install/onboard command.",
     );
     expect(vi.mocked(console.error).mock.calls.flat().join("\n")).not.toContain("localhost");
+  });
+
+  it.each([
+    {
+      state: "unsafe public bindings",
+      status: 0,
+      stdout: JSON.stringify([
+        {
+          Id: "a".repeat(64),
+          Name: "/nemoclaw-vllm",
+          State: { Running: true },
+          Config: { Labels: { "com.nvidia.nemoclaw.managed-vllm": "true" } },
+          NetworkSettings: { Ports: { "8000/tcp": [{ HostIp: "0.0.0.0", HostPort: "8000" }] } },
+        },
+      ]),
+      message:
+        "Handle a Running vLLM Server' in the vLLM setup guide before recreating the owned `nemoclaw-vllm` container. Preserve the original model and port settings.",
+    },
+    {
+      state: "unavailable inspection",
+      status: 1,
+      stdout: "",
+      message:
+        "Managed vLLM container inspection failed. Verify access to Docker's default local daemon before retrying.",
+    },
+  ])("stops onboarding before probing with $state", async ({ status, stdout, message }) => {
+    vi.spyOn(localModelDocker, "dockerRun").mockReturnValue({
+      status,
+      stdout,
+      stderr: "Cannot inspect Docker",
+    } as ReturnType<typeof localModelDocker.dockerRun>);
+    const runCapture = vi.fn();
+    const handler = createSetupNimVllmHandler(
+      deps({
+        runCapture,
+        getManagedVllmProviderBinding: () => {
+          getLegacyHostLocalManagedVllmBridgeHost(8000, () =>
+            JSON.stringify([{ Gateway: "172.18.0.1" }]),
+          );
+          return null;
+        },
+      }),
+    );
+    await expect(handler(state(null))).rejects.toThrow("exit 1");
+    expect(runCapture).not.toHaveBeenCalled();
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining(message));
   });
 
   it("fails closed before probing a managed dual endpoint whose key is missing", async () => {
@@ -832,5 +972,107 @@ describe("DGX Spark existing vLLM headroom warning", () => {
         "served-model",
       ),
     ).toBeNull();
+  });
+});
+
+describe("setupNim vLLM requested serving profile", () => {
+  const profile = {
+    presetId: "vllm.dgx-spark-gb10.single.muse-glimmer-30b-nvfp4-w4a4",
+    backend: "vllm",
+    servedName: "muse-glimmer",
+    modelId: "Inferact/Muse-Glimmer-30B-NVFP4-W4A4",
+  };
+
+  it("refuses a running server that reports a different model (#9563)", async () => {
+    const validateOpenAiLikeSelection = vi.fn(async () => ({
+      ok: true as const,
+      api: "openai-completions",
+    }));
+    const handler = createSetupNimVllmHandler(
+      deps({
+        runCapture: () => JSON.stringify({ data: [{ id: "nvidia/Qwen3.6-35B-A3B-NVFP4" }] }),
+        validateOpenAiLikeSelection,
+      }),
+    );
+
+    await expect(handler(state(null), { servingProfileModel: profile })).rejects.toThrow("exit 1");
+    expect(console.error).toHaveBeenCalledWith(
+      "  Serving profile 'vllm.dgx-spark-gb10.single.muse-glimmer-30b-nvfp4-w4a4' serves " +
+        "'Inferact/Muse-Glimmer-30B-NVFP4-W4A4' as 'muse-glimmer', but vLLM on localhost:8000 " +
+        "reports 'nvidia/Qwen3.6-35B-A3B-NVFP4'.",
+    );
+    expect(console.error).toHaveBeenCalledWith(
+      "  Stop the existing vLLM server on localhost:8000, then rerun the original " +
+        "install/onboard command.",
+    );
+    expect(validateOpenAiLikeSelection).not.toHaveBeenCalled();
+  });
+
+  it("clears the exported preset in the keep-the-detected-model path (#9563)", async () => {
+    const handler = createSetupNimVllmHandler(
+      deps({
+        runCapture: () => JSON.stringify({ data: [{ id: "nvidia/Qwen3.6-35B-A3B-NVFP4" }] }),
+      }),
+    );
+
+    await expect(handler(state(null), { servingProfileModel: profile })).rejects.toThrow("exit 1");
+    expect(console.error).toHaveBeenCalledWith(
+      "    unset NEMOCLAW_SERVING_PRESET NEMOCLAW_PROVIDER",
+    );
+  });
+
+  it("names the managed endpoint rather than loopback for a managed binding (#9563)", async () => {
+    const handler = createSetupNimVllmHandler(
+      deps({
+        getManagedVllmProviderBinding: () => ({
+          baseUrl: "http://10.40.0.1:8000/v1",
+          apiKey: "a".repeat(64),
+        }),
+        queryVllmModels: () => JSON.stringify({ data: [{ id: "nvidia/Qwen3.6-35B-A3B-NVFP4" }] }),
+      }),
+    );
+
+    await expect(handler(state(null), { servingProfileModel: profile })).rejects.toThrow("exit 1");
+    expect(console.error).toHaveBeenCalledWith(
+      "  Serving profile 'vllm.dgx-spark-gb10.single.muse-glimmer-30b-nvfp4-w4a4' serves " +
+        "'Inferact/Muse-Glimmer-30B-NVFP4-W4A4' as 'muse-glimmer', but the managed vLLM endpoint " +
+        "reports 'nvidia/Qwen3.6-35B-A3B-NVFP4'.",
+    );
+    expect(console.error).toHaveBeenCalledWith(
+      "  Stop the managed vLLM deployment, then rerun the original install/onboard command.",
+    );
+  });
+
+  it("accepts the served alias the profile pins", async () => {
+    const selection = state(null);
+    const handler = createSetupNimVllmHandler(
+      deps({ runCapture: () => JSON.stringify({ data: [{ id: "muse-glimmer" }] }) }),
+    );
+
+    await expect(handler(selection, { servingProfileModel: profile })).resolves.toBe("selected");
+    expect(selection.model).toBe("muse-glimmer");
+  });
+
+  it("accepts an alias whose reported root is the model the profile declares", async () => {
+    const handler = createSetupNimVllmHandler(
+      deps({
+        runCapture: () =>
+          JSON.stringify({
+            data: [{ id: "local-alias", root: "Inferact/Muse-Glimmer-30B-NVFP4-W4A4" }],
+          }),
+      }),
+    );
+
+    await expect(handler(state(null), { servingProfileModel: profile })).resolves.toBe("selected");
+  });
+
+  it("accepts a different served model when the run requested no profile", async () => {
+    const handler = createSetupNimVllmHandler(
+      deps({
+        runCapture: () => JSON.stringify({ data: [{ id: "nvidia/Qwen3.6-35B-A3B-NVFP4" }] }),
+      }),
+    );
+
+    await expect(handler(state(null), { servingProfileModel: null })).resolves.toBe("selected");
   });
 });

@@ -3,42 +3,40 @@
 
 import path from "node:path";
 
-import { dockerListImagesFormat, dockerRmi } from "../adapters/docker";
 import { CLI_NAME } from "../cli/branding";
 import { GATEWAY_PORT } from "../core/ports";
-import { prompt as askPrompt } from "../credentials/store";
 import { formatFailedBackupItems } from "../domain/backup-failure";
-import {
-  type GarbageCollectImagesOptions,
-  normalizeGarbageCollectImagesOptions,
-} from "../domain/lifecycle/options";
-import { findOrphanedSandboxImages, parseSandboxImageRows } from "../domain/maintenance/images";
+import type { GarbageCollectImagesOptions } from "../domain/lifecycle/options";
 import {
   classifyOrphanedRegistrySandboxes,
   orphanedRegistryRemediation,
   orphanedRegistrySummary,
 } from "../domain/maintenance/orphan-detection";
-import { SANDBOX_IMAGE_REPOS } from "../domain/sandbox/image-tag";
 import { resolveGatewayName, resolveSandboxGatewayName } from "../onboard/gateway-binding";
 import { captureSandboxListWithGatewayPreflightOrExit } from "../openshell-sandbox-list";
-import { parseLiveSandboxNames, parseReadySandboxNames } from "../runtime-recovery";
 import { withSandboxMutationLock } from "../state/mcp-lifecycle-lock";
+import { enforceRemovedImmutabilityMigrationBoundary } from "../state/migrations/removed-immutability";
 import * as registry from "../state/registry";
 import * as sandboxState from "../state/sandbox";
 import { nemoclawStateRoot, resolveHome } from "../state/state-root";
 import {
-  type BackupShieldsWindowOptions,
-  openBackupShieldsWindow,
-  relockBackupShieldsWindow,
-} from "./sandbox/backup-shields-window";
+  assertNoHermesPortableHostAuthority,
+  defaultPortableStateDir,
+  withPortableHostFence,
+} from "../state/portable-uninstall-retirement";
+import { garbageCollectImagesWithoutPortableAuthority } from "./maintenance/gc";
 import * as snapshotBackup from "./sandbox/snapshot/backup-authority";
 import {
   backupStartedSandboxState,
+  createUnreachableEngineNameLookup,
   isSandboxContainerDefinitivelyAbsent,
   returnSandboxContainerToStopped,
+  startedSandboxBackupTransactionDeadline,
+  startedSandboxBackupWorkDeadline,
   type StartedForBackup,
   startStoppedSandboxContainerForBackup,
 } from "./sandbox/stopped-sandbox-backup";
+import { retainStrictPreUpgradeRecoveryState } from "./sandbox/snapshot/strict-pre-upgrade-recovery";
 
 const useColor = !process.env.NO_COLOR && !!process.stdout.isTTY;
 const trueColor =
@@ -48,6 +46,7 @@ const D = useColor ? "\x1b[2m" : "";
 const R = useColor ? "\x1b[0m" : "";
 const RD = useColor ? "\x1b[1;31m" : "";
 const YW = useColor ? "\x1b[1;33m" : "";
+const STRICT_BACKUP_POST_STOP_CLEANUP_TIMEOUT_MS = 30_000;
 
 export function shouldSkipUnreachableSandboxBackup(env: NodeJS.ProcessEnv): boolean {
   return env.NEMOCLAW_SKIP_UNREACHABLE_SANDBOX_BACKUP === "1";
@@ -57,36 +56,66 @@ export function rebuildBackupsDirectory(home: string, gatewayPort: number): stri
   return path.join(nemoclawStateRoot(home, gatewayPort), "rebuild-backups");
 }
 
-function notRunningBackupSkipMessage(name: string): string {
-  return `Skipping '${name}' (not running; start the sandbox/container and rerun '${CLI_NAME} backup-all' so NemoClaw can capture a fresh snapshot)`;
+export interface BackupAllOptions {
+  purpose?: "pre-uninstall" | "pre-upgrade";
+  requireAll?: boolean;
+  sandboxNames?: readonly string[];
+  skipUnreachable?: boolean;
 }
 
-function backupAllShieldsWindowOptions(sandboxName: string): BackupShieldsWindowOptions {
-  return {
-    operation: "backup-all",
-    reason: "auto-unlock for backup-all",
-    retryCommand: `${CLI_NAME} backup-all`,
-    shieldsUpCommand: `${CLI_NAME} ${sandboxName} shields up`,
-  };
+async function withHermesPortableMaintenanceAdmission<T>(
+  commandId: "backup-all" | "gc",
+  operation: () => Promise<T>,
+): Promise<T> {
+  const home = resolveHome();
+  return withPortableHostFence(home, async () => {
+    assertNoHermesPortableHostAuthority(defaultPortableStateDir(process.env), commandId);
+    return operation();
+  });
+}
+
+function engineUnavailableBackupSkipMessage(
+  name: string,
+  engineName: string,
+  retry: string,
+): string {
+  return `Skipping '${name}' (${engineName} is not responding, so its stopped container cannot be started; start ${engineName}, then ${retry})`;
+}
+
+function notRunningBackupSkipMessage(name: string): string {
+  return `Skipping '${name}' (not running; start the sandbox/container and rerun '${CLI_NAME} backup-all' so NemoClaw can capture a fresh complete native-home/workspace backup)`;
 }
 
 interface BackupAllSandboxAttempt {
   result: sandboxState.BackupResult | null;
   orphanManifestMessage: string | null;
-  shieldsWindowOpened: boolean;
   stoppedContainerUnavailable: boolean;
   mutationLockError?: unknown;
 }
 
-function returnStartedSandboxToStopped(
+async function returnStartedSandboxToStopped(
   sandboxName: string,
   startedForBackup: StartedForBackup,
-): Error | null {
+  transactionDeadlineMs: number | null,
+): Promise<Error | null> {
   const failureDetail =
     "could not return its container to the stopped state; the container was left running";
   const failureMessage = `Backup cleanup failed for '${sandboxName}': ${failureDetail}.`;
   try {
-    if (returnSandboxContainerToStopped(startedForBackup.containerName)) {
+    if (
+      await returnSandboxContainerToStopped(startedForBackup, {
+        ...(transactionDeadlineMs === null ? {} : { deadlineMs: transactionDeadlineMs }),
+      })
+    ) {
+      if (!registry.recordSandboxStopIntent(sandboxName, true, registry.updateSandbox)) {
+        const error = new Error(
+          `Backup cleanup failed for '${sandboxName}': the container returned to the stopped state, but NemoClaw could not retain that lifecycle intent.`,
+        );
+        console.error(
+          `  ${RD}✗${R} ${sandboxName}: backup cleanup failed (could not retain its stopped-state intent)`,
+        );
+        return error;
+      }
       console.log(`  ${D}Returned '${sandboxName}' to its stopped state.${R}`);
       return null;
     }
@@ -100,78 +129,61 @@ function returnStartedSandboxToStopped(
   }
 }
 
-function shieldsRelockError(sandboxName: string, cause?: unknown): Error {
-  const message = `Shields lockdown could not be restored for '${sandboxName}' after backup-all; aborting remaining backups.`;
-  return cause === undefined ? new Error(message) : new Error(message, { cause });
-}
-
-async function backupSandboxWithinShieldsWindow(
+async function backupSandboxWithinMutationLock(
   sandboxName: string,
   shouldStartStoppedContainer: boolean,
+  discardFailedBackup:
+    | ((result: sandboxState.BackupResult, cleanupDeadlineMs: number) => sandboxState.BackupResult)
+    | null,
   backup: (
     startedForBackup: StartedForBackup | null,
+    transactionDeadlineMs: number | null,
   ) => sandboxState.BackupResult | Promise<sandboxState.BackupResult>,
 ): Promise<BackupAllSandboxAttempt> {
-  const shieldsWindowOptions = backupAllShieldsWindowOptions(sandboxName);
   let enteredTransactionLock = false;
   try {
     return await withSandboxMutationLock(sandboxName, async () => {
       enteredTransactionLock = true;
+      enforceRemovedImmutabilityMigrationBoundary(sandboxName, {
+        allowStateRecord: true,
+      });
+      const startDeadlineMs = shouldStartStoppedContainer
+        ? startedSandboxBackupTransactionDeadline()
+        : null;
       const startedForBackup = shouldStartStoppedContainer
-        ? startStoppedSandboxContainerForBackup(sandboxName)
+        ? await startStoppedSandboxContainerForBackup(sandboxName, {
+            deadlineMs: startDeadlineMs ?? undefined,
+          })
         : null;
       if (shouldStartStoppedContainer && !startedForBackup) {
         return {
           result: null,
           orphanManifestMessage: null,
-          shieldsWindowOpened: false,
           stoppedContainerUnavailable: true,
         };
       }
       if (startedForBackup) {
         console.log(`  Starting stopped sandbox '${sandboxName}' to back it up...`);
       }
-      let window;
-      try {
-        window = openBackupShieldsWindow(sandboxName, shieldsWindowOptions);
-      } catch (error) {
-        if (!startedForBackup) throw error;
-        const cleanupError = returnStartedSandboxToStopped(sandboxName, startedForBackup);
-        if (cleanupError) {
-          throw new AggregateError(
-            [error, cleanupError],
-            `Backup setup for '${sandboxName}' failed and its started container could not be returned to the stopped state.`,
-          );
-        }
-        throw error;
-      }
-      if (!window) {
-        const cleanupError = startedForBackup
-          ? returnStartedSandboxToStopped(sandboxName, startedForBackup)
-          : null;
-        if (cleanupError) throw cleanupError;
-        return {
-          result: null,
-          orphanManifestMessage: null,
-          shieldsWindowOpened: false,
-          stoppedContainerUnavailable: false,
-        };
-      }
-
+      // Starting the container has its own bounded window. Establish the
+      // readiness/backup/cleanup transaction only after OpenShell accepts that
+      // start so lifecycle startup cannot consume the documented readiness
+      // allowance or either cleanup reserve.
+      const transactionDeadlineMs = startedForBackup
+        ? startedSandboxBackupTransactionDeadline()
+        : null;
       console.log(`  Backing up '${sandboxName}'...`);
       let result: sandboxState.BackupResult | null = null;
       let orphanManifestMessage: string | null = null;
       let backupError: unknown;
       let hasBackupError = false;
-      let relockError: Error | null = null;
       let stoppedContainerCleanupError: Error | null = null;
       try {
-        result = await backup(startedForBackup);
+        result = await backup(startedForBackup, transactionDeadlineMs);
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
-        // Preserve the narrow pre-upgrade orphan exception, but classify it inside
-        // this window so a previously locked sandbox is always relocked before the
-        // caller counts the attempt as skipped.
+        // Preserve the narrow pre-upgrade orphan exception inside the mutation
+        // transaction so cleanup completes before the caller counts the skip.
         if (/^Agent '[^']+' not found: .+\/manifest\.yaml$/.test(message)) {
           orphanManifestMessage = message;
         } else {
@@ -179,55 +191,23 @@ async function backupSandboxWithinShieldsWindow(
           hasBackupError = true;
         }
       } finally {
-        // One lifecycle transaction excludes concurrent NemoClaw destroy and
-        // recreate operations through the shields-down window, backup, and
-        // cleanup. If auto-restore expires, its deadline gate blocks new
-        // lifecycle mutations and waits for this owner. The relock path binds
-        // to the active timer token before the lifecycle lock is released.
-        try {
-          if (!relockBackupShieldsWindow(sandboxName, window, true, shieldsWindowOptions)) {
-            relockError = shieldsRelockError(sandboxName);
-          }
-        } catch (error) {
-          relockError = shieldsRelockError(sandboxName, error);
-        } finally {
-          if (startedForBackup) {
-            stoppedContainerCleanupError = returnStartedSandboxToStopped(
-              sandboxName,
-              startedForBackup,
-            );
-          }
+        if (startedForBackup) {
+          stoppedContainerCleanupError = await returnStartedSandboxToStopped(
+            sandboxName,
+            startedForBackup,
+            transactionDeadlineMs,
+          );
         }
       }
-
-      if (relockError) {
-        if (hasBackupError) {
-          throw new AggregateError(
-            [
-              backupError,
-              relockError,
-              ...(stoppedContainerCleanupError ? [stoppedContainerCleanupError] : []),
-            ],
-            `Backup for '${sandboxName}' failed and Shields lockdown could not be restored; aborting remaining backups.`,
-          );
-        }
-        if (orphanManifestMessage) {
-          throw new AggregateError(
-            [
-              new Error(orphanManifestMessage),
-              relockError,
-              ...(stoppedContainerCleanupError ? [stoppedContainerCleanupError] : []),
-            ],
-            `Backup for '${sandboxName}' encountered an orphan manifest and Shields lockdown could not be restored; aborting remaining backups.`,
-          );
-        }
-        if (stoppedContainerCleanupError) {
-          throw new AggregateError(
-            [relockError, stoppedContainerCleanupError],
-            `Shields lockdown could not be restored for '${sandboxName}' and its started container could not be returned to the stopped state; aborting remaining backups.`,
-          );
-        }
-        throw relockError;
+      // A strict snapshot can be large. Remove it only after the stopped-state
+      // restoration attempt, so filesystem cleanup cannot consume the
+      // lifecycle stop reserve. A failed restoration must not retain an unsafe
+      // extracted tree on the host.
+      if (result && !result.success && discardFailedBackup) {
+        result = discardFailedBackup(
+          result,
+          Date.now() + STRICT_BACKUP_POST_STOP_CLEANUP_TIMEOUT_MS,
+        );
       }
       if (stoppedContainerCleanupError && hasBackupError) {
         throw new AggregateError(
@@ -246,7 +226,6 @@ async function backupSandboxWithinShieldsWindow(
       return {
         result,
         orphanManifestMessage,
-        shieldsWindowOpened: true,
         stoppedContainerUnavailable: false,
       };
     });
@@ -255,7 +234,6 @@ async function backupSandboxWithinShieldsWindow(
     return {
       result: null,
       orphanManifestMessage: null,
-      shieldsWindowOpened: false,
       stoppedContainerUnavailable: false,
       mutationLockError: error,
     };
@@ -263,9 +241,20 @@ async function backupSandboxWithinShieldsWindow(
 }
 
 export async function backupAll(): Promise<void> {
+  return withHermesPortableMaintenanceAdmission("backup-all", backupAllUnderPortableHostFence);
+}
+
+export async function backupAllUnderPortableHostFence(
+  options: BackupAllOptions = {},
+): Promise<void> {
+  const selectedNames = options.sandboxNames ? new Set(options.sandboxNames) : null;
   const sandboxes = registry
     .listSandboxes()
-    .sandboxes.filter((sandbox) => !registry.isRouteOnlySandboxReservation(sandbox));
+    .sandboxes.filter(
+      (sandbox) =>
+        registry.isPublishedSandboxRegistration(sandbox) &&
+        (selectedNames === null || selectedNames.has(sandbox.name)),
+    );
   if (sandboxes.length === 0) {
     console.log("  No sandboxes registered. Nothing to back up.");
     return;
@@ -283,7 +272,11 @@ export async function backupAll(): Promise<void> {
     },
     { gatewayName: selectedGatewayName },
   );
-  const readyNames = parseReadySandboxNames(liveList.output || "");
+  const readyNames = new Set(
+    liveList.sandboxes
+      .filter((sandbox) => sandbox.readiness === "ready")
+      .map((sandbox) => sandbox.name),
+  );
   // Source-of-truth review (#6520):
   //
   // - Invalid state: a sandbox the selected gateway does not observe, whose
@@ -312,22 +305,41 @@ export async function backupAll(): Promise<void> {
   // candidate the gateway observes again reverts to a genuine strict skip.
   const orphanNames = new Set(
     classifyOrphanedRegistrySandboxes(sandboxes, {
-      observedNames: parseLiveSandboxNames(liveList.output || ""),
+      observedNames: new Set(liveList.sandboxes.map((sandbox) => sandbox.name)),
       reconnectedNames: new Set(),
       selectedGatewayName,
       resolveGatewayBinding: resolveSandboxGatewayName,
     }).map((sandbox) => sandbox.name),
   );
 
-  const skipUnreachable = shouldSkipUnreachableSandboxBackup(process.env);
-  const requireAll = process.env.NEMOCLAW_REQUIRE_ALL_SANDBOX_BACKUPS === "1";
+  const purpose = options.purpose ?? "pre-upgrade";
+  const strictRetry =
+    purpose === "pre-uninstall"
+      ? "rerun the original uninstall command"
+      : `run '${CLI_NAME} backup-all' again`;
+  const unreachableEngineName = createUnreachableEngineNameLookup();
+  const skipUnreachable =
+    options.skipUnreachable ?? shouldSkipUnreachableSandboxBackup(process.env);
+  const requireAll = options.requireAll ?? process.env.NEMOCLAW_REQUIRE_ALL_SANDBOX_BACKUPS === "1";
+  const retainPreUpgradePolicy = purpose === "pre-upgrade" && requireAll;
   let backed = 0;
   let failed = 0;
   let skipped = 0;
   let unreachableRunning = 0;
   let notRunningSkipped = 0;
+  const unavailableEngineNames = new Set<string>();
+  let unavailableEngineSkipped = 0;
   const strandedOrphans: string[] = [];
   const backupRegisteredSandbox = async (sb: (typeof sandboxes)[number]): Promise<void> => {
+    // Lock acquisition can reject entry before the stopped container path
+    // reports that this registry row has no runtime to back up.
+    // Apply the same gateway-binding + Docker-absence proof before acquiring
+    // that lock. The confirming post-loop probes below still close the race
+    // before the installer accepts the exemption.
+    if (orphanNames.has(sb.name) && isSandboxContainerDefinitivelyAbsent(sb.name)) {
+      strandedOrphans.push(sb.name);
+      return;
+    }
     // A registered docker-driver sandbox whose container is merely stopped is
     // backupable: start it for the duration of the backup and return it to
     // its stopped state after (#6500). Anything else that is not Ready keeps
@@ -336,25 +348,67 @@ export async function backupAll(): Promise<void> {
     let orphanManifestMessage: string | null = null;
     let mutationLockError: unknown;
     let mutationLockFailed = false;
-    const attempt = await backupSandboxWithinShieldsWindow(
+    const attempt = await backupSandboxWithinMutationLock(
       sb.name,
       !readyNames.has(sb.name),
-      (startedForBackup) =>
-        startedForBackup
-          ? backupStartedSandboxState(sb.name)
+      retainPreUpgradePolicy
+        ? (failedResult, cleanupDeadlineMs) =>
+            snapshotBackup.discardIncompleteBackup(
+              sb.name,
+              failedResult,
+              cleanupDeadlineMs,
+              "strict pre-upgrade",
+            )
+        : null,
+      async (startedForBackup, transactionDeadlineMs) => {
+        const backupResult = await (startedForBackup
+          ? backupStartedSandboxState(sb.name, {
+              deadlineMs: transactionDeadlineMs ?? undefined,
+              deferSanitizationDeadlineCleanup: retainPreUpgradePolicy,
+              deferCompletionPublication: retainPreUpgradePolicy,
+            })
           : snapshotBackup.backupSandboxStateWithManagedAuthority(
               sb.name,
-              {},
+              retainPreUpgradePolicy ? { deferCompletionPublication: true } : {},
               {
                 getSandbox: registry.getSandbox,
               },
-            ),
+            ));
+        return retainPreUpgradePolicy
+          ? retainStrictPreUpgradeRecoveryState(
+              sb,
+              backupResult,
+              {
+                gatewayName: resolveSandboxGatewayName(sb),
+                workspace: "default",
+              },
+              // Retention runs while a started container is still up, so it
+              // may consume only the backup share of the transaction.
+              transactionDeadlineMs === null
+                ? undefined
+                : startedSandboxBackupWorkDeadline(transactionDeadlineMs),
+            )
+          : backupResult;
+      },
     );
     if (attempt.stoppedContainerUnavailable) {
       if (orphanNames.has(sb.name) && isSandboxContainerDefinitivelyAbsent(sb.name)) {
         // Tracked separately from `skipped` so the strict gate stays
         // untripped: there is nothing to back up and nothing to start.
         strandedOrphans.push(sb.name);
+        return;
+      }
+      // Distinguish "the container is stopped" from "the engine that owns the
+      // container does not respond": only the first is fixed by starting the
+      // sandbox, so the not-running remediation must not be offered (#12749).
+      const unavailableEngineName = unreachableEngineName(sb.name);
+      if (unavailableEngineName) {
+        console.log(
+          `  ${D}${engineUnavailableBackupSkipMessage(sb.name, unavailableEngineName, strictRetry)}${R}`,
+        );
+        unavailableEngineNames.add(unavailableEngineName);
+        skipped++;
+        unavailableEngineSkipped++;
         return;
       }
       console.log(`  ${D}${notRunningBackupSkipMessage(sb.name)}${R}`);
@@ -375,11 +429,6 @@ export async function backupAll(): Promise<void> {
       failed++;
       return;
     }
-    if (!attempt.shieldsWindowOpened) {
-      console.error(`  ${RD}✗${R} ${sb.name}: backup failed (could not safely unlock shields)`);
-      failed++;
-      return;
-    }
     if (orphanManifestMessage) {
       console.log(`  ${YW}⚠${R} Skipped '${sb.name}' (orphan manifest): ${orphanManifestMessage}`);
       skipped++;
@@ -387,13 +436,23 @@ export async function backupAll(): Promise<void> {
     }
     if (!result) throw new Error(`Backup for '${sb.name}' completed without a result`);
     if (result.success) {
-      console.log(
-        `  ${G}✓${R} ${sb.name}: ${result.backedUpDirs.length} dirs, ${result.backedUpFiles.length} files → ${result.manifest?.backupPath || "unknown"}`,
-      );
+      const nativeArchive = result.manifest?.nativeState
+        ? path.join(result.manifest.backupPath, result.manifest.nativeState.archive)
+        : null;
+      const archiveCounts = result.nativeArchiveCounts;
+      const backupDescription =
+        nativeArchive && archiveCounts
+          ? `${archiveCounts.directories} dirs, ${archiveCounts.files} files → ${nativeArchive}`
+          : nativeArchive
+            ? `native state archived in ${nativeArchive} (entry counts unavailable)`
+            : `${result.backedUpDirs.length} dirs, ${result.backedUpFiles.length} files → ${result.manifest?.backupPath || "unknown"}`;
+      console.log(`  ${G}✓${R} ${sb.name}: ${backupDescription}`);
       backed++;
     } else {
       if (result.unreachable) {
-        if (skipUnreachable) {
+        // Strict mode cannot skip it, so report the failed backup instead of
+        // a skip that the strict gate would reject without guidance (#13782).
+        if (skipUnreachable && !requireAll) {
           console.log(
             `  ${YW}⚠${R} Skipped '${sb.name}' (running but SSH-unreachable; NEMOCLAW_SKIP_UNREACHABLE_SANDBOX_BACKUP=1 set). Any uncommitted state since the last successful backup will be lost.`,
           );
@@ -406,7 +465,8 @@ export async function backupAll(): Promise<void> {
         [...result.failedDirs, ...result.failedFiles],
         result.failedDirReasons,
       );
-      console.error(`  ${RD}✗${R} ${sb.name}: backup failed (${failedItems})`);
+      const failureDetail = [failedItems, result.error].filter(Boolean).join("; ");
+      console.error(`  ${RD}✗${R} ${sb.name}: backup failed (${failureDetail})`);
       failed++;
     }
   };
@@ -428,7 +488,7 @@ export async function backupAll(): Promise<void> {
       },
       { gatewayName: selectedGatewayName },
     );
-    const observedOnRecheck = parseLiveSandboxNames(confirmation.output || "");
+    const observedOnRecheck = new Set(confirmation.sandboxes.map((sandbox) => sandbox.name));
     confirmedStranded = strandedOrphans.filter(
       (name) => !observedOnRecheck.has(name) && isSandboxContainerDefinitivelyAbsent(name),
     );
@@ -440,7 +500,10 @@ export async function backupAll(): Promise<void> {
     }
   }
   console.log("");
-  console.log(`  Pre-upgrade backup: ${backed} backed up, ${failed} failed, ${skipped} skipped`);
+  const purposeLabel = purpose === "pre-uninstall" ? "Pre-uninstall" : "Pre-upgrade";
+  console.log(
+    `  ${purposeLabel} backup: ${backed} backed up, ${failed} failed, ${skipped} skipped`,
+  );
   if (backed > 0) {
     console.log(`  Backups stored in: ${rebuildBackupsDirectory(resolveHome(), GATEWAY_PORT)}`);
   }
@@ -456,8 +519,13 @@ export async function backupAll(): Promise<void> {
       );
       if (requireAll) {
         console.error(
-          `  Strict pre-upgrade backup cannot skip these sandboxes. Restore their gateway health, then run '${CLI_NAME} backup-all' again.`,
+          `  Strict ${purpose} backup cannot skip these sandboxes. Restore their gateway health, then ${strictRetry}.`,
         );
+        if (skipUnreachable) {
+          console.error(
+            `  NEMOCLAW_SKIP_UNREACHABLE_SANDBOX_BACKUP=1 applies only to a standalone '${CLI_NAME} backup-all'; it does not relax strict ${purpose} backup.`,
+          );
+        }
       } else {
         console.error(
           `  To upgrade now and recover them afterwards from their latest validated backup, re-run with NEMOCLAW_SKIP_UNREACHABLE_SANDBOX_BACKUP=1. Any uncommitted state since the last successful backup will be lost.`,
@@ -471,11 +539,24 @@ export async function backupAll(): Promise<void> {
   if (requireAll && skipped > 0) {
     console.error("");
     console.error(
-      `  Strict pre-upgrade backup requires every registered sandbox to be backed up; ${skipped} sandbox(es) were skipped.`,
+      `  Strict ${purpose} backup requires every registered sandbox to be backed up; ${skipped} sandbox(es) were skipped.`,
     );
+    if (unavailableEngineSkipped > 0) {
+      const engineLabel = [...unavailableEngineNames].sort().join(" and ");
+      const cleanupConsequence =
+        purpose === "pre-uninstall" ? " and their containers cannot be cleaned up" : "";
+      console.error(
+        `  ${unavailableEngineSkipped} skipped sandbox(es) could not be started for backup because ${engineLabel} did not respond${cleanupConsequence}.`,
+      );
+      console.error(`  Start ${engineLabel}, then ${strictRetry}.`);
+    }
     if (notRunningSkipped > 0) {
       console.error(
-        `  ${notRunningSkipped} skipped sandbox(es) were not running. Start each sandbox/container, then rerun the installer or '${CLI_NAME} backup-all'.`,
+        `  ${notRunningSkipped} skipped sandbox(es) were not running. Start each sandbox/container, then ${
+          purpose === "pre-uninstall"
+            ? "rerun the original uninstall command"
+            : `rerun the installer or '${CLI_NAME} backup-all'`
+        }.`,
       );
     }
     console.error("  Resolve each skipped sandbox using its reason above and retry.");
@@ -486,77 +567,11 @@ export async function backupAll(): Promise<void> {
 export async function garbageCollectImages(
   options: string[] | GarbageCollectImagesOptions = {},
 ): Promise<void> {
-  const normalized = normalizeGarbageCollectImagesOptions(options);
-  const dryRun = normalized.dryRun === true;
-  const skipConfirm = normalized.yes === true || normalized.force === true;
-
-  let imagesOutput = "";
-  try {
-    // Scan every sandbox image repo, not just sandbox-from; see
-    // SANDBOX_IMAGE_REPOS for why local prebuilds were missed (#6301).
-    imagesOutput = SANDBOX_IMAGE_REPOS.map((repo) =>
-      dockerListImagesFormat(repo, "{{.Repository}}:{{.Tag}}\t{{.Size}}"),
-    ).join("\n");
-  } catch {
-    console.error("  Failed to query Docker images. Is Docker running?");
-    process.exit(1);
-  }
-
-  const allImages = parseSandboxImageRows(imagesOutput);
-
-  if (allImages.length === 0) {
-    console.log("  No sandbox images found on the host.");
-    return;
-  }
-
-  const { sandboxes } = registry.listSandboxes();
-  const orphans = findOrphanedSandboxImages(allImages, sandboxes);
-
-  if (orphans.length === 0) {
-    console.log(`  All ${allImages.length} sandbox image(s) are in use. Nothing to clean up.`);
-    return;
-  }
-
-  console.log(`  Found ${orphans.length} orphaned sandbox image(s):\n`);
-  for (const img of orphans) {
-    console.log(`    ${img.tag}  ${D}(${img.size})${R}`);
-  }
-  console.log("");
-
-  if (dryRun) {
-    console.log(`  --dry-run: would remove ${orphans.length} image(s).`);
-    return;
-  }
-
-  if (!skipConfirm) {
-    const answer = await askPrompt(`  Remove ${orphans.length} orphaned image(s)? [y/N]: `);
-    if (answer.trim().toLowerCase() !== "y" && answer.trim().toLowerCase() !== "yes") {
-      console.log("  Cancelled.");
-      return;
-    }
-  }
-
-  let removed = 0;
-  let failed = 0;
-  for (const img of orphans) {
-    const rmiResult = dockerRmi(img.tag, {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-      ignoreError: true,
-      suppressOutput: true,
-    });
-    if (rmiResult.status === 0) {
-      console.log(`  ${G}✓${R} Removed ${img.tag}`);
-      removed++;
-    } else {
-      const details = `${rmiResult.stderr || rmiResult.stdout || ""}`.trim();
-      console.error(`  ${YW}⚠${R} Failed to remove ${img.tag}${details ? `: ${details}` : ""}`);
-      failed++;
-    }
-  }
-
-  console.log("");
-  if (removed > 0) console.log(`  ${G}✓${R} Removed ${removed} orphaned image(s).`);
-  if (failed > 0) console.log(`  ${YW}⚠${R} Failed to remove ${failed} image(s).`);
-  if (failed > 0) process.exit(1);
+  // Reject unsupported state before even listing host images. The same check
+  // runs again inside deletion admission after confirmation to cover changes
+  // that occur while the prompt is open.
+  assertNoHermesPortableHostAuthority(defaultPortableStateDir(process.env), "gc");
+  return garbageCollectImagesWithoutPortableAuthority(options, (operation) =>
+    withHermesPortableMaintenanceAdmission("gc", async () => await operation()),
+  );
 }

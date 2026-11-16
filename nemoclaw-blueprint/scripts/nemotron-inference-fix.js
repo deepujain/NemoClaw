@@ -45,7 +45,7 @@
 //   sandboxed chat-completions traffic until the upstream clients/providers
 //   always emit the model-specific kwargs themselves.
 //
-//   Regression proof: test/nemotron-inference-fix.test.ts covers the helper
+//   Regression proof: test/inference/managed/nemotron-inference-fix.test.ts covers the helper
 //   logic, the http/https path, and a real Node fetch/undici request to a local
 //   OpenAI-compatible endpoint. The request fails before reaching the endpoint
 //   if this wrapper leaves a stale Content-Length after injecting kwargs.
@@ -73,7 +73,7 @@
 //   Ultra path usable in the niche tool-less configuration that triggers
 //   the bug.
 //
-//   Regression proof: test/nemotron-inference-fix.test.ts covers the
+//   Regression proof: test/inference/managed/nemotron-inference-fix.test.ts covers the
 //   inject/skip branches via the http stub AND a real fetch/undici request
 //   against a local OpenAI-compatible endpoint, asserting both the injected
 //   system message and the refreshed Content-Length. The runtime model-
@@ -98,8 +98,8 @@
 //   field (the endpoint returns `reasoning_content` either way), so the field
 //   carries no behavior to preserve.
 //
-//   Scope: the `nvidia/nemotron-3-` model family when the managed
-//   `inference.local` route currently selects nvidia-prod. The image-baked
+//   Scope: the `nvidia/nemotron-3-` model family when the NemoClaw-managed
+//   route or attached OpenShell provider currently selects nvidia-prod. The image-baked
 //   NEMOCLAW_UPSTREAM_PROVIDER establishes the onboarding route; after an
 //   in-place provider switch, OpenClaw's private request marker is authoritative
 //   and this preload removes it before forwarding. Ultra, Super, and Nano all
@@ -118,7 +118,7 @@
 //   Stripping (not relocating) is correct because both accepted shapes are
 //   rejected and reasoning happens regardless of the field.
 //
-//   Regression proof: test/nemotron-inference-fix.test.ts covers the strip/
+//   Regression proof: test/inference/managed/nemotron-inference-fix.test.ts covers the strip/
 //   skip branches; the http/https/fetch transports share the same
 //   patchJsonBody path already exercised by the kwargs tests. Verified
 //   end-to-end against integrate.api.nvidia.com by replaying an Ultra request
@@ -167,7 +167,7 @@
   //
   // Scope boundary: this preload runs inside NemoClaw-managed sandboxes
   // where the chat-completions destination is the OpenShell-gateway
-  // `inference.local` route bound to NVIDIA Build. The path+model regex
+  // NVIDIA Build route. The path+model regex
   // is the intentional trust boundary; non-sandbox OpenAI-compatible
   // callers do not load this preload.
   var TOOL_LESS_SYSTEM_PROMPT_RULES = [
@@ -393,14 +393,17 @@
   function isManagedBuildHost(host, upstreamProvider) {
     return (
       isNvidiaBuildUpstream(upstreamProvider) &&
-      /^inference\.local(?::\d+)?$/i.test(String(host || ''))
+      /^(?:inference\.local(?::\d+)?|integrate\.api\.nvidia\.com(?::443)?)$/i.test(
+        String(host || ''),
+      )
     );
   }
 
   function isManagedBuildFetch(input, upstreamProvider) {
     if (!isNvidiaBuildUpstream(upstreamProvider)) return false;
     try {
-      return new URL(fetchUrl(input)).hostname.toLowerCase() === 'inference.local';
+      var hostname = new URL(fetchUrl(input)).hostname.toLowerCase();
+      return hostname === 'inference.local' || hostname === 'integrate.api.nvidia.com';
     } catch (_e) {
       return false;
     }

@@ -19,7 +19,7 @@ export const TRUSTED_HERMES_SWAP_STEP_NAME = "Provision trusted Hermes E2E swap"
 export const TRUSTED_HERMES_SWAP_STEP_ID = "trusted_hermes_swap";
 
 const TRUSTED_HERMES_SWAP_IF =
-  "github.repository == 'NVIDIA/NemoClaw' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')";
+  "github.repository == 'NVIDIA/NemoClaw' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))";
 const TRUSTED_HERMES_E2E_SELECTION = `(${selectorsForCanonicalE2eId("hermes-e2e")
   .flatMap((selector) => [
     `contains(format(',{0},', inputs.jobs), ',${selector},')`,
@@ -60,11 +60,17 @@ export const TRUSTED_HERMES_SWAP_SCRIPT = [
   "  exit 1",
   "}",
   "",
-  'if [[ "${REPOSITORY}" != "NVIDIA/NemoClaw" || "${REF}" != "refs/heads/main" ]]; then',
-  '  fail "workflow must run from NVIDIA/NemoClaw main"',
+  'if [[ "${REPOSITORY}" != "NVIDIA/NemoClaw" ]]; then',
+  '  fail "workflow must run from NVIDIA/NemoClaw"',
   "fi",
   'if [[ "${EVENT_NAME}" != "push" && "${EVENT_NAME}" != "workflow_dispatch" ]]; then',
   '  fail "workflow event must be push or workflow_dispatch"',
+  "fi",
+  'if [[ "${EVENT_NAME}" == "push" && "${REF}" != "refs/heads/main" ]]; then',
+  '  fail "push workflow must run from NVIDIA/NemoClaw main"',
+  "fi",
+  'if [[ "${EVENT_NAME}" == "workflow_dispatch" && "${REF}" != refs/heads/* ]]; then',
+  '  fail "manual workflow must run from an NVIDIA/NemoClaw branch"',
   "fi",
   "# PR E2E mode: maintainer-dispatched PR commit.",
   'if [[ "${EVENT_NAME}" == "workflow_dispatch" && -n "${CHECKOUT_SHA}" ]]; then',
@@ -222,6 +228,11 @@ const JOB_CONDITIONS = {
   "mcp-bridge": `\${{ ${TRUSTED_HERMES_SWAP_IF} && matrix.agent == 'hermes' }}`,
 } as const;
 
+const JOB_NEEDS = {
+  "hermes-e2e": ["base-image-publication", "generate-matrix", "package-openshell-sdk"],
+  "mcp-bridge": ["base-image-publication", "generate-matrix", "package-openshell-sdk"],
+} as const;
+
 function asRecord(value: unknown): WorkflowRecord {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as WorkflowRecord)
@@ -252,7 +263,7 @@ export function validateTrustedHermesSwapWorkflow(workflowValue: unknown): strin
       continue;
     }
 
-    if (job.needs !== "generate-matrix") {
+    if (!isDeepStrictEqual(job.needs, JOB_NEEDS[jobName as keyof typeof JOB_NEEDS])) {
       errors.push(`${jobName} trusted Hermes swap job must depend on controller validation`);
     }
     if (provisionSteps.length !== 1) {

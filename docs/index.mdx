@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "NVIDIA NemoClaw"
 sidebar-title: "Home"
-description: "NemoClaw is an open source reference stack for running supported AI agents more safely with guided onboarding, managed inference, policy, and lifecycle operations."
-keywords: "NemoClaw, OpenClaw, Hermes, LangChain Deep Agents Code, dcode, OpenShell, AI agents, Markdown docs, sandboxing, inference routing"
+description: "NemoClaw is an open source reference stack for running supported and qualified candidate AI agents more safely with guided onboarding, managed inference, policy, and lifecycle operations."
+keywords: "NemoClaw, OpenClaw, Hermes, LangChain Deep Agents Code, Pi coding agent, dcode, OpenShell, AI agents, Markdown docs, sandboxing, inference routing"
 layout: overview
 position: 1
 ---
@@ -32,8 +32,8 @@ import { CommandTerminal } from "./_components/CommandTerminal";
   ]}
 />
 
-NVIDIA NemoClaw is an open source reference stack for running supported AI agents more safely inside [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) sandboxes.
-NemoClaw provides guided onboarding, managed inference, network policy, managed integrations, and lifecycle operations for supported agent runtimes.
+NVIDIA NemoClaw is an open source reference stack for running supported and qualified candidate AI agents more safely inside [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) sandboxes.
+NemoClaw provides guided onboarding, managed inference, network policy, managed integrations, and lifecycle operations while keeping qualification-only candidates separate from supported agent runtimes.
 It installs OpenShell, part of NVIDIA Agent Toolkit, and applies the selected agent integration layer and versioned blueprint.
 OpenShell provides credential custody for managed inference and host-configured integration credentials.
 
@@ -50,6 +50,10 @@ It helps you choose an agent to run in an OpenShell sandbox, asks one question a
 
 ### From Your Terminal
 
+NemoClaw collects operation telemetry to help improve the project.
+Ordinary installer and supported CLI operations attempt to send telemetry about completed operations to NVIDIA's fixed Production receiver by default.
+To disable NemoClaw telemetry, run `export NEMOCLAW_DISABLE_TELEMETRY=1` in each shell before installation or CLI use.
+Refer to [Operation Telemetry](/user-guide/openclaw/security/best-practices#operation-telemetry) for details.
 Paste this command into your terminal for the default installation process.
 
 <llms-ignore>
@@ -76,6 +80,7 @@ By default, NemoClaw installs the OpenClaw agent. Use one of the following quick
 | OpenClaw (default) | [Quickstart with OpenClaw](../openclaw/get-started/quickstart) |
 | Hermes | [Quickstart with Hermes](../hermes/get-started/quickstart) |
 | LangChain Deep Agents Code | [Quickstart with Deep Agents](../deepagents/get-started/quickstart) |
+| Pi (release candidate) | [Quickstart with Pi](../pi/get-started/quickstart) |
 
 <section>
 
@@ -84,16 +89,11 @@ By default, NemoClaw installs the OpenClaw agent. Use one of the following quick
 Use NemoClaw's Markdown docs or the docs-routing skill when you want your AI coding agent to help you install or operate a sandbox.
 The assistant fetches the same pages that power this site and applies them to your local environment.
 
-<Cards>
-
-<Card title="Add NemoClaw Docs to Your Agent" href="resources/agent-skills">
-
-Give your assistant the docs entry points or optional routing skill so NemoClaw guidance is available directly in chat.
-
-<Badge intent="tip" minimal outlined>Resource</Badge>
-</Card>
-
-</Cards>
+| Agent | Resource |
+|-------|----------|
+| OpenClaw | [Add Docs to Your Agent](../openclaw/resources/agent-skills) |
+| Hermes | [Add Docs to Your Agent](../hermes/resources/agent-skills) |
+| LangChain Deep Agents Code | [Add Docs to Your Agent](../deepagents/resources/agent-skills) |
 
 </section>
 
@@ -103,16 +103,11 @@ Give your assistant the docs entry points or optional routing skill so NemoClaw 
 
 Use the following resources to explore NemoClaw end-to-end examples, showcases, and integrations.
 
-<Cards>
-
-<Card title="Explore Community Solutions" href="resources/community-contributions">
-
-Learn where to contribute third-party solutions, showcases, and integrations built with NemoClaw.
-
-<Badge intent="tip" minimal outlined>Examples</Badge>
-</Card>
-
-</Cards>
+| Agent | Resource |
+|-------|----------|
+| OpenClaw | [Community Solutions](../openclaw/resources/community-contributions) |
+| Hermes | [Community Solutions](../hermes/resources/community-contributions) |
+| LangChain Deep Agents Code | [Community Solutions](../deepagents/resources/community-contributions) |
 
 </section>
 
@@ -141,6 +136,13 @@ Read the Hermes-focused overview before launching a Hermes sandboxed agent.
 Read the Deep Agents-focused overview before launching a `dcode` sandboxed terminal agent.
 
 <Badge intent="tip" minimal outlined>Overview</Badge>
+</Card>
+
+<Card title="NemoClaw for Pi" href="../pi/get-started/quickstart">
+
+Review Pi's candidate status, initial support matrix, and terminal workflows before activation.
+
+<Badge intent="warning" minimal outlined>Release candidate</Badge>
 </Card>
 
 </Cards>

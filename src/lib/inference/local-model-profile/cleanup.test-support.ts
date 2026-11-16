@@ -40,6 +40,7 @@ function commandResult(status: number, stdout = "", stderr = ""): ContainerEngin
 
 interface EngineHarnessOptions {
   authorityId?: string;
+  containerForeign?: boolean;
   containerPresent?: boolean;
   networkPresent?: boolean;
   daemonInspectFailure?: boolean;
@@ -54,6 +55,15 @@ export function engineHarness(options: EngineHarnessOptions = {}): {
   let networkPresent = options.networkPresent ?? true;
   const capture = vi.fn((args: readonly string[]) => {
     if (args[0] === "info") return commandResult(0);
+    if (
+      args[0] === "ps" &&
+      args.includes(
+        `label=io.nvidia.nemoclaw.host-local-inference.request-transaction-sha256=${TRANSACTION_ID}`,
+      )
+    ) {
+      if (options.daemonInspectFailure) return commandResult(1, "", "daemon unavailable");
+      return commandResult(0);
+    }
     if (args[0] === "container" && args[1] === "inspect") {
       if (options.daemonInspectFailure) return commandResult(1, "", "daemon unavailable");
       if (!containerPresent) return commandResult(1, "", "No such container");
@@ -64,14 +74,16 @@ export function engineHarness(options: EngineHarnessOptions = {}): {
             Id: RUNTIME_ID,
             Name: `/${MANAGED_LLAMA_CPP_CONTAINER_NAME}`,
             Config: {
-              Labels: {
-                [MANAGED_LLAMA_CPP_OWNER_LABEL]: MANAGED_LLAMA_CPP_OWNER_VALUE,
-                "io.nvidia.nemoclaw.host-local-inference.managed": "true",
-                "io.nvidia.nemoclaw.host-local-inference.provider": "docker",
-                "io.nvidia.nemoclaw.host-local-inference.service": "llama-cpp",
-                "io.nvidia.nemoclaw.host-local-inference.spec-sha256": SPEC_SHA256,
-                "io.nvidia.nemoclaw.host-local-inference.transaction-sha256": TRANSACTION_ID,
-              },
+              Labels: options.containerForeign
+                ? {}
+                : {
+                    [MANAGED_LLAMA_CPP_OWNER_LABEL]: MANAGED_LLAMA_CPP_OWNER_VALUE,
+                    "io.nvidia.nemoclaw.host-local-inference.managed": "true",
+                    "io.nvidia.nemoclaw.host-local-inference.provider": "docker",
+                    "io.nvidia.nemoclaw.host-local-inference.service": "llama-cpp",
+                    "io.nvidia.nemoclaw.host-local-inference.spec-sha256": SPEC_SHA256,
+                    "io.nvidia.nemoclaw.host-local-inference.transaction-sha256": TRANSACTION_ID,
+                  },
             },
           },
         ]),
@@ -131,17 +143,19 @@ export function createManagedState(
     phase?: HostLocalCreateJournalPhase;
     gatewayPort?: number;
     createIntentUnixMs?: number;
+    sandboxName?: string;
+    recipeId?: string;
   } = {},
 ): void {
   const phase = options.phase ?? "finalized";
   const paths = managedLlamaCppStatePaths(homeDir, options.gatewayPort);
   reserveManagedLlamaCppOwner(paths, {
     schemaVersion: 1,
-    sandboxName: "spark-agent",
+    sandboxName: options.sandboxName ?? "spark-agent",
     catalogDigest: `sha256:${"5".repeat(64)}`,
     presetDigest: `sha256:${"6".repeat(64)}`,
     recipeDigest: `sha256:${"7".repeat(64)}`,
-    recipeId: "llama-cpp.nemotron.spark.v1",
+    recipeId: options.recipeId ?? "llama-cpp.nemotron.spark.v1",
   });
   const engineAuthority = {
     schemaVersion: 1 as const,
@@ -170,7 +184,7 @@ export function createManagedState(
       specSha256: SPEC_SHA256,
       model: {
         planDigest: `sha256:${"b".repeat(64)}`,
-        recipeId: "llama-cpp.nemotron.spark.v1",
+        recipeId: options.recipeId ?? "llama-cpp.nemotron.spark.v1",
         generation: TRANSACTION_ID,
         digest: `sha256:${"c".repeat(64)}`,
         sizeBytes: 64,

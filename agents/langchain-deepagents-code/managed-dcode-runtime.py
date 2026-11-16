@@ -22,7 +22,7 @@ from urllib.parse import urljoin, urlparse, urlsplit
 _MANAGED_STATE_DIR = Path("/sandbox/.deepagents/.state")
 _AUTH_FILE = _MANAGED_STATE_DIR / "auth.json"
 _CODEX_AUTH_FILE = _MANAGED_STATE_DIR / "chatgpt-auth.json"
-_MCP_CONFIG_FILE = Path("/sandbox/.deepagents/.nemoclaw-mcp.json")
+_MCP_CONFIG_FILE = Path("/sandbox/.deepagents/.mcp.json")
 _INFERENCE_BASE_URL_FILE = Path(
     "/usr/local/share/nemoclaw/dcode-inference-base-url"
 )
@@ -117,7 +117,7 @@ _DISPLAY_PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # Match the launchers' root-owned, image-baked proxy validator. Its deliberate
 # RFC 1123 deviation permits underscores only for controlled internal/container
 # aliases such as `proxy_name`; the cross-boundary cases in
-# test/langchain-deepagents-code-proxy-launcher.test.ts prevent validator drift.
+# test/agents/deepagents/langchain-deepagents-code-proxy-launcher.test.ts prevent validator drift.
 _MANAGED_PROXY_HOST = re.compile(r"[A-Za-z0-9._-]+")
 _MCP_SERVER_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 _MCP_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
@@ -174,10 +174,10 @@ _MANAGED_MCP_READY = False
 # SECURITY -- Source boundary: this isolated Python runtime cannot import the
 # canonical TypeScript groups in src/lib/security/secret-patterns.ts, so these
 # expressions deliberately mirror their secret-shape behavior.
-# Regression gate: test/langchain-deepagents-code-secret-pattern-parity.test.ts
+# Regression gate: test/agents/deepagents/langchain-deepagents-code-secret-pattern-parity.test.ts
 # fingerprints all canonical groups and runs one shared positive corpus through
 # both those groups and _contains_secret_shape; the Bash wrapper consumes the
-# same corpus in test/langchain-deepagents-code-image-credentials.test.ts.
+# same corpus in test/agents/deepagents/langchain-deepagents-code-image-credentials.test.ts.
 # Removal condition: delete this mirror only when the managed runtime can consume
 # the canonical patterns directly or upstream rejects these shapes before boot.
 _SECRET_PATTERNS = tuple(
@@ -231,19 +231,25 @@ def _contains_other_platform_secret(value: str, platform: str) -> bool:
 
 
 def _is_openshell_placeholder_for_name(name: str, value: str) -> bool:
+    if name == "NEMOCLAW_ATTACHED_PROVIDER_API_KEY":
+        if value != os.environ.get("NVIDIA_INFERENCE_API_KEY"):
+            return False
+        name = "NVIDIA_INFERENCE_API_KEY"
     if name == "OPENSHELL_TLS_KEY" or not _MCP_ENV_NAME.fullmatch(name):
         return False
     canonical = f"{_OPENSHELL_ENV_PLACEHOLDER_PREFIX}{name}"
-    versioned = re.fullmatch(
-        rf"{re.escape(_OPENSHELL_ENV_PLACEHOLDER_PREFIX)}v[0-9]{{1,20}}_{re.escape(name)}",
+    generation_scoped = re.fullmatch(
+        rf"{re.escape(_OPENSHELL_ENV_PLACEHOLDER_PREFIX)}(?:v[0-9]{{1,20}}|s[a-f0-9]{{64}})_{re.escape(name)}",
         value,
     )
-    return value == canonical or versioned is not None
+    return value == canonical or generation_scoped is not None
 
 
 def _is_managed_value(name: str, value: str) -> bool:
     if name == "DEEPAGENTS_CODE_OPENAI_API_KEY":
         return value == "nemoclaw-managed-inference"
+    if name == "NEMOCLAW_ATTACHED_PROVIDER_API_KEY":
+        return value == "nemoclaw-openshell-provider"
     if name == "SLACK_BOT_TOKEN":
         return bool(re.fullmatch(r"xoxb-[A-Za-z0-9_-]{10,}", value)) and not _contains_other_platform_secret(value, "slack")
     if name == "SLACK_APP_TOKEN":
@@ -460,7 +466,10 @@ def _validate_managed_mcp_entry(
     if not placeholder.startswith(_OPENSHELL_ENV_PLACEHOLDER_PREFIX):
         raise RuntimeError(f"managed MCP server {server} must use an OpenShell placeholder")
     suffix = placeholder.removeprefix(_OPENSHELL_ENV_PLACEHOLDER_PREFIX)
-    match = re.fullmatch(r"(?:v[0-9]{1,20}_)?([A-Za-z_][A-Za-z0-9_]{0,127})", suffix)
+    match = re.fullmatch(
+        r"(?:(?:v[0-9]{1,20}|s[a-f0-9]{64})_)?([A-Za-z_][A-Za-z0-9_]{0,127})",
+        suffix,
+    )
     if match is None or not _is_openshell_placeholder_for_name(match.group(1), placeholder):
         raise RuntimeError(f"managed MCP server {server} has an invalid OpenShell placeholder")
     return {
@@ -1069,6 +1078,55 @@ def managed_inference_base_url() -> str:
     return value
 
 
+def managed_inference_api_key(base_url: str) -> str:
+    """Select the non-secret credential for the validated image-owned route."""
+    parsed = urlparse(base_url)
+    host = parsed.hostname or ""
+    local_host = host in {"host.openshell.internal", "host.docker.internal"}
+    try:
+        address = ipaddress.IPv4Address(host)
+        local_host = any(address in ipaddress.IPv4Network(network) for network in (
+            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"
+        ))
+    except ipaddress.AddressValueError:
+        # Keep the host-alias result above; every other non-IPv4 name remains untrusted.
+        pass
+    upstream_provider = _managed_upstream_provider()
+    if parsed.scheme == "http" and local_host and upstream_provider in {
+        "ollama-local", "vllm-local", "llama-cpp-local", "compatible-endpoint"
+    }:
+        value = os.environ.get("NEMOCLAW_LOCAL_INFERENCE_TOKEN", "")
+        if re.fullmatch(
+            r"openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_NEMOCLAW_LOCAL_INFERENCE_TOKEN",
+            value,
+        ) is None:
+            raise RuntimeError("native local inference requires an issued OpenShell credential reference")
+        return value
+    if base_url == "https://integrate.api.nvidia.com/v1" and upstream_provider != "compatible-endpoint":
+        name = "NVIDIA_INFERENCE_API_KEY"
+        provider = "NVIDIA"
+    elif base_url == "https://openrouter.ai/api/v1" and upstream_provider in (
+        _OPENROUTER_DISPLAY_PROVIDER_ALIASES | {"compatible-endpoint"}
+    ):
+        name = (
+            "COMPATIBLE_API_KEY"
+            if upstream_provider == "compatible-endpoint"
+            else "OPENROUTER_API_KEY"
+        )
+        provider = "OpenRouter"
+    elif upstream_provider == "compatible-endpoint" and host not in {
+        "inference.local", "localhost", "127.0.0.1", "::1"
+    }:
+        name = "COMPATIBLE_API_KEY"
+        provider = "compatible endpoint"
+    else:
+        return "nemoclaw-managed-inference"
+    value = os.environ.get(name, "")
+    if not _is_openshell_placeholder_for_name(name, value):
+        raise RuntimeError(f"native {provider} inference requires an OpenShell credential placeholder")
+    return value
+
+
 def managed_fetch_proxy_url() -> str | None:
     """Return the explicit OpenShell proxy delegated to managed ``fetch_url``.
 
@@ -1485,6 +1543,13 @@ def assert_safe_runtime() -> None:
     """Reject unmanaged runtime credentials before dcode bootstraps settings."""
     _assert_safe_environment()
     _assert_safe_auth_state()
+    # Whole-home rebuild restores can retain the old native api_key_env field.
+    # Remove this alias when supported stored configs have retired that field.
+    native_placeholder = os.environ.get("NVIDIA_INFERENCE_API_KEY", "")
+    if _is_openshell_placeholder_for_name("NVIDIA_INFERENCE_API_KEY", native_placeholder):
+        os.environ["NEMOCLAW_ATTACHED_PROVIDER_API_KEY"] = native_placeholder
+    else:
+        os.environ.pop("NEMOCLAW_ATTACHED_PROVIDER_API_KEY", None)
     os.environ[_UPSTREAM_PROVIDER_ENV] = _managed_upstream_provider()
     managed_fetch_proxy_url()
     base_url = managed_inference_base_url()

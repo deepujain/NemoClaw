@@ -4,12 +4,18 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { decisionSelected, decisionUnset } from "../state/onboard-checkpoint-decision";
+import { NEMOCLAW_VLLM_GPU_DEVICE_ENV } from "../inference/vllm-models";
 import {
   CHECKPOINT_SCHEMA_VERSION,
   type CheckpointLoadResult,
   type OnboardCheckpoint,
 } from "../state/onboard-checkpoint-types";
-import { createSession, type Session, type SessionRecoveryReceipt } from "../state/onboard-session";
+import {
+  createSession,
+  normalizeSession,
+  type Session,
+  type SessionRecoveryReceipt,
+} from "../state/onboard-session";
 import type { ResumeConfigConflict } from "./resume-config";
 import {
   checkpointSandboxName,
@@ -91,6 +97,271 @@ function createDeps(
 }
 
 describe("prepareOnboardSession", () => {
+  it.each([true, false])(
+    "preserves retained router recovery metadata before fresh session replacement (fresh=%s)",
+    async (fresh) => {
+      const stored = createSession({
+        provider: "legacy-custom-router",
+        routerPid: 4242,
+        routerPort: 4100,
+        routerCredentialHash: "retained",
+      });
+      const before = structuredClone(stored);
+      const { deps, getSession } = createDeps(stored);
+      await expect(
+        prepareOnboardSession(
+          {
+            resume: false,
+            fresh,
+            requestedFromDockerfile: null,
+            requestedSandboxName: "replacement",
+            cannotPrompt: true,
+            nonInteractive: true,
+          },
+          deps,
+        ),
+      ).rejects.toThrow("Model Router has been removed");
+      expect(deps.clearSession).not.toHaveBeenCalled();
+      expect(deps.createSession).not.toHaveBeenCalled();
+      expect(deps.saveSession).not.toHaveBeenCalled();
+      expect(getSession()).toEqual(before);
+    },
+  );
+
+  it.each([true, false])(
+    "rejects legacy router resume before durable state changes (resumable=%s)",
+    async (resumable) => {
+      const stored = { ...createSession({ provider: "nvidia-router" }), resumable };
+      const before = structuredClone(stored);
+      const { deps, getSession } = createDeps(stored);
+      await expect(
+        prepareOnboardSession(
+          {
+            resume: true,
+            fresh: false,
+            requestedFromDockerfile: null,
+            requestedSandboxName: "saved",
+            cannotPrompt: true,
+            nonInteractive: true,
+          },
+          deps,
+        ),
+      ).rejects.toThrow("Model Router has been removed");
+      expect(deps.updateSession).not.toHaveBeenCalled();
+      expect(deps.applySessionRecovery).not.toHaveBeenCalled();
+      expect(deps.saveSession).not.toHaveBeenCalled();
+      expect(getSession()).toEqual(before);
+    },
+  );
+
+  it.each(["thread-opt-in", "disabled"] as const)(
+    "preserves explicit DCode %s intent across interruption before sandbox registration",
+    async (mode) => {
+      const { deps } = createDeps();
+      const input = {
+        resume: false,
+        fresh: false,
+        requestedFromDockerfile: null,
+        requestedSandboxName: "saved",
+        cannotPrompt: true,
+        nonInteractive: true,
+        requestedDcodeAutoApprovalMode: mode,
+      };
+      const fresh = await prepareOnboardSession(input, deps);
+      const persisted = normalizeSession(JSON.parse(JSON.stringify(fresh.session)));
+      const resumed = await prepareOnboardSession(
+        { ...input, resume: true, requestedDcodeAutoApprovalMode: null },
+        createDeps(persisted).deps,
+      );
+      expect(resumed.session).toMatchObject({
+        dcodeAutoApprovalMode: mode,
+        dcodeAutoApprovalRequestedExplicitly: true,
+      });
+    },
+  );
+  it("retains explicit disabled after replacing a pending thread opt-in on resume", async () => {
+    const { deps } = createDeps(
+      createSession({
+        dcodeAutoApprovalMode: "thread-opt-in",
+        dcodeAutoApprovalRequestedExplicitly: true,
+      }),
+    );
+    const input = {
+      resume: true,
+      fresh: false,
+      requestedFromDockerfile: null,
+      requestedSandboxName: "saved",
+      cannotPrompt: true,
+      nonInteractive: true,
+    };
+    const changed = await prepareOnboardSession(
+      { ...input, requestedDcodeAutoApprovalMode: "disabled" },
+      deps,
+    );
+    const persisted = normalizeSession(JSON.parse(JSON.stringify(changed.session)));
+    const resumed = await prepareOnboardSession(input, createDeps(persisted).deps);
+    expect(resumed.session).toMatchObject({
+      dcodeAutoApprovalMode: "disabled",
+      dcodeAutoApprovalRequestedExplicitly: true,
+    });
+  });
+
+  it("stops resume before side effects when saved sandbox identity is invalid (#9833)", async () => {
+    const loadSession = vi.fn((): Session | null => {
+      throw new Error(
+        "Refusing to load the onboarding session: the saved sandbox identity is invalid.",
+      );
+    });
+    const { deps } = createDeps(null, { loadSession });
+
+    await expect(
+      prepareOnboardSession(
+        {
+          resume: true,
+          fresh: false,
+          requestedFromDockerfile: null,
+          requestedSandboxName: null,
+          cannotPrompt: true,
+          nonInteractive: true,
+        },
+        deps,
+      ),
+    ).rejects.toThrow(/saved sandbox identity is invalid/u);
+
+    expect(loadSession).toHaveBeenCalledOnce();
+    expect(deps.requireHostMountRuntimeSupport).not.toHaveBeenCalled();
+    expect(deps.setOnboardBrandingAgent).not.toHaveBeenCalled();
+    expect(deps.updateSession).not.toHaveBeenCalled();
+    expect(deps.saveSession).not.toHaveBeenCalled();
+    expect(deps.clearSession).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["requested", createSession(), true],
+    ["recorded", createSession({ apfInterceptorRequested: true }), false],
+  ])(
+    "rejects %s APF selection before resumed-session effects (#9833)",
+    async (_source, initial, requested) => {
+      const { deps } = createDeps(initial);
+
+      await expect(
+        prepareOnboardSession(
+          {
+            resume: true,
+            fresh: false,
+            requestedFromDockerfile: null,
+            requestedSandboxName: null,
+            cannotPrompt: true,
+            nonInteractive: true,
+            apfInterceptorRequested: requested,
+          },
+          deps,
+        ),
+      ).rejects.toMatchObject({ code: 1 });
+
+      expect(deps.requireHostMountRuntimeSupport).not.toHaveBeenCalled();
+      expect(deps.setOnboardBrandingAgent).not.toHaveBeenCalled();
+      expect(deps.updateSession).not.toHaveBeenCalled();
+      expect(deps.saveSession).not.toHaveBeenCalled();
+      expect(deps.clearSession).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects APF sandbox recreation before fresh-session mutation (#9833)", async () => {
+    const { deps } = createDeps(createSession({ sessionId: "existing" }));
+
+    await expect(
+      prepareOnboardSession(
+        {
+          resume: false,
+          fresh: true,
+          recreateSandboxRequested: true,
+          apfInterceptorRequested: true,
+          requestedFromDockerfile: null,
+          requestedSandboxName: "alpha",
+          cannotPrompt: true,
+          nonInteractive: true,
+        },
+        deps,
+      ),
+    ).rejects.toMatchObject({ code: 1 });
+
+    expect(deps.requireHostMountRuntimeSupport).not.toHaveBeenCalled();
+    expect(deps.clearSession).not.toHaveBeenCalled();
+    expect(deps.createSession).not.toHaveBeenCalled();
+    expect(deps.saveSession).not.toHaveBeenCalled();
+  });
+
+  it("rejects APF with the Portable profile before fresh-session mutation (#9833)", async () => {
+    const { deps } = createDeps(createSession({ sessionId: "existing" }));
+
+    await expect(
+      prepareOnboardSession(
+        {
+          resume: false,
+          fresh: true,
+          apfInterceptorRequested: true,
+          checkpointProfile: "portable",
+          requestedFromDockerfile: null,
+          requestedSandboxName: "alpha",
+          cannotPrompt: true,
+          nonInteractive: true,
+        },
+        deps,
+      ),
+    ).rejects.toMatchObject({ code: 1 });
+
+    expect(deps.error).toHaveBeenCalledWith(
+      "  APF interceptor selection cannot use the Portable experimental profile.",
+    );
+    expect(deps.requireHostMountRuntimeSupport).not.toHaveBeenCalled();
+    expect(deps.clearSession).not.toHaveBeenCalled();
+    expect(deps.createSession).not.toHaveBeenCalled();
+    expect(deps.saveSession).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "preserves incomplete activation evidence with resume=%s (#11340)",
+    async (resume) => {
+      const activationEvidence = {
+        schemaVersion: 1 as const,
+        activationId: "4b5a8e18-f967-4e27-a3b2-f2cc315abe21",
+        componentId: "policy-governance",
+        lifecycleGeneration: "generation-1",
+        sandboxIdentityFingerprint: `sha256:${"b".repeat(64)}`,
+        resultClass: "ambiguous" as const,
+      };
+      const existing = createSession({
+        sessionId: "incomplete-activation",
+        externalComponentActivation: activationEvidence,
+      });
+      const { deps, getSession } = createDeps(existing);
+
+      await expect(
+        prepareOnboardSession(
+          {
+            resume,
+            fresh: !resume,
+            requestedFromDockerfile: null,
+            requestedSandboxName: "replacement",
+            cannotPrompt: true,
+            nonInteractive: true,
+          },
+          deps,
+        ),
+      ).rejects.toMatchObject({ code: "lifecycle_unsupported" });
+
+      expect(getSession()).toBe(existing);
+      expect(getSession()?.externalComponentActivation).toEqual(activationEvidence);
+      expect(deps.requireHostMountRuntimeSupport).not.toHaveBeenCalled();
+      expect(deps.updateSession).not.toHaveBeenCalled();
+      expect(deps.applySessionRecovery).not.toHaveBeenCalled();
+      expect(deps.clearSession).not.toHaveBeenCalled();
+      expect(deps.createSession).not.toHaveBeenCalled();
+      expect(deps.saveSession).not.toHaveBeenCalled();
+    },
+  );
+
   it("creates a fresh session and records the resolved Dockerfile", async () => {
     const existing = createSession({ sessionId: "old-session" });
     const { deps, getSession } = createDeps(existing);
@@ -105,6 +376,7 @@ describe("prepareOnboardSession", () => {
         nonInteractive: true,
         requestedToolDisclosure: "direct",
         requestedObservabilityEnabled: true,
+        apfInterceptorRequested: true,
         requestedHostMounts: [
           { source: "/srv/project", target: "/sandbox/project", readOnly: true },
         ],
@@ -122,6 +394,7 @@ describe("prepareOnboardSession", () => {
     expect(result.session?.toolDisclosure).toBe("direct");
     expect(result.session?.observabilityEnabled).toBe(true);
     expect(result.session?.observabilityRequestedExplicitly).toBe(true);
+    expect(result.session?.apfInterceptorRequested).toBe(true);
     expect(getSession()?.sessionId).not.toBe("old-session");
   });
 
@@ -215,6 +488,24 @@ describe("prepareOnboardSession", () => {
     );
 
     expect(result.session?.servingProfileProvenance).toEqual(SERVING_PROFILE_PROVENANCE);
+  });
+
+  it("checkpoints the managed vLLM GPU device before fresh onboarding effects", async () => {
+    vi.stubEnv(NEMOCLAW_VLLM_GPU_DEVICE_ENV, "GPU-69adb14e-820e-bfb4-0993-171e73f68504");
+    const { deps } = createDeps();
+    const result = await prepareOnboardSession(
+      {
+        resume: false,
+        fresh: false,
+        requestedFromDockerfile: null,
+        requestedSandboxName: "gpu-test",
+        cannotPrompt: true,
+        nonInteractive: true,
+      },
+      deps,
+    );
+
+    expect(result.session?.vllmGpuDevice).toBe("GPU-69adb14e-820e-bfb4-0993-171e73f68504");
   });
 
   it("checkpoints Station Express choices before managed vLLM setup", async () => {
@@ -403,34 +694,34 @@ describe("prepareOnboardSession", () => {
   it.each([
     { recorded: true, requested: false },
     { recorded: false, requested: true },
-  ])("records an explicit observability request while resuming", async ({
-    recorded,
-    requested,
-  }) => {
-    const { deps } = createDeps(
-      createSession({
-        sandboxName: "demo",
-        observabilityEnabled: recorded,
-        status: "failed",
-      }),
-    );
+  ])(
+    "records an explicit observability request while resuming",
+    async ({ recorded, requested }) => {
+      const { deps } = createDeps(
+        createSession({
+          sandboxName: "demo",
+          observabilityEnabled: recorded,
+          status: "failed",
+        }),
+      );
 
-    const result = await prepareOnboardSession(
-      {
-        resume: true,
-        fresh: false,
-        requestedFromDockerfile: null,
-        requestedSandboxName: null,
-        cannotPrompt: false,
-        nonInteractive: false,
-        requestedObservabilityEnabled: requested,
-      },
-      deps,
-    );
+      const result = await prepareOnboardSession(
+        {
+          resume: true,
+          fresh: false,
+          requestedFromDockerfile: null,
+          requestedSandboxName: null,
+          cannotPrompt: false,
+          nonInteractive: false,
+          requestedObservabilityEnabled: requested,
+        },
+        deps,
+      );
 
-    expect(result.session?.observabilityEnabled).toBe(requested);
-    expect(result.session?.observabilityRequestedExplicitly).toBe(true);
-  });
+      expect(result.session?.observabilityEnabled).toBe(requested);
+      expect(result.session?.observabilityRequestedExplicitly).toBe(true);
+    },
+  );
 
   it("records and reports resume conflicts before exiting", async () => {
     const conflict: ResumeConfigConflict = {
@@ -464,6 +755,36 @@ describe("prepareOnboardSession", () => {
       "  Run: nemoclaw onboard              # start a fresh onboarding session",
     );
     expect(deps.exitProcess).toHaveBeenCalledWith(1);
+  });
+
+  it("explains how to recover when resume newly requests an external image", async () => {
+    const conflict: ResumeConfigConflict = {
+      field: "fromImage",
+      requested: `ghcr.io/example/openclaw@sha256:${"a".repeat(64)}`,
+      recorded: null,
+    };
+    const { deps } = createDeps(createSession(), {
+      getResumeConfigConflicts: vi.fn(() => [conflict]),
+    });
+
+    await expect(
+      prepareOnboardSession(
+        {
+          resume: true,
+          fresh: false,
+          requestedFromDockerfile: null,
+          requestedFromImage: conflict.requested,
+          requestedSandboxName: null,
+          cannotPrompt: false,
+          nonInteractive: false,
+        },
+        deps,
+      ),
+    ).rejects.toThrow(ExitError);
+
+    expect(deps.error).toHaveBeenCalledWith(
+      "  Session was started without --from-image; resume without that flag or start a fresh onboarding session.",
+    );
   });
 
   it("checks requested host mounts for resume conflict without overwriting recorded state", async () => {
@@ -718,9 +1039,10 @@ describe("prepareOnboardSession", () => {
     };
     session.checkpoint = checkpoint;
     const { deps } = createDeps(session, {
-      resolveResumeCheckpoint: vi.fn(
-        (): CheckpointLoadResult => ({ status: "loaded", checkpoint }),
-      ),
+      resolveResumeCheckpoint: vi.fn((): CheckpointLoadResult => ({
+        status: "loaded",
+        checkpoint,
+      })),
     });
 
     const result = await prepareOnboardSession(

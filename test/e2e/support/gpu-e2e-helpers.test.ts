@@ -2,27 +2,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { ChildProcess, execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import type { HostCliClient } from "../fixtures/clients/host.ts";
+import { nativeLocalChatCommand } from "../fixtures/native-local-chat.ts";
+import { HostCliClient } from "../fixtures/clients/host.ts";
 import type { SandboxClient } from "../fixtures/clients/sandbox.ts";
+import { CleanupRegistry } from "../fixtures/cleanup.ts";
+import type { LifecyclePhaseFixture } from "../fixtures/phases/lifecycle.ts";
 import {
   assertAgentExecutionSucceeded,
-  buildLlamaCppCompatibilityTargetEnv,
   cleanupGpu,
+  createGpuPrivateHome,
   env,
   hasExactReadyPhase,
   ollamaCleanupScript,
+  ollamaProxyTokenFile,
   openClawModelConfigProjectionScript,
-  shouldBootstrapLlamaCppGenericGpuTarget,
+  REPO_ROOT,
+  startAttachedOllama,
+  trackGpuGatewayCleanup,
+  waitForAttachedOllama,
 } from "../live/gpu-e2e-helpers.ts";
+import * as observedChild from "../fixtures/observed-child-process.ts";
+import { startTestProgress } from "../fixtures/progress.ts";
 import {
   PROTECTED_OLLAMA_CURL_MAX_SECONDS,
   PROTECTED_OLLAMA_READY_ATTEMPTS,
@@ -162,6 +171,94 @@ const invalidExecutionProofs: Array<{
 ];
 
 describe("GPU E2E helpers", () => {
+  it.each([
+    { name: "waits through refused connections and curl timeouts", codes: [7, 28, 0], attempts: 3 },
+    { name: "stops after 20 curl timeouts", codes: [28], attempts: 20, reason: "exhausted" },
+    { name: "rejects an HTTP failure immediately", codes: [22], attempts: 1, reason: "terminal" },
+    {
+      name: "rejects a terminated probe immediately",
+      codes: [null],
+      attempts: 1,
+      reason: "terminal",
+    },
+  ])("$name during attached Ollama readiness", async ({ codes, attempts, reason }) => {
+    vi.useFakeTimers();
+    let index = 0;
+    const run = vi.fn(async () => ({
+      command: ["curl"],
+      exitCode: codes[Math.min(index++, codes.length - 1)],
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      artifacts: { stdout: "", stderr: "", result: "" },
+    }));
+    try {
+      const ready = waitForAttachedOllama(new HostCliClient({ run }), {}, "cleanup-ready");
+      const artifactName = `cleanup-ready-attempt-${String(attempts).padStart(2, "0")}`;
+      const checked = reason
+        ? expect(ready).rejects.toMatchObject({
+            reason,
+            lastAttempt: { attempt: attempts, artifactName },
+          })
+        : expect(ready).resolves.toMatchObject({
+            attempt: attempts,
+            artifactName,
+            value: { exitCode: 0 },
+          });
+      await Promise.all([checked, vi.runAllTimersAsync()]);
+      expect(run).toHaveBeenCalledTimes(attempts);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("owns the attached Ollama daemon with the supplied listener and cleanup (#11435)", async () => {
+    const progress = startTestProgress(
+      "attached Ollama helper",
+      ["start the attached daemon", "close the owned daemon"],
+      {
+        logLine: () => undefined,
+      },
+    );
+    const child = new ChildProcess();
+    const spawn = vi.spyOn(observedChild, "spawnObservedChild").mockReturnValue(child);
+    const kill = vi.spyOn(child, "kill").mockReturnValue(true);
+    const environment = { OLLAMA_HOST: "127.0.0.1:11444", OLLAMA_MODELS: "/tmp/owned-models" };
+    try {
+      const owner = startAttachedOllama(progress, environment);
+      expect(spawn).toHaveBeenCalledExactlyOnceWith(
+        "ollama",
+        ["serve"],
+        expect.objectContaining({
+          progress,
+          spawn: { cwd: REPO_ROOT, env: environment, stdio: "ignore" },
+        }),
+      );
+      expect(owner.child).toBe(child);
+      let closed = false;
+      void owner.closed.then(() => {
+        closed = true;
+      });
+      let terminated = false;
+      const termination = owner.terminate().then(() => {
+        terminated = true;
+      });
+      expect(kill).toHaveBeenCalledExactlyOnceWith("SIGTERM");
+      await Promise.resolve();
+      expect([closed, terminated]).toEqual([false, false]);
+      child.emit("close", null, "SIGTERM");
+      await termination;
+      await owner.closed;
+      expect(closed).toBe(true);
+      await owner.terminate();
+      expect(kill).toHaveBeenCalledTimes(1);
+    } finally {
+      child.emit("close", null, "SIGTERM");
+      progress.stop();
+    }
+  });
+
   it("stops the Ollama system service before cleanup completes", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "nemoclaw-ollama-cleanup-"));
     const listenerPort = await unusedLoopbackPort();
@@ -535,57 +632,109 @@ describe("GPU E2E helpers", () => {
 
   it("stops GPU setup when Ollama cleanup leaves a listener", async () => {
     const success = { exitCode: 0, stderr: "", stdout: "" };
+    const cleanupEnv = { HOME: "/private/gpu-cleanup" };
+    const cleanupOrder: string[] = [];
+    const cleanupGatewayRegistration = vi.fn(async () => {
+      cleanupOrder.push("remove gateway registration");
+    });
     const host = {
       command: async (command: string) =>
         command === "bash"
           ? { exitCode: 1, stderr: "Ollama still listens on 127.0.0.1:11434", stdout: "" }
           : success,
+      cleanupGatewayRegistration,
     } as unknown as HostCliClient;
+    const openshell = vi.fn(async () => success);
     const sandbox = {
       cleanupSandbox: async () => success,
-      openshell: async () => success,
+      openshell,
     } as unknown as SandboxClient;
-
-    await expect(cleanupGpu(host, sandbox)).rejects.toThrow(/still listens/u);
-  });
-
-  it("bootstraps the new llama.cpp target through the trusted pre-merge GPU lane", () => {
-    expect(
-      shouldBootstrapLlamaCppGenericGpuTarget({
-        NEMOCLAW_RUN_LIVE_E2E: "1",
-        NEMOCLAW_E2E_EXPECTED_SHA: "a".repeat(40),
+    const lifecycle = {
+      stopGatewayRuntime: vi.fn(async () => {
+        cleanupOrder.push("stop gateway runtime");
+        return null;
       }),
-    ).toBe(true);
-  });
+    } as unknown as LifecyclePhaseFixture;
 
-  it("keeps the Ollama GPU lane independent once the dedicated llama.cpp lane exists", () => {
-    expect(
-      shouldBootstrapLlamaCppGenericGpuTarget({
-        E2E_LLAMA_CPP_DEDICATED_LANE: "1",
-        NEMOCLAW_RUN_LIVE_E2E: "1",
-        NEMOCLAW_E2E_EXPECTED_SHA: "a".repeat(40),
-      }),
-    ).toBe(false);
-  });
-
-  it("does not bootstrap the llama.cpp target outside exact-head live E2E", () => {
-    expect(shouldBootstrapLlamaCppGenericGpuTarget({ NEMOCLAW_RUN_LIVE_E2E: "1" })).toBe(false);
-  });
-
-  it("keeps live collection enabled in the sanitized compatibility child", () => {
-    const childEnv = buildLlamaCppCompatibilityTargetEnv({
-      NEMOCLAW_E2E_CORRELATION_ID: "11111111-1111-4111-8111-111111111111",
-      NEMOCLAW_E2E_EXPECTED_SHA: "a".repeat(40),
-      NEMOCLAW_E2E_SHARD: "default",
-      NEMOCLAW_RUN_LIVE_E2E: "1",
-      UNRELATED_PARENT_VALUE: "must-not-leak",
+    await expect(cleanupGpu(host, lifecycle, sandbox, cleanupEnv)).rejects.toThrow(
+      /still listens/u,
+    );
+    expect(lifecycle.stopGatewayRuntime).toHaveBeenCalledWith({
+      env: cleanupEnv,
+      userServiceMode: "permanent",
     });
+    expect(cleanupOrder).toEqual(["stop gateway runtime", "remove gateway registration"]);
+    expect(cleanupGatewayRegistration).toHaveBeenCalledWith(
+      "nemoclaw",
+      expect.objectContaining({ artifactName: "cleanup-gateway-destroy-gpu" }),
+    );
+    expect(openshell).not.toHaveBeenCalled();
+  });
 
-    expect(childEnv.NEMOCLAW_E2E_CORRELATION_ID).toBe("11111111-1111-4111-8111-111111111111");
-    expect(childEnv.NEMOCLAW_E2E_EXPECTED_SHA).toBe("a".repeat(40));
-    expect(childEnv.NEMOCLAW_E2E_SHARD).toBe("default");
-    expect(childEnv.NEMOCLAW_RUN_LIVE_E2E).toBe("1");
-    expect(childEnv.UNRELATED_PARENT_VALUE).toBeUndefined();
+  it("stops terminal GPU gateway runtime before registration and private-state cleanup", async () => {
+    const cleanup = new CleanupRegistry();
+    const cleanupOrder: string[] = [];
+    const cleanupEnv = { HOME: "/private/export-home" };
+    const host = {
+      cleanupGatewayRegistration: vi.fn(async () => {
+        cleanupOrder.push("remove gateway registration");
+      }),
+    } as unknown as HostCliClient;
+    const lifecycle = {
+      stopGatewayRuntime: vi.fn(async () => {
+        cleanupOrder.push("stop gateway runtime");
+        return null;
+      }),
+    } as unknown as LifecyclePhaseFixture;
+
+    trackGpuGatewayCleanup(cleanup, host, lifecycle, cleanupEnv, "export-cleanup-gateway", () => {
+      cleanupOrder.push("remove private state");
+    });
+    const result = await cleanup.runAll();
+
+    expect(result.failures).toEqual([]);
+    expect(cleanupOrder).toEqual([
+      "stop gateway runtime",
+      "remove gateway registration",
+      "remove private state",
+    ]);
+    expect(lifecycle.stopGatewayRuntime).toHaveBeenCalledWith({
+      env: cleanupEnv,
+      userServiceMode: "permanent",
+    });
+    expect(host.cleanupGatewayRegistration).toHaveBeenCalledWith(
+      "nemoclaw",
+      expect.objectContaining({ artifactName: "export-cleanup-gateway", env: cleanupEnv }),
+    );
+  });
+
+  it("preserves retryable GPU gateway state when runtime cleanup fails", async () => {
+    const cleanup = new CleanupRegistry();
+    const cleanupEnv = { HOME: "/private/export-home" };
+    const cleanupGatewayRegistration = vi.fn(async () => undefined);
+    const removePrivateState = vi.fn(() => undefined);
+    const host = { cleanupGatewayRegistration } as unknown as HostCliClient;
+    const lifecycle = {
+      stopGatewayRuntime: vi.fn(async () => {
+        throw new Error("gateway runtime stop failed");
+      }),
+    } as unknown as LifecyclePhaseFixture;
+
+    trackGpuGatewayCleanup(
+      cleanup,
+      host,
+      lifecycle,
+      cleanupEnv,
+      "export-cleanup-gateway",
+      removePrivateState,
+    );
+    const result = await cleanup.runAll();
+
+    expect(result.failures).toEqual([
+      expect.objectContaining({ message: "gateway runtime stop failed" }),
+    ]);
+    expect(cleanupGatewayRegistration).not.toHaveBeenCalled();
+    expect(removePrivateState).not.toHaveBeenCalled();
   });
 
   it("forwards the workflow-owned Ollama model pull timeout", () => {
@@ -604,6 +753,29 @@ describe("GPU E2E helpers", () => {
 
   it("honors the workflow-owned GPU model", () => {
     expect(env({}, { NEMOCLAW_MODEL: "workflow/model" }).NEMOCLAW_MODEL).toBe("workflow/model");
+  });
+
+  it("keeps the export scenario's selected model over the workflow default (#11857)", () => {
+    expect(
+      env({ NEMOCLAW_MODEL: "qwen2.5:0.5b" }, { NEMOCLAW_MODEL: GPU_MODEL }).NEMOCLAW_MODEL,
+    ).toBe("qwen2.5:0.5b");
+  });
+
+  it("resolves the proxy token from the export scenario's private home", () => {
+    expect(ollamaProxyTokenFile("/private/export-home")).toBe(
+      "/private/export-home/.nemoclaw/ollama-proxy-token",
+    );
+  });
+
+  it("creates isolated GPU state beneath the account home", () => {
+    const accountHome = mkdtempSync(path.join(tmpdir(), "nemoclaw-gpu-account-home-"));
+    try {
+      const privateHome = createGpuPrivateHome(accountHome);
+      expect(path.dirname(privateHome)).toBe(accountHome);
+      expect(path.basename(privateHome)).toMatch(/^\.nemoclaw-gpu-e2e-/u);
+    } finally {
+      rmSync(accountHome, { recursive: true, force: true });
+    }
   });
 
   it("forwards the workflow-owned trace directory through availability probes", () => {
@@ -629,7 +801,7 @@ describe("GPU E2E helpers", () => {
     expect(hasExactReadyPhase(output)).toBe(false);
   });
 
-  it("accepts successful execution proof when the model suppresses visible text", () => {
+  it("accepts recovery proof from successful execution metadata (#10973)", () => {
     expect(() =>
       assertAgentExecutionSucceeded(agentOutput(), "inference", GPU_MODEL),
     ).not.toThrow();
@@ -681,5 +853,71 @@ describe("GPU E2E helpers", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("GPU native local chat command", () => {
+  const endpointUrl = "http://host.openshell.internal:11435/v1";
+  const body = JSON.stringify({ model: GPU_MODEL, messages: [{ role: "user", content: "hi" }] });
+
+  function runWithRecordingCurl(token: string, curlFlags: "-fsS" | "-sS", requestBody = body) {
+    const root = mkdtempSync(path.join(tmpdir(), "gpu-native-chat-"));
+    try {
+      const bin = path.join(root, "bin");
+      mkdirSync(bin);
+      writeShellCommands(bin, [["curl", 'for arg in "$@"; do printf "%s\\n" "$arg"; done\n']]);
+      try {
+        const stdout = execFileSync(
+          "sh",
+          ["-c", nativeLocalChatCommand(endpointUrl, requestBody, curlFlags)],
+          {
+            ...SYNC_E2E_CHILD_OPTIONS,
+            encoding: "utf8",
+            env: {
+              PATH: `${bin}:${process.env.PATH ?? ""}`,
+              NEMOCLAW_LOCAL_INFERENCE_TOKEN: token,
+            },
+          },
+        );
+        return { status: 0, args: stdout.split("\n").filter(Boolean) };
+      } catch (error) {
+        return { status: (error as { status?: number }).status, args: [] as string[] };
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  it("sends the OpenShell-issued handle to the recorded endpoint", () => {
+    const handle = "openshell:resolve:env:v7_NEMOCLAW_LOCAL_INFERENCE_TOKEN";
+    expect(runWithRecordingCurl(handle, "-fsS")).toEqual({
+      status: 0,
+      args: [
+        "-fsS",
+        "--max-time",
+        "120",
+        `${endpointUrl}/chat/completions`,
+        "-H",
+        `Authorization: Bearer ${handle}`,
+        "-H",
+        "Content-Type: application/json",
+        "--data",
+        body,
+      ],
+    });
+    expect(runWithRecordingCurl(handle, "-sS").args[0]).toBe("-sS");
+  });
+
+  it("refuses a raw or missing credential before calling curl", () => {
+    expect(runWithRecordingCurl("raw-proxy-token-value", "-fsS")).toEqual({ status: 2, args: [] });
+    expect(runWithRecordingCurl("", "-fsS")).toEqual({ status: 2, args: [] });
+  });
+
+  it("keeps request data with shell syntax as one curl argument", () => {
+    const handle = "openshell:resolve:env:v7_NEMOCLAW_LOCAL_INFERENCE_TOKEN";
+    const hostileBody = JSON.stringify({ model: "x'; echo injected; '$(echo also)", messages: [] });
+    const result = runWithRecordingCurl(handle, "-fsS", hostileBody);
+    expect(result.status).toBe(0);
+    expect(result.args.slice(-2)).toEqual(["--data", hostileBody]);
   });
 });

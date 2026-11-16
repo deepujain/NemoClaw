@@ -8,6 +8,9 @@
 
 import { describe, expect, it, vi } from "vitest";
 
+import { PORTABLE_HOST_GATEWAY_IP } from "./experimental/portable-profile";
+import { prepareNativePodmanGatewayHostRuntime } from "./runtime-provider/podman-runtime-surfaces";
+
 // Mock the docker adapter so the test never loads runner.ts (which requires
 // the compiled ./platform artifact unavailable in the test environment).
 vi.mock("../adapters/docker/run", () => ({
@@ -86,6 +89,29 @@ describe("probeHostServiceSandboxReachability", () => {
     expect(capturedArgs).toContain("4000");
   });
 
+  it("uses the configured Docker network when networkName is omitted (#9461)", async () => {
+    vi.stubEnv("OPENSHELL_DOCKER_NETWORK_NAME", "portable-custom");
+    const inspectNetworkImpl = vi.fn(() => makeNetwork());
+    let capturedArgs: readonly string[] = [];
+
+    const result = await probeHostServiceSandboxReachability({
+      port: 4000,
+      inspectNetworkImpl,
+      usesHostGatewayRouteImpl: () => false,
+      runImpl: (args) => {
+        capturedArgs = args;
+        return { status: 0 };
+      },
+    });
+
+    expect(inspectNetworkImpl).toHaveBeenCalledWith("portable-custom");
+    const networkIndex = capturedArgs.indexOf("--network");
+    expect(networkIndex).toBeGreaterThanOrEqual(0);
+    expect(capturedArgs[networkIndex + 1]).toBe("portable-custom");
+    expect(result.ok).toBe(true);
+    expect(result.networkName).toBe("portable-custom");
+  });
+
   it("routes portable profile probes through the sandbox host gateway", async () => {
     vi.stubEnv("NEMOCLAW_EXPERIMENTAL_PROFILE", "portable");
     vi.spyOn(process, "platform", "get").mockReturnValue("linux");
@@ -101,8 +127,43 @@ describe("probeHostServiceSandboxReachability", () => {
     });
 
     expect(result).toMatchObject({ ok: true, reason: "ok" });
-    expect(capturedArgs).toContain("host.openshell.internal:169.254.1.2");
+    expect(capturedArgs).toContain(`host.openshell.internal:${PORTABLE_HOST_GATEWAY_IP}`);
     expect(capturedArgs).not.toContain("host.openshell.internal:host-gateway");
+    expect(capturedArgs).not.toContain("host.openshell.internal:10.89.0.1");
+  });
+
+  it("routes native Podman probes through the sandbox host gateway", async () => {
+    let capturedArgs: readonly string[] = [];
+    const inspect = vi.fn(() => ({ subnet: "10.89.0.0/24", gatewayIp: "10.89.0.1" }));
+    const run = vi.fn((args: readonly string[]) => {
+      capturedArgs = args;
+      return { status: 0 };
+    });
+    const gatewayRuntime = {
+      ...prepareNativePodmanGatewayHostRuntime({
+        environment: {},
+        platform: "linux",
+        socketPath: "/run/user/1000/podman/podman.sock",
+      }),
+      network: {
+        sandboxSourceCidrs: () => ["10.89.0.0/24"],
+        inspect,
+        usesHostGatewayRoute: vi.fn(() => false),
+        run,
+        ensureProbeImageCached: vi.fn(() => ({ ok: true, alreadyCached: true })),
+      },
+    };
+
+    const result = await probeHostServiceSandboxReachability({
+      gatewayRuntime,
+      platform: "linux",
+      port: 11435,
+    });
+
+    expect(result).toMatchObject({ ok: true, reason: "ok" });
+    expect(inspect).toHaveBeenCalledWith("openshell-docker");
+    expect(run).toHaveBeenCalledOnce();
+    expect(capturedArgs).toContain(`host.openshell.internal:${PORTABLE_HOST_GATEWAY_IP}`);
     expect(capturedArgs).not.toContain("host.openshell.internal:10.89.0.1");
   });
 
@@ -151,26 +212,26 @@ describe("formatHostServiceUnreachableMessage", () => {
     expect(msg).toContain("nemoclaw onboard");
   });
 
-  it.each([
-    "nemohermes",
-    "nemo-deepagents",
-  ])("uses the invoked %s CLI in the recovery command (#8712)", (invokedAs) => {
-    vi.stubEnv("NEMOCLAW_INVOKED_AS", invokedAs);
+  it.each(["nemohermes", "nemo-deepagents"])(
+    "uses the invoked %s CLI in the recovery command (#8712)",
+    (invokedAs) => {
+      vi.stubEnv("NEMOCLAW_INVOKED_AS", invokedAs);
 
-    const msg = formatHostServiceUnreachableMessage(
-      {
-        ok: false,
-        reason: "tcp_failed",
-        port: 8081,
-        networkName: "openshell-docker",
-        subnet: "172.18.0.0/16",
-        gatewayIp: "172.18.0.1",
-      },
-      { serviceLabel: "managed llama.cpp server" },
-    );
+      const msg = formatHostServiceUnreachableMessage(
+        {
+          ok: false,
+          reason: "tcp_failed",
+          port: 8081,
+          networkName: "openshell-docker",
+          subnet: "172.18.0.0/16",
+          gatewayIp: "172.18.0.1",
+        },
+        { serviceLabel: "managed llama.cpp server" },
+      );
 
-    expect(msg).toContain(`Then rerun \`${invokedAs} onboard\`.`);
-  });
+      expect(msg).toContain(`Then rerun \`${invokedAs} onboard\`.`);
+    },
+  );
 
   it("falls back to result.port when no explicit port option is given", () => {
     const msg = formatHostServiceUnreachableMessage(

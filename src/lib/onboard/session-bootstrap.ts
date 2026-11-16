@@ -1,9 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { rejectRetiredModelRouterSession } from "../inference/provider-key/contract";
+import {
+  finishTelemetryOperation,
+  isTelemetryOperationActive,
+  recordTelemetryTarget,
+} from "../actions/telemetry/operation";
+import path from "node:path";
+
+import { normalizeProcessExitCode } from "../core/process-exit";
 import type { ServingProfileProvenance } from "../inference/serving/types";
+import { NEMOCLAW_VLLM_GPU_DEVICE_ENV, parseVllmGpuDevice } from "../inference/vllm-models";
 import { PERSONAL_POLICY_TIER_NAME } from "../policy/tiers";
-import { redactSensitiveText } from "../security/redact";
+export {
+  isTrustedOnboardError,
+  redactOnboardError,
+  redactOnboardErrorText,
+  redactOnboardDiagnosticText,
+  redactOnboardCommandDiagnosticText,
+  sanitizeOnboardFailure,
+} from "./diagnostics/redaction";
 import { isDecisionSelected } from "../state/onboard-checkpoint-decision";
 import {
   deriveCheckpointFromSession,
@@ -16,6 +33,7 @@ import type {
   CheckpointPortableRuntimeAuthority,
 } from "../state/onboard-checkpoint-types";
 import type { Session } from "../state/onboard-session";
+import type { SandboxEntry } from "../state/registry/types";
 import {
   DEFAULT_TOOL_DISCLOSURE,
   TOOL_DISCLOSURE_ENV,
@@ -24,8 +42,10 @@ import {
 import { recordCheckpointSandboxIdentity } from "./checkpoint-record";
 import { checkpointProvesSandboxStepComplete } from "./checkpoint-replay";
 import { EXPERIMENTAL_PROFILE_ENV } from "./docker-driver-platform";
+import { assertNoIncompleteExternalComponentActivation } from "./external-component/onboarding";
 import type { PortableInferenceActivation } from "./experimental/portable-inference-descriptor";
 import { requireReadOnlyHostMountRuntimeSupport } from "./host-mount";
+import { type DcodeAutoApprovalMode, isDcodeAutoApprovalMode } from "./dcode-auto-approval";
 import type { ResumeConfigConflict } from "./resume-config";
 import type { StationExpressResumeIntent } from "./station-express-resume";
 import { ensureRequiredTierPolicyPresets } from "./policy-tier-suppression";
@@ -55,6 +75,14 @@ export {
   type OnboardResumeIntentSnapshot,
   type ResolvedOnboardResumeIntent,
 };
+
+/** Expected onboarding refusal when selected restore authority changes. */
+export class OnboardRestoreSnapshotDriftError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OnboardRestoreSnapshotDriftError";
+  }
+}
 
 export function resolveOnboardResumeIntent(options: {
   readonly explicitResume: boolean;
@@ -116,8 +144,17 @@ interface PreviousEnvironmentValue {
 
 export interface PortableOnboardEnvironmentScope {
   readonly env: NodeJS.ProcessEnv;
+  createHermesPortablePodmanSourceEnvironment(
+    runtimeAuthority: CheckpointPortableRuntimeAuthority,
+  ): NodeJS.ProcessEnv;
   installRuntime(input: { containersConf: string; socketPath: string }): void;
   restore(): void;
+}
+
+/** Keep one prepared portable runtime authority with the environment scope that installed it. */
+export interface PortableOnboardRuntimeContext {
+  readonly authority: CheckpointPortableRuntimeAuthority;
+  readonly environmentScope: PortableOnboardEnvironmentScope | null;
 }
 
 export function createDefaultResumeProfileEnvironmentScope(
@@ -129,6 +166,9 @@ export function createDefaultResumeProfileEnvironmentScope(
   let restored = false;
   return {
     env,
+    createHermesPortablePodmanSourceEnvironment() {
+      throw new Error("Default onboarding has no portable Podman environment authority.");
+    },
     installRuntime() {
       throw new Error("Default onboarding resume cannot install portable runtime authority.");
     },
@@ -146,11 +186,13 @@ const ONBOARD_DEFERRED_EXIT_ERROR = Symbol.for("nemoclaw.onboard.deferred-exit-e
 export class OnboardDeferredExitError extends Error {
   readonly [ONBOARD_DEFERRED_EXIT_ERROR] = true;
   readonly code: number;
+  readonly preserveIncompleteSession: boolean;
 
-  constructor(code: number) {
+  constructor(code: number, options: { preserveIncompleteSession?: boolean } = {}) {
     super(`Onboarding requested exit ${String(code)}.`);
     this.name = "OnboardDeferredExitError";
     this.code = code;
+    this.preserveIncompleteSession = options.preserveIncompleteSession === true;
   }
 }
 
@@ -167,6 +209,132 @@ export function isOnboardDeferredExitError(error: unknown): error is OnboardDefe
   );
 }
 
+export function shouldPreserveIncompleteOnboardSession(error: unknown): boolean {
+  return isOnboardDeferredExitError(error) && error.preserveIncompleteSession;
+}
+
+/** Preserve completed archive restoration metadata before a later onboarding phase can fail. */
+export async function preserveRestoredModelSelections(
+  sandboxName: string,
+  gatewayName: string,
+  previous: SandboxEntry,
+): Promise<void> {
+  if (!isTelemetryOperationActive()) return;
+  let metadataErrors: NonNullable<Parameters<typeof recordTelemetryTarget>[0]["metadataErrors"]> = [
+    { category: "model_source" },
+  ];
+  try {
+    const { verifySelectedAgentsManifest } =
+      await import("../actions/sandbox/agents/telemetry-verification");
+    const selection = await verifySelectedAgentsManifest(
+      sandboxName,
+      { kind: "named", gatewayName },
+      previous,
+      true,
+    );
+    if (selection.status === "reported") return;
+    metadataErrors = selection.metadataErrors ?? metadataErrors;
+  } catch {
+    // A metadata failure never changes successful native archive restoration.
+  }
+  recordTelemetryTarget({
+    scope: "sandbox",
+    sandboxName,
+    gatewayName,
+    outcome: "completed",
+    state: "applied",
+    verificationStatus: "collection_error",
+    metadataErrors,
+  });
+}
+
+/** Record onboarding only after its native finalization and outer cleanup complete. */
+export function createOnboardOperationCompletion(options: {
+  sandboxName?: string;
+  pending: boolean;
+  getSandbox(name: string): { configurationApplyPending?: true } | null;
+  updateSandbox(name: string, update: { configurationApplyPending?: undefined }): boolean;
+}) {
+  let metadataComplete = true;
+  let modelSelectionVerified = true;
+  let previousEntries: Record<string, SandboxEntry> = {};
+  const metadataErrors: NonNullable<Parameters<typeof recordTelemetryTarget>[0]["metadataErrors"]> =
+    [];
+  let cancelled = false;
+  let failed = false;
+  return {
+    sandboxName: options.sandboxName,
+    captureExisting(readEntries: () => Record<string, SandboxEntry>): void {
+      if (!isTelemetryOperationActive()) return;
+      try {
+        previousEntries = structuredClone(readEntries());
+      } catch {
+        metadataComplete = false;
+      }
+    },
+    async accept(completed: boolean): Promise<void> {
+      if (!completed || options.pending || !this.sandboxName) return;
+      try {
+        if (isTelemetryOperationActive()) {
+          const { verifySelectedAgentsManifest } =
+            await import("../actions/sandbox/agents/telemetry-verification");
+          const selection = await verifySelectedAgentsManifest(
+            this.sandboxName,
+            undefined,
+            previousEntries[this.sandboxName],
+          );
+          metadataErrors.push(...(selection.metadataErrors ?? []));
+          modelSelectionVerified = selection.verified;
+          metadataComplete &&= selection.status !== "collection_error";
+        }
+        if (
+          modelSelectionVerified &&
+          options.getSandbox(this.sandboxName)?.configurationApplyPending === true
+        ) {
+          let cleared = false;
+          try {
+            cleared = options.updateSandbox(this.sandboxName, {
+              configurationApplyPending: undefined,
+            });
+          } catch {
+            /* Native completion remains valid when optional metadata cannot be saved. */
+          }
+          if (!cleared) {
+            metadataComplete = false;
+            metadataErrors.push({ category: "configuration_apply_state" });
+          }
+        }
+      } catch {
+        metadataComplete = false;
+      }
+    },
+    reject(error: unknown): void {
+      cancelled = isOnboardDeferredExitError(error) && error.code === 0;
+      failed = !cancelled;
+    },
+    record(completed: boolean, gatewayName: string): void {
+      const completedNative = completed && !failed;
+      const accepted = completedNative && modelSelectionVerified;
+      let outcome: Parameters<typeof recordTelemetryTarget>[0]["outcome"] = "failed";
+      if (accepted) outcome = "completed";
+      else if (completedNative) outcome = "unverified";
+      else if (cancelled) outcome = "cancelled";
+      let state: Parameters<typeof recordTelemetryTarget>[0]["state"] = "partial";
+      if (accepted) state = options.pending ? "pending" : "applied";
+      else if (cancelled) state = "unchanged";
+      recordTelemetryTarget({
+        scope: "sandbox",
+        sandboxName: this.sandboxName,
+        gatewayName,
+        outcome,
+        state,
+        verificationStatus: metadataComplete ? "reported" : "collection_error",
+        ...(metadataErrors.length ? { metadataErrors } : {}),
+      });
+    },
+  };
+}
+
 interface DeferredExitOptions {
   readonly deferProcessExit?: boolean;
 }
@@ -178,8 +346,8 @@ export function wrapOnboardDeferredExit<TOptions extends DeferredExitOptions>(
     const resolvedOptions = options ?? ({} as TOptions);
     const originalProcessExit = process.exit;
     let deferredExit: OnboardDeferredExitError | null = null;
-    process.exit = ((code?: number): never => {
-      throw new OnboardDeferredExitError(code ?? 0);
+    process.exit = ((code?: number | string | null): never => {
+      throw new OnboardDeferredExitError(normalizeProcessExitCode(code));
     }) as typeof process.exit;
     try {
       await run(resolvedOptions);
@@ -191,19 +359,32 @@ export function wrapOnboardDeferredExit<TOptions extends DeferredExitOptions>(
     }
     if (!deferredExit) return;
     if (resolvedOptions.deferProcessExit === true) throw deferredExit;
+    await finishTelemetryOperation(deferredExit.code);
     originalProcessExit(deferredExit.code);
   };
 }
 
-export function redactOnboardDiagnosticText(message: string): string {
-  return redactSensitiveText(message) ?? "";
+/** Reject conflicting fresh provider intent without changing the caller environment. */
+export function assertPortableOnboardProviderIntent(
+  env: NodeJS.ProcessEnv,
+  activation: PortableInferenceActivation | null,
+  options: { readonly resume?: boolean } = {},
+): void {
+  const requestedProvider = env.NEMOCLAW_PROVIDER?.trim();
+  if (!options.resume && !activation && requestedProvider && requestedProvider !== "ollama") {
+    throw new Error(
+      "Portable onboarding uses Ollama. Set NEMOCLAW_PROVIDER=ollama and choose an Ollama model, or remove --experimental-profile portable to use another provider.",
+    );
+  }
 }
 
+/** Scope Portable environment changes while preserving activation and checkpoint authority. */
 export function createPortableOnboardEnvironmentScope(
   env: NodeJS.ProcessEnv,
   activation: PortableInferenceActivation | null,
   options: { readonly resume?: boolean } = {},
 ): PortableOnboardEnvironmentScope {
+  assertPortableOnboardProviderIntent(env, activation, options);
   const previous = new Map<string, PreviousEnvironmentValue>();
   for (const key of PORTABLE_OWNED_ENV_KEYS) {
     previous.set(key, {
@@ -247,13 +428,40 @@ export function createPortableOnboardEnvironmentScope(
     }
   }
 
+  let installedRuntime: { readonly containersConf: string; readonly dockerHost: string } | null =
+    null;
   let restored = false;
   return {
     env,
+    createHermesPortablePodmanSourceEnvironment(runtimeAuthority) {
+      if (restored || !installedRuntime) {
+        throw new Error("Hermes portable Podman environment authority is not active.");
+      }
+      const expectedContainersConf = path.join(
+        runtimeAuthority.configHome,
+        "nemoclaw",
+        "portable",
+        "containers.conf",
+      );
+      const expectedDockerHost = `unix://${runtimeAuthority.socketPath}`;
+      if (
+        installedRuntime.containersConf !== expectedContainersConf ||
+        installedRuntime.dockerHost !== expectedDockerHost
+      ) {
+        throw new Error("Hermes portable Podman environment disagrees with runtime authority.");
+      }
+      const source = { ...env };
+      if (source.CONTAINERS_CONF === installedRuntime.containersConf) {
+        delete source.CONTAINERS_CONF;
+      }
+      if (source.DOCKER_HOST === installedRuntime.dockerHost) delete source.DOCKER_HOST;
+      return source;
+    },
     installRuntime({ containersConf, socketPath }) {
       env.NETAVARK_FW = "iptables";
       env.CONTAINERS_CONF = containersConf;
       env.DOCKER_HOST = `unix://${socketPath}`;
+      installedRuntime = { containersConf, dockerHost: env.DOCKER_HOST };
     },
     restore() {
       if (restored) return;
@@ -269,7 +477,9 @@ export function createPortableOnboardEnvironmentScope(
 export interface OnboardSessionBootstrapInput {
   resume: boolean;
   fresh: boolean;
+  recreateSandboxRequested?: boolean;
   requestedFromDockerfile: string | null;
+  requestedFromImage?: string | null;
   requestedSandboxName: string | null;
   cannotPrompt: boolean;
   nonInteractive: boolean;
@@ -278,6 +488,8 @@ export interface OnboardSessionBootstrapInput {
   envAgent?: string | null;
   requestedToolDisclosure?: ToolDisclosure | null;
   requestedObservabilityEnabled?: boolean | null;
+  requestedDcodeAutoApprovalMode?: DcodeAutoApprovalMode | null;
+  apfInterceptorRequested?: boolean | null;
   stationExpressIntent?: StationExpressResumeIntent | null;
   requestedHostMounts?: readonly import("../state/registry/types").SandboxHostMount[];
   servingProfileProvenance?: ServingProfileProvenance | null;
@@ -298,6 +510,7 @@ export interface OnboardSessionBootstrapDeps {
     opts: {
       nonInteractive?: boolean;
       fromDockerfile?: string | null;
+      fromImage?: string | null;
       sandboxName?: string | null;
       agent?: string | null;
       toolDisclosure?: ToolDisclosure | null;
@@ -321,6 +534,7 @@ export interface OnboardSessionBootstrapDeps {
 export interface OnboardSessionBootstrapResult {
   session: Session | null;
   fromDockerfile: string | null;
+  fromImage?: string | null;
 }
 
 export const defaultResolveResumeCheckpoint: () => CheckpointLoadResult = loadResumeCheckpoint;
@@ -393,6 +607,23 @@ function reportLegacyResumeCheckpoint(deps: OnboardSessionBootstrapDeps): never 
   deps.exitProcess(1);
 }
 
+function reportUnsupportedApfLifecycle(
+  reason: "resume" | "recreate" | "portable",
+  deps: OnboardSessionBootstrapDeps,
+): never {
+  deps.error(
+    reason === "resume"
+      ? "  APF interceptor selection cannot resume an onboarding session."
+      : reason === "recreate"
+        ? "  APF interceptor selection cannot recreate a sandbox."
+        : "  APF interceptor selection cannot use the Portable experimental profile.",
+  );
+  deps.error(
+    `  Start a new sandbox with a new name: ${deps.cliName()} onboard --fresh --apf-interceptor --name <sandbox>`,
+  );
+  deps.exitProcess(1);
+}
+
 function guardResumeCheckpoint(deps: OnboardSessionBootstrapDeps): void {
   const result = deps.resolveResumeCheckpoint();
   if (result?.status === "unsupported_future") {
@@ -434,6 +665,22 @@ function reportResumeConflict(
     } else {
       deps.error(
         `  Session was started with --from '${conflict.recorded}', not '${conflict.requested}'.`,
+      );
+    }
+    return;
+  }
+  if (conflict.field === "fromImage") {
+    if (!conflict.recorded) {
+      deps.error(
+        "  Session was started without --from-image; resume without that flag or start a fresh onboarding session.",
+      );
+    } else if (!conflict.requested) {
+      deps.error(
+        `  Session was started with --from-image '${conflict.recorded}'; rerun with that reference to resume it.`,
+      );
+    } else {
+      deps.error(
+        `  Session was started with --from-image '${conflict.recorded}', not '${conflict.requested}'.`,
       );
     }
     return;
@@ -495,6 +742,11 @@ async function prepareResumeSession(
   deps: OnboardSessionBootstrapDeps,
 ): Promise<OnboardSessionBootstrapResult> {
   let session = deps.loadSession();
+  rejectRetiredModelRouterSession(session);
+  assertNoIncompleteExternalComponentActivation(session);
+  if (input.apfInterceptorRequested === true || session?.apfInterceptorRequested === true) {
+    reportUnsupportedApfLifecycle("resume", deps);
+  }
   deps.requireHostMountRuntimeSupport(
     input.requestedHostMounts?.length ? input.requestedHostMounts : session?.metadata?.hostMounts,
     input.checkpointProfile,
@@ -511,9 +763,11 @@ async function prepareResumeSession(
     : sessionFrom
       ? deps.resolvePath(sessionFrom)
       : null;
+  const fromImage = input.requestedFromImage || session.metadata?.fromImage || null;
   const resumeConflicts = deps.getResumeConfigConflicts(session, {
     nonInteractive: input.nonInteractive,
     fromDockerfile: input.requestedFromDockerfile,
+    fromImage: input.requestedFromImage,
     sandboxName: input.requestedSandboxName,
     agent: input.agentFlag || null,
     toolDisclosure: input.requestedToolDisclosure ?? null,
@@ -531,6 +785,10 @@ async function prepareResumeSession(
       current.observabilityEnabled = input.requestedObservabilityEnabled;
       current.observabilityRequestedExplicitly = true;
     }
+    if (isDcodeAutoApprovalMode(input.requestedDcodeAutoApprovalMode)) {
+      current.dcodeAutoApprovalMode = input.requestedDcodeAutoApprovalMode;
+      current.dcodeAutoApprovalRequestedExplicitly = true;
+    }
     current.mode = mode(input.nonInteractive);
     current.failure = null;
     current.status = "in_progress";
@@ -538,13 +796,28 @@ async function prepareResumeSession(
   });
   session = deps.loadSession();
   assertRecoverableResumeSandboxName(session, input, deps);
-  return { session, fromDockerfile };
+  return { session, fromDockerfile, ...(fromImage ? { fromImage } : {}) };
 }
 
 function prepareFreshSession(
   input: OnboardSessionBootstrapInput,
   deps: OnboardSessionBootstrapDeps,
 ): OnboardSessionBootstrapResult {
+  if (input.apfInterceptorRequested === true && input.recreateSandboxRequested === true) {
+    reportUnsupportedApfLifecycle("recreate", deps);
+  }
+  if (input.apfInterceptorRequested === true && input.checkpointProfile === "portable") {
+    reportUnsupportedApfLifecycle("portable", deps);
+  }
+  const previousSession = deps.loadSession();
+  if (
+    previousSession?.routerPid ||
+    previousSession?.routerPort ||
+    previousSession?.routerCredentialHash
+  ) {
+    rejectRetiredModelRouterSession(previousSession);
+  }
+  assertNoIncompleteExternalComponentActivation(previousSession);
   deps.requireHostMountRuntimeSupport(input.requestedHostMounts, input.checkpointProfile);
   if (input.fresh) {
     deps.clearSession();
@@ -552,16 +825,24 @@ function prepareFreshSession(
   const fromDockerfile = input.requestedFromDockerfile
     ? deps.resolvePath(input.requestedFromDockerfile)
     : null;
+  const fromImage = input.requestedFromImage || null;
   const session = deps.createSession({
     mode: mode(input.nonInteractive),
     toolDisclosure: input.requestedToolDisclosure ?? DEFAULT_TOOL_DISCLOSURE,
     observabilityEnabled: input.requestedObservabilityEnabled === true,
     observabilityRequestedExplicitly: typeof input.requestedObservabilityEnabled === "boolean",
+    dcodeAutoApprovalMode: input.requestedDcodeAutoApprovalMode ?? null,
+    dcodeAutoApprovalRequestedExplicitly: isDcodeAutoApprovalMode(
+      input.requestedDcodeAutoApprovalMode,
+    ),
+    apfInterceptorRequested: input.apfInterceptorRequested === true,
     stationExpressIntent: input.stationExpressIntent ?? null,
     servingProfileProvenance: input.servingProfileProvenance ?? null,
+    vllmGpuDevice: parseVllmGpuDevice(process.env[NEMOCLAW_VLLM_GPU_DEVICE_ENV]),
     metadata: {
       gatewayName: "nemoclaw",
       fromDockerfile: fromDockerfile || null,
+      fromImage,
       ...(input.requestedHostMounts && input.requestedHostMounts.length > 0
         ? { hostMounts: input.requestedHostMounts.map((mount) => ({ ...mount })) }
         : {}),
@@ -572,7 +853,7 @@ function prepareFreshSession(
     runtimeAuthority: input.portableRuntimeAuthority ?? null,
   });
   const savedSession = deps.saveSession(session);
-  return { session: savedSession, fromDockerfile };
+  return { session: savedSession, fromDockerfile, ...(fromImage ? { fromImage } : {}) };
 }
 
 export async function prepareOnboardSession(

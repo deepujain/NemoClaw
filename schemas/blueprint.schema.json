@@ -4,7 +4,23 @@
   "title": "NemoClaw Blueprint",
   "description": "Schema for nemoclaw-blueprint/blueprint.yaml — defines sandbox orchestration, inference profiles, and policy configuration.",
   "type": "object",
-  "required": ["version", "profiles", "components"],
+  "required": ["version"],
+  "oneOf": [
+    {
+      "required": ["profiles", "components"],
+      "not": { "required": ["openshell_target"] }
+    },
+    {
+      "required": ["openshell_target", "min_openshell_version", "max_openshell_version"],
+      "not": {
+        "anyOf": [
+          { "required": ["profiles"] },
+          { "required": ["components"] },
+          { "required": ["min_openclaw_version"] }
+        ]
+      }
+    }
+  ],
   "additionalProperties": false,
   "properties": {
     "version": {
@@ -14,13 +30,13 @@
     },
     "min_openshell_version": {
       "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
-      "description": "Minimum compatible OpenShell version."
+      "pattern": "^[0-9]{1,15}\\.[0-9]{1,15}\\.[0-9]{1,15}$",
+      "description": "Minimum compatible OpenShell release. The Blueprint Runner rejects a range whose minimum exceeds its maximum."
     },
     "max_openshell_version": {
       "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
-      "description": "Maximum compatible OpenShell version."
+      "pattern": "^[0-9]{1,15}\\.[0-9]{1,15}\\.[0-9]{1,15}$",
+      "description": "Maximum compatible OpenShell release. The Blueprint Runner rejects a range whose minimum exceeds its maximum."
     },
     "min_openclaw_version": {
       "type": "string",
@@ -40,6 +56,9 @@
     },
     "description": {
       "type": "string"
+    },
+    "openshell_target": {
+      "$ref": "#/$defs/externalOpenShellTarget"
     },
     "components": {
       "type": "object",
@@ -72,8 +91,16 @@
                 "type": "object",
                 "required": ["cpu", "memory"],
                 "properties": {
-                  "cpu": { "type": "string", "minLength": 1, "pattern": "^([1-9]\\d?%|100%|\\d+(\\.\\d+)?[mKMGTPE]?i?)$" },
-                  "memory": { "type": "string", "minLength": 1, "pattern": "^([1-9]\\d?%|100%|\\d+(\\.\\d+)?[mKMGTPE]?i?)$" }
+                  "cpu": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^([1-9]\\d?%|100%|\\d+(\\.\\d+)?[mKMGTPE]?i?)$"
+                  },
+                  "memory": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^([1-9]\\d?%|100%|\\d+(\\.\\d+)?[mKMGTPE]?i?)$"
+                  }
                 },
                 "additionalProperties": false
               }
@@ -91,27 +118,6 @@
               "additionalProperties": {
                 "$ref": "#/$defs/inferenceProfile"
               }
-            }
-          }
-        },
-        "router": {
-          "type": "object",
-          "description": "Model router configuration for complexity-based routing.",
-          "additionalProperties": false,
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Whether the model router is active."
-            },
-            "port": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 65535,
-              "description": "Port the router proxy listens on."
-            },
-            "pool_config_path": {
-              "type": "string",
-              "description": "Path to the router pool config YAML relative to the blueprint directory."
             }
           }
         },
@@ -139,7 +145,72 @@
       }
     }
   },
+  "dependentRequired": {
+    "openshell_target": ["min_openshell_version", "max_openshell_version"]
+  },
   "$defs": {
+    "externalOpenShellTarget": {
+      "type": "object",
+      "description": "Explicit externally managed OpenShell gateway target for target-only planning and credential-free public health status. File references use POSIX-rooted absolute paths. Planning validates and sanitizes target inputs without connecting. Status uses the explicit HTTPS endpoint and validated CA bundle for one public health request. Status does not access the authentication file or authenticate. This contract does not establish remote readiness or support for machine authentication or Kubernetes.",
+      "required": [
+        "endpoint",
+        "workspace",
+        "expected_release",
+        "lifecycle",
+        "trust",
+        "authentication"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "pattern": "^https://(?:(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)|(?:\\[(?![^\\]]*:::)(?=[^\\]]*:)[0-9A-Fa-f:.]+\\]))(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?/?$",
+          "description": "Bare HTTPS gateway origin without credentials, path, query, or fragment. The runner performs final URL, port, loopback, unspecified-address, and IPv6 validation before opening ca_file or credential_file."
+        },
+        "workspace": {
+          "type": "string",
+          "pattern": "^(?!.*--)[a-z]([a-z0-9-]*[a-z0-9])?$",
+          "maxLength": 19,
+          "description": "Explicit OpenShell workspace name included in the sanitized plan and status identity. Public health does not verify or access the workspace."
+        },
+        "expected_release": {
+          "type": "string",
+          "pattern": "^[0-9]{1,15}\\.[0-9]{1,15}\\.[0-9]{1,15}$",
+          "description": "Exact OpenShell release required by planning and public health status. The runner requires safe numeric components and validates this value against min_openshell_version and max_openshell_version. Status succeeds only when public health reports this release."
+        },
+        "lifecycle": {
+          "const": "external",
+          "description": "Declares that NemoClaw does not manage the target gateway lifecycle."
+        },
+        "trust": {
+          "type": "object",
+          "required": ["ca_file"],
+          "additionalProperties": false,
+          "properties": {
+            "ca_file": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^/",
+              "description": "POSIX-rooted absolute path to a regular PEM CA bundle no larger than 1 MiB. Planning validates the PEM CA bundle and returns its fingerprint without connecting. Status supplies the validated bundle to the official OpenShell SDK for the credential-free public health request. Symbolic-link paths are not accepted."
+            }
+          }
+        },
+        "authentication": {
+          "type": "object",
+          "required": ["credential_file"],
+          "additionalProperties": false,
+          "description": "File-backed authentication reference required in the target shape for target-only planning and status. Planning validates the referenced file metadata without reading its contents. Status accepts the reference but does not access or validate the referenced file. Neither operation authenticates or selects or validates a machine-authentication protocol.",
+          "properties": {
+            "credential_file": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^/",
+              "description": "POSIX-rooted absolute authentication file path. Planning requires a non-empty regular file no larger than 1 MiB, rejects symbolic links, and inspects only file metadata. Public health status does not access, validate, or require the referenced file. Neither operation returns the path."
+            }
+          }
+        }
+      }
+    },
     "inferenceProfile": {
       "type": "object",
       "required": ["provider_type", "endpoint"],

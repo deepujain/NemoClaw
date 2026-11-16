@@ -32,11 +32,7 @@ import {
   type RuntimeProviderActivationRegistration,
   type RuntimeProviderActivationTransport,
 } from "./activation";
-import {
-  RUNTIME_PROVIDER_SNAPSHOT_CONTRACT_VERSION,
-  RUNTIME_PROVIDER_STATE_MUTATION_CONTRACT_VERSION,
-  type RuntimeProviderBundle,
-} from "./contract";
+import { RUNTIME_PROVIDER_SNAPSHOT_CONTRACT_VERSION, type RuntimeProviderBundle } from "./contract";
 import { CURRENT_RUNTIME_PROVIDER_BUNDLES, createCurrentRuntimeProviderBundles } from "./current";
 
 type CandidateTopology = {
@@ -108,24 +104,10 @@ function completeBundle(providerId: string): RuntimeProviderBundle {
   });
   return {
     ...base,
-    stateMutation: {
-      providerId,
-      supported: true,
-      contractVersion: RUNTIME_PROVIDER_STATE_MUTATION_CONTRACT_VERSION,
-      acquire: unreachable,
-      assertFenced: unreachable,
-      publish: unreachable,
-      rollback: unreachable,
-      activate: unreachable,
-      release: unreachable,
-      recover: unreachable,
-    },
     bootstrap: {
       providerId,
-      supported: true,
-      createAuthorityStore: unreachable,
-      createLifecycle: unreachable,
-      createOnboardRouting: unreachable,
+      supported: false,
+      reason: "OpenShell owns managed-image sandbox creation.",
     },
     snapshot: {
       providerId,
@@ -150,6 +132,11 @@ function completeBundle(providerId: string): RuntimeProviderBundle {
         engineId: "contract-fixture",
         displayName: "Contract fixture",
       })),
+      capture: () => ({ status: 0, stdout: "", stderr: "" }),
+      nvidiaContainer: {
+        capture: () => ({ status: 0, stdout: "", stderr: "" }),
+        cleanup: () => ({ status: "absent" }),
+      },
     },
   };
 }
@@ -189,28 +176,6 @@ function registration(
 }
 
 const INCOMPLETE_SURFACES = [
-  [
-    "stateMutation",
-    (bundle: RuntimeProviderBundle) => ({
-      ...bundle,
-      stateMutation: {
-        providerId: bundle.identity.id,
-        supported: false as const,
-        reason: "incomplete fixture",
-      },
-    }),
-  ],
-  [
-    "bootstrap",
-    (bundle: RuntimeProviderBundle) => ({
-      ...bundle,
-      bootstrap: {
-        providerId: bundle.identity.id,
-        supported: false as const,
-        reason: "incomplete fixture",
-      },
-    }),
-  ],
   [
     "snapshot",
     (bundle: RuntimeProviderBundle) => ({
@@ -274,11 +239,36 @@ describe("runtime provider activation catalog", () => {
     ).toEqual([true, true, true]);
   });
 
-  it("leaves Docker and Kubernetes unchanged with no production candidate registration", () => {
-    expect(Object.keys(CURRENT_RUNTIME_PROVIDER_BUNDLES)).toEqual(["docker", "kubernetes"]);
-    expect(Object.keys(createCurrentRuntimeProviderBundles())).toEqual(["docker", "kubernetes"]);
-    expect(CURRENT_RUNTIME_PROVIDER_BUNDLES).not.toHaveProperty("podman");
+  it("registers qualified Podman without changing the established providers", () => {
+    expect(Object.keys(CURRENT_RUNTIME_PROVIDER_BUNDLES)).toEqual([
+      "docker",
+      "kubernetes",
+      "podman",
+    ]);
+    expect(Object.keys(createCurrentRuntimeProviderBundles())).toEqual([
+      "docker",
+      "kubernetes",
+      "podman",
+    ]);
+    expect(CURRENT_RUNTIME_PROVIDER_BUNDLES.podman?.identity.id).toBe("podman");
     expect(CURRENT_RUNTIME_PROVIDER_BUNDLES).not.toHaveProperty("mxc");
+  });
+
+  it("exposes one stable read-only view of the lazily constructed current registry", () => {
+    const firstPodman = CURRENT_RUNTIME_PROVIDER_BUNDLES.podman;
+
+    expect(firstPodman).toBeDefined();
+    expect(CURRENT_RUNTIME_PROVIDER_BUNDLES.podman).toBe(firstPodman);
+    expect(() => {
+      (CURRENT_RUNTIME_PROVIDER_BUNDLES as Record<string, RuntimeProviderBundle>).podman =
+        CURRENT_RUNTIME_PROVIDER_BUNDLES.docker!;
+    }).toThrow(TypeError);
+    expect(Object.keys(CURRENT_RUNTIME_PROVIDER_BUNDLES)).toEqual([
+      "docker",
+      "kubernetes",
+      "podman",
+    ]);
+    expect(CURRENT_RUNTIME_PROVIDER_BUNDLES.podman).toBe(firstPodman);
   });
 
   it.each(INCOMPLETE_SURFACES)(
@@ -314,9 +304,29 @@ describe("runtime provider activation catalog", () => {
 
       expect(() =>
         createRuntimeProviderActivationCatalog([registration(candidate, incomplete)]),
-      ).toThrow(`missing: ${operation}`);
+      ).toThrow(
+        operation === "host-local-inference"
+          ? "cannot expose NVIDIA container proof without host-local-inference authority"
+          : `missing: ${operation}`,
+      );
     },
   );
+
+  it("accepts a qualified provider without the optional NVIDIA container capability", () => {
+    const candidate = CANDIDATE_TOPOLOGIES[1];
+    const bundle = completeBundle(candidate.providerId);
+    const supported = bundle.containerEngine as Extract<
+      RuntimeProviderBundle["containerEngine"],
+      { readonly supported: true }
+    >;
+    const { nvidiaContainer: _capability, ...containerEngine } = supported;
+
+    expect(() =>
+      createRuntimeProviderActivationCatalog([
+        registration(candidate, { ...bundle, containerEngine }),
+      ]),
+    ).not.toThrow();
+  });
 
   it("rejects incomplete host-local inference authority", () => {
     const candidate = CANDIDATE_TOPOLOGIES[1];

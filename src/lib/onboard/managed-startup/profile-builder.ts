@@ -1,13 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import {
+  HERMES_SWITCHYARD_BINDINGS_ENV,
+  readSwitchyardProviderBindingsEnvironment,
+} from "../../hermes-switchyard-routing";
+
 import { Buffer } from "node:buffer";
 import { createHash, X509Certificate } from "node:crypto";
 
+import { assertNoPerAgentMaxSpawnDepth } from "../../extra-agents-validation";
 import { MAX_AUTODETECTED_OLLAMA_CONTEXT_WINDOW } from "../../inference/ollama-runtime-context";
 import { hydrateDerivedSandboxMessagingPlanFields } from "../../messaging/hydration";
 import { parseSandboxMessagingPlan } from "../../messaging/plan-validation";
 import { withLocalNoProxy } from "../../proxy/local-no-proxy";
+import {
+  HERMES_SWITCHYARD_ROUTING_ENV,
+  readHermesSwitchyardRoutingEnvironment,
+} from "../../hermes-switchyard-routing";
 import {
   MAX_CORPORATE_CA_BYTES,
   MAX_CORPORATE_CA_CERTS,
@@ -64,8 +74,8 @@ export const MANAGED_STARTUP_HOST_PROXY_URL_INPUTS = [
  * change; otherwise construction fails before a sandbox is launched.
  */
 const EXPECTED_AFFORDANCE_INVENTORY_SHA256 = {
-  openclaw: "9b722441e33f0b0d7580f74cd185c0174979de9c1a784556ff56ff931b2c9904",
-  hermes: "26c2dc3750274e5c2a79bf382a4b18b3cf26c0ef64938e91b694427aa23756e8",
+  openclaw: "b4a3fa7060c7b7f5654c271513398666ccf52e36dcc2ff4ac8064b1d801841cf",
+  hermes: "566904b99ca27b8cb12e3e8929eef6a73d7fd9ab1a0d0f4362939be6f2a912e2",
   "langchain-deepagents-code": "08c75cf22495ec93a090bc5b70544eac65970e658b10fba057dea5ffef502e4a",
   pi: "6302d387182c596fd67ad18577ecf82107bad6271aeeb5e69714115f91557abb",
 } as const satisfies Record<ManagedStartupAgent, string>;
@@ -82,7 +92,7 @@ export interface ManagedStartupResolvedInferenceInput {
   readonly model: string;
   readonly routedBaseUrl: string;
   readonly upstreamEndpointUrl: string | null;
-  readonly api: ManagedStartupProfile["inference"]["api"];
+  readonly api: NonNullable<ManagedStartupProfile["inference"]>["api"];
   readonly primaryModelRef: string | null;
   readonly compatibility: Readonly<Record<string, unknown>> | null;
 }
@@ -90,7 +100,7 @@ export interface ManagedStartupResolvedInferenceInput {
 export interface ManagedStartupProfileBuilderInput {
   readonly agent: ManagedStartupAgent;
   /** Fully resolved host semantics; the portable builder never selects providers. */
-  readonly inference: ManagedStartupResolvedInferenceInput;
+  readonly inference: ManagedStartupResolvedInferenceInput | null;
   readonly dashboard: ManagedStartupDashboard;
   readonly webSearch: {
     readonly fetchEnabled: boolean;
@@ -301,6 +311,7 @@ function normalizeExtraAgentsCandidate(value: unknown): ManagedStartupExtraAgent
   if (value === null || value === undefined) {
     return { agents: [], defaults: emptyDefaults, main: {} };
   }
+  assertNoPerAgentMaxSpawnDepth(value);
   if (Array.isArray(value)) {
     return {
       agents: normalizeExtraAgentList(value, "NEMOCLAW_EXTRA_AGENTS_JSON"),
@@ -398,7 +409,27 @@ function normalizeMessagingPlan(
   const hydrated = hydrateDerivedSandboxMessagingPlanFields(plan);
   const reparsed = parseSandboxMessagingPlan(hydrated, { agent });
   if (!reparsed) fail(`messagingPlan hydration produced an invalid ${agent} plan`);
-  return JSON.parse(JSON.stringify(reparsed)) as ManagedStartupJsonObject;
+  const projected = JSON.parse(JSON.stringify(reparsed)) as ManagedStartupJsonObject;
+  const buildSteps = projected.buildSteps;
+  if (Array.isArray(buildSteps)) {
+    for (const step of buildSteps) {
+      if (
+        !isPlainObject(step) ||
+        step.kind !== "package-install" ||
+        !isPlainObject(step.value) ||
+        typeof step.value.pin !== "boolean"
+      ) {
+        continue;
+      }
+      // Package pins govern image construction. A managed image already owns
+      // the exact installed package, so this derived build-only flag does not
+      // belong in the managed startup profile consumed at runtime. Validate
+      // and hydrate the full plan before this projection so malformed or
+      // misplaced pins still fail closed (#9399).
+      delete step.value.pin;
+    }
+  }
+  return projected;
 }
 
 function resolveAliasedEnvironmentValue(
@@ -505,12 +536,15 @@ function resolveCorporateCaMaterial(corporateCa: ResolvedCorporateCa | null | un
 }
 
 function assertAgentSpecificInput(input: ManagedStartupProfileBuilderInput): void {
+  if (input.inference === null && input.agent !== "openclaw" && input.agent !== "hermes") {
+    fail(`${input.agent} requires inference configuration`);
+  }
   if (input.dashboard.agent !== input.agent) {
     fail("dashboard.agent must match agent");
   }
   if (input.agent === "openclaw") {
     if (
-      input.inference.upstreamEndpointUrl !== null ||
+      (input.inference?.upstreamEndpointUrl ?? null) !== null ||
       input.hermesToolGateways.length > 0 ||
       input.dcodeAutoApprovalMode !== null ||
       input.observabilityEnabled !== null
@@ -520,11 +554,11 @@ function assertAgentSpecificInput(input: ManagedStartupProfileBuilderInput): voi
     return;
   }
   if (input.agent === "hermes") {
-    if (input.inference.compatibility !== null) {
+    if ((input.inference?.compatibility ?? null) !== null) {
       fail("Hermes does not support inference compatibility");
     }
     if (
-      input.inference.upstreamEndpointUrl !== null ||
+      (input.inference?.upstreamEndpointUrl ?? null) !== null ||
       input.dcodeAutoApprovalMode !== null ||
       input.observabilityEnabled !== null
     ) {
@@ -537,8 +571,8 @@ function assertAgentSpecificInput(input: ManagedStartupProfileBuilderInput): voi
       input.webSearch !== null ||
       input.hermesToolGateways.length > 0 ||
       input.messagingPlan !== null ||
-      input.inference.compatibility !== null ||
-      input.inference.upstreamEndpointUrl !== null ||
+      (input.inference?.compatibility ?? null) !== null ||
+      (input.inference?.upstreamEndpointUrl ?? null) !== null ||
       input.dcodeAutoApprovalMode !== null ||
       input.observabilityEnabled !== null
     ) {
@@ -555,7 +589,7 @@ function assertAgentSpecificInput(input: ManagedStartupProfileBuilderInput): voi
   if (input.messagingPlan !== null) {
     fail("langchain-deepagents-code messagingPlan must be null");
   }
-  if (input.inference.compatibility !== null) {
+  if ((input.inference?.compatibility ?? null) !== null) {
     fail("langchain-deepagents-code does not support inference compatibility");
   }
   if (
@@ -615,6 +649,13 @@ function profilePathExists(profile: ManagedStartupProfile, profilePath: string):
 
 function assertInventoryPathsResolved(profile: ManagedStartupProfile): void {
   for (const affordance of MANAGED_STARTUP_PROFILE_AFFORDANCE_INVENTORY[profile.agent]) {
+    if (profile.inference === null && affordance.profilePath.startsWith("inference.")) continue;
+    if (
+      affordance.input === HERMES_SWITCHYARD_BINDINGS_ENV &&
+      profile.agentConfig.agent === "hermes" &&
+      !profile.agentConfig.switchyardRouting
+    )
+      continue;
     if (!profilePathExists(profile, affordance.profilePath)) {
       fail(`${affordance.input} has no resolved value at ${affordance.profilePath}`);
     }
@@ -654,17 +695,20 @@ function assertEnvironmentConsistency(
   environment: NodeJS.ProcessEnv,
 ): void {
   const stringValues: Readonly<Record<string, string | null>> = {
-    NEMOCLAW_MODEL: profile.inference.model,
-    NEMOCLAW_INFERENCE_PROVIDER_ID: profile.inference.routeProvider,
-    NEMOCLAW_UPSTREAM_PROVIDER: profile.inference.upstreamProvider,
-    NEMOCLAW_PRIMARY_MODEL_REF: profile.inference.primaryModelRef,
-    NEMOCLAW_INFERENCE_BASE_URL: profile.inference.routedBaseUrl,
-    NEMOCLAW_INFERENCE_API: profile.inference.api,
+    NEMOCLAW_MODEL: profile.inference?.model ?? null,
+    NEMOCLAW_INFERENCE_PROVIDER_ID: profile.inference?.routeProvider ?? null,
+    NEMOCLAW_UPSTREAM_PROVIDER: profile.inference?.upstreamProvider ?? null,
+    NEMOCLAW_SERVING_PRESET: profile.inference?.servingPreset ?? null,
+    NEMOCLAW_PRIMARY_MODEL_REF: profile.inference?.primaryModelRef ?? null,
+    NEMOCLAW_INFERENCE_BASE_URL: profile.inference?.routedBaseUrl ?? null,
+    NEMOCLAW_INFERENCE_API: profile.inference?.api ?? null,
     NEMOCLAW_TOOL_DISCLOSURE: profile.tools.disclosure,
     CHAT_UI_URL:
-      profile.dashboard.agent === "openclaw" || profile.dashboard.agent === "hermes"
+      profile.dashboard.agent === "openclaw"
         ? profile.dashboard.url
-        : null,
+        : profile.dashboard.agent === "hermes"
+          ? (profile.dashboard.browserUrl ?? profile.dashboard.url)
+          : null,
   };
   for (const [name, expected] of Object.entries(stringValues)) {
     const raw = presentEnvironmentValue(environment, name);
@@ -694,7 +738,7 @@ function assertEnvironmentConsistency(
     assertEquivalent(
       "NEMOCLAW_UPSTREAM_ENDPOINT_URL",
       upstreamEndpoint,
-      profile.inference.upstreamEndpointUrl,
+      profile.inference?.upstreamEndpointUrl ?? null,
     );
   }
 
@@ -705,8 +749,6 @@ function assertEnvironmentConsistency(
     const directValues: Readonly<Record<string, unknown>> = {
       NEMOCLAW_REASONING: String(profile.tuning.reasoning),
       NEMOCLAW_AGENT_HEARTBEAT_EVERY: config.heartbeatEvery,
-      NEMOCLAW_DISABLE_DEVICE_AUTH: config.deviceAuth.disabled ? "1" : "0",
-      NEMOCLAW_DEVICE_AUTH_OPT_OUT_SOURCE: config.deviceAuth.optOutSource,
       NEMOCLAW_WEB_SEARCH_ENABLED: config.webSearch.enabled ? "1" : "0",
       NEMOCLAW_WEB_SEARCH_PROVIDER: config.webSearch.provider,
       NEMOCLAW_OPENCLAW_OTEL_ENDPOINT: config.otel.endpointUrl,
@@ -746,7 +788,7 @@ function assertEnvironmentConsistency(
       assertEquivalent(
         "NEMOCLAW_INFERENCE_INPUTS",
         [...parseInputModalities(environment)].sort(),
-        profile.inference.inputModalities,
+        profile.inference?.inputModalities ?? null,
       );
     }
     const compatibility = parseEnvironmentJson(environment, "NEMOCLAW_INFERENCE_COMPAT_B64");
@@ -754,7 +796,7 @@ function assertEnvironmentConsistency(
       assertEquivalent(
         "NEMOCLAW_INFERENCE_COMPAT_B64",
         compatibility,
-        profile.inference.compatibility,
+        profile.inference?.compatibility ?? null,
       );
     }
     const extraAgents = parseEnvironmentJson(environment, "NEMOCLAW_EXTRA_AGENTS_JSON_B64");
@@ -802,6 +844,21 @@ function assertEnvironmentConsistency(
         "NEMOCLAW_HERMES_TOOL_GATEWAY_PRESETS_B64",
         [...presets].sort(),
         profile.tools.enabledGateways,
+      );
+    }
+    if (presentEnvironmentValue(environment, HERMES_SWITCHYARD_ROUTING_ENV) !== null) {
+      assertEquivalent(
+        HERMES_SWITCHYARD_ROUTING_ENV,
+        readHermesSwitchyardRoutingEnvironment(environment),
+        config.switchyardRouting ?? null,
+      );
+    }
+    if (presentEnvironmentValue(environment, HERMES_SWITCHYARD_BINDINGS_ENV) !== null) {
+      if (!config.switchyardRouting) fail("Switchyard provider bindings require routing intent");
+      assertEquivalent(
+        HERMES_SWITCHYARD_BINDINGS_ENV,
+        readSwitchyardProviderBindingsEnvironment(environment, config.switchyardRouting),
+        config.switchyardBindings,
       );
     }
   } else if (profile.agentConfig.agent === "langchain-deepagents-code") {
@@ -895,9 +952,6 @@ function buildCandidate(input: ManagedStartupProfileBuilderInput): {
         ) ?? DEFAULT_OPENCLAW_AGENT_TIMEOUT_SECONDS,
       heartbeatEvery: parseHeartbeat(input.environment),
       extraAgents: parseExtraAgents(input.environment),
-      // Managed onboarding currently applies this compatibility opt-out to
-      // every stock OpenClaw image, independently of dashboard exposure.
-      deviceAuth: { disabled: true, optOutSource: "managed-onboard" },
       minimalBootstrap: parseZeroOneFlag(input.environment, "NEMOCLAW_MINIMAL_BOOTSTRAP", false),
     };
     tuning = {
@@ -916,7 +970,20 @@ function buildCandidate(input: ManagedStartupProfileBuilderInput): {
     };
   } else if (input.agent === "hermes") {
     if (!webSearch) fail("Hermes web-search state is missing");
-    agentConfig = { agent: "hermes", webSearch };
+    const switchyardRouting = readHermesSwitchyardRoutingEnvironment(input.environment);
+    agentConfig = {
+      agent: "hermes",
+      webSearch,
+      switchyardRouting,
+      ...(switchyardRouting
+        ? {
+            switchyardBindings: readSwitchyardProviderBindingsEnvironment(
+              input.environment,
+              switchyardRouting,
+            ),
+          }
+        : {}),
+    };
     tuning = {
       contextWindow: parsePositiveInteger(input.environment, "NEMOCLAW_CONTEXT_WINDOW", null, {
         minimum: MIN_HERMES_CONTEXT_WINDOW,
@@ -957,22 +1024,29 @@ function buildCandidate(input: ManagedStartupProfileBuilderInput): {
     schemaVersion: MANAGED_STARTUP_PROFILE_SCHEMA_VERSION,
     agent: input.agent,
     agentConfig,
-    inference: {
-      routeProvider: inference.routeProvider,
-      upstreamProvider: inference.upstreamProvider,
-      model: inference.model,
-      routedBaseUrl: inference.routedBaseUrl,
-      upstreamEndpointUrl: inference.upstreamEndpointUrl,
-      api: inference.api,
-      primaryModelRef: inference.primaryModelRef,
-      // Docker's legacy JSON encoder maps a null compatibility result to {},
-      // and the OpenClaw generator consumes an object in all cases.
-      compatibility:
-        input.agent === "openclaw"
-          ? (JSON.parse(JSON.stringify(inference.compatibility ?? {})) as ManagedStartupJsonObject)
-          : null,
-      inputModalities: input.agent === "openclaw" ? parseInputModalities(input.environment) : null,
-    },
+    inference:
+      inference === null
+        ? null
+        : {
+            routeProvider: inference.routeProvider,
+            upstreamProvider: inference.upstreamProvider,
+            servingPreset: presentEnvironmentValue(input.environment, "NEMOCLAW_SERVING_PRESET"),
+            model: inference.model,
+            routedBaseUrl: inference.routedBaseUrl,
+            upstreamEndpointUrl: inference.upstreamEndpointUrl,
+            api: inference.api,
+            primaryModelRef: inference.primaryModelRef,
+            // Docker's legacy JSON encoder maps a null compatibility result to {},
+            // and the OpenClaw generator consumes an object in all cases.
+            compatibility:
+              input.agent === "openclaw"
+                ? (JSON.parse(
+                    JSON.stringify(inference.compatibility ?? {}),
+                  ) as ManagedStartupJsonObject)
+                : null,
+            inputModalities:
+              input.agent === "openclaw" ? parseInputModalities(input.environment) : null,
+          },
     proxy: {
       managedHost,
       managedPort,

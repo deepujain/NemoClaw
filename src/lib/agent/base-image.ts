@@ -14,13 +14,7 @@ import {
   dockerRmi,
   dockerTag,
 } from "../adapters/docker";
-import { requireCuaFrameworkEnabled } from "../cua/feature";
-import {
-  getCuaSandboxImageRef,
-  loadCuaRuntimeManifest,
-  stageCuaRuntimePayload,
-  verifyCuaRuntimePayload,
-} from "../cua/runtime-manifest";
+import { requireCuaSandboxImageRef } from "../cua/feature";
 import { encodeCorporateCaArg, resolveCorporateCa } from "../onboard/corporate-ca";
 import { createCustomBuildContextFilter } from "../onboard/custom-build-context";
 import { ROOT } from "../runner";
@@ -43,11 +37,17 @@ import {
   SANDBOX_BASE_RESOLUTION_SCHEMA,
   SANDBOX_BASE_TAG,
   type SandboxBaseImageResolution,
+  type SandboxBaseImageValidationContext,
   SandboxBaseImageResolutionError,
   type SandboxBaseImageResolutionMetadata,
   type TrustedLocalBaseImageOverride,
   versionGte,
 } from "../sandbox-base-image";
+import {
+  hermesSandboxBaseImageHasSecurityInventory,
+  sandboxBaseImageHasSecurityInventory,
+} from "../sandbox-base-image/security-inventory";
+import { getAgentSandboxBaseImageEnvVar } from "./base-image-env";
 import { createDeepAgentsCodeBaseImageResolutionOptions } from "./deep-agents-code-base-image";
 import type { AgentDefinition } from "./defs";
 
@@ -61,9 +61,6 @@ function corporateCaBuildArgs(
 }
 
 function agentBaseImageBuildArgs(agent: AgentDefinition): Record<string, string> | undefined {
-  if (agent.name === "nemocua") {
-    return { NEMOCUA_RUNTIME_IMAGE: getCuaSandboxImageRef() };
-  }
   // Only these base Dockerfiles declare ARG NEMOCLAW_CORPORATE_CA_B64 and anchor
   // the decoded certificates before their HTTPS package fetches (#8119).
   return agent.name === "langchain-deepagents-code" || agent.name === "pi"
@@ -72,6 +69,17 @@ function agentBaseImageBuildArgs(agent: AgentDefinition): Record<string, string>
 }
 
 const HERMES_MCP_RUNTIME_PROBE_OK = "nemoclaw-hermes-mcp-runtime-ok";
+const HERMES_BASE_IMAGE_PROBE_GUARDS = [
+  "--network",
+  "none",
+  "--cap-drop",
+  "ALL",
+  "--security-opt",
+  "no-new-privileges",
+  "--read-only",
+  "--user",
+  "sandbox",
+] as const;
 // Matches the official Hermes base repository for both Dockerfile manifest-list
 // pins and Docker-normalized platform manifest digests.
 const HERMES_OFFICIAL_BASE_DIGEST_REF =
@@ -81,6 +89,7 @@ export interface EnsureAgentBaseImageOptions {
   forceBaseImageRebuild?: boolean;
   resolutionHint?: SandboxBaseImageResolutionMetadata | null;
   forceBaseImageRefresh?: boolean;
+  allowLocalFallback?: boolean;
 }
 
 export interface CreateAgentSandboxOptions extends EnsureAgentBaseImageOptions {
@@ -180,9 +189,7 @@ function reuseTrustedAgentRemoteBaseImageOverride(
   return reused;
 }
 
-export function getAgentSandboxBaseImageEnvVar(agentName: string): string {
-  return `NEMOCLAW_${agentName.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_SANDBOX_BASE_IMAGE_REF`;
-}
+export { getAgentSandboxBaseImageEnvVar };
 
 function immutableLocalBaseImageTag(agentName: string, imageId: string, temporary = false): string {
   const match = imageId.trim().match(/^sha256:([0-9a-f]{64})$/i);
@@ -296,20 +303,24 @@ function hermesFinalDockerfileAcceptsBase(
 }
 
 /**
- * Verify that a Hermes base contains both the MCP SDK and Hermes' native
- * Streamable HTTP integration. Version output alone is insufficient because
- * these dependencies are installed through an optional upstream extra.
+ * Verify that a Hermes base contains the native MCP Streamable HTTP runtime,
+ * the pinned ACP SDK, and Hermes' ACP adapter. Version output alone is
+ * insufficient because these dependencies are installed through optional
+ * upstream extras.
  */
-export function hermesBaseImageSupportsMcp(imageRef: string): boolean {
+export function hermesBaseImageSupportsRuntime(imageRef: string, expectedVersion: string): boolean {
+  const quotedExpectedVersion = JSON.stringify(expectedVersion);
   const output = dockerCapture(
     [
       "run",
       "--rm",
+      ...HERMES_BASE_IMAGE_PROBE_GUARDS,
       "--entrypoint",
       "/opt/hermes/.venv/bin/python",
       imageRef,
+      "-I",
       "-c",
-      `import mcp; from tools import mcp_tool; assert getattr(mcp_tool, "_MCP_AVAILABLE", False); assert getattr(mcp_tool, "_MCP_HTTP_AVAILABLE", False); print("${HERMES_MCP_RUNTIME_PROBE_OK}")`,
+      `import importlib.metadata as metadata; import sys; import acp; import mcp; from acp_adapter.server import HermesACPAgent; from tools import mcp_tool; metadata.version("hermes-agent") == ${quotedExpectedVersion} or sys.exit(1); metadata.version("agent-client-protocol") == "0.9.0" or sys.exit(1); mcp_tool._ensure_mcp_sdk() or sys.exit(1); getattr(mcp_tool, "_MCP_AVAILABLE", False) or sys.exit(1); getattr(mcp_tool, "_MCP_HTTP_AVAILABLE", False) or sys.exit(1); print("${HERMES_MCP_RUNTIME_PROBE_OK}")`,
     ],
     { ignoreError: true, timeout: 20_000 },
   );
@@ -322,14 +333,30 @@ function createAgentBaseImageResolutionOptions(
   options: EnsureAgentBaseImageOptions,
 ): ResolveBaseImageOptions {
   const imageName = `ghcr.io/nvidia/nemoclaw/${agent.name}-sandbox-base`;
+  const pinnedRemoteRef = getHermesPinnedRemoteBaseRef(agent) ?? undefined;
+  const expectedHermesVersion = agent.expectedVersion?.trim();
+  if (agent.name === "hermes" && !expectedHermesVersion) {
+    throw new Error(
+      `Agent '${agent.name}' (${agent.displayName}) manifest is missing expected_version required for base-image validation`,
+    );
+  }
   const validationOptions =
     agent.name === "hermes"
       ? {
-          validateImage: hermesBaseImageSupportsMcp,
-          validationDescription: "the required MCP Streamable HTTP runtime",
+          validateImage: (imageRef: string, context?: SandboxBaseImageValidationContext) =>
+            hermesBaseImageSupportsRuntime(imageRef, expectedHermesVersion!) &&
+            hermesSandboxBaseImageHasSecurityInventory(
+              imageRef,
+              context?.source === "pinned" && context.pinnedRemoteRef === pinnedRemoteRef,
+            ),
+          validationDescription: `Hermes ${expectedHermesVersion} with the required MCP Streamable HTTP and ACP runtimes and the immutable security package inventory`,
         }
-      : createDeepAgentsCodeBaseImageResolutionOptions(agent, dockerfilePath);
-  const pinnedRemoteRef = getHermesPinnedRemoteBaseRef(agent) ?? undefined;
+      : agent.name === "pi"
+        ? {
+            validateImage: sandboxBaseImageHasSecurityInventory,
+            validationDescription: "the immutable security package inventory",
+          }
+        : createDeepAgentsCodeBaseImageResolutionOptions(agent, dockerfilePath);
   return {
     imageName,
     dockerfilePath,
@@ -342,7 +369,8 @@ function createAgentBaseImageResolutionOptions(
     forceRefresh: options.forceBaseImageRefresh,
     rootDir: ROOT,
     pinnedRemoteRef,
-    preferPinnedRemoteRef: agent.name === "hermes" && pinnedRemoteRef !== undefined,
+    requirePinnedRemoteRef: agent.name === "hermes" && pinnedRemoteRef !== undefined,
+    allowLocalFallback: options.allowLocalFallback,
     ...validationOptions,
   };
 }
@@ -403,7 +431,12 @@ export function bindLocalAgentBaseImageToPinnedProvenance(
   ) {
     return null;
   }
-  if (resolutionOptions.validateImage && !resolutionOptions.validateImage(imageRef)) return null;
+  if (
+    resolutionOptions.validateImage &&
+    !resolutionOptions.validateImage(imageRef, { source: "pinned", pinnedRemoteRef })
+  ) {
+    return null;
+  }
   const digest = resolvedRemoteRef.slice(resolvedRemoteRef.indexOf("@") + 1);
   const metadata = createSandboxBaseImageResolutionMetadata(
     resolutionOptions,
@@ -542,17 +575,13 @@ export function ensureAgentBaseImage(
   agent: AgentDefinition,
   options: EnsureAgentBaseImageOptions = {},
 ): EnsureAgentBaseImageResult {
-  if (agent.name === "nemocua") requireCuaFrameworkEnabled();
+  if (agent.name === "nemocua") {
+    return { imageTag: requireCuaSandboxImageRef(), built: false };
+  }
   const baseDockerfile = agent.dockerfileBasePath;
 
   if (!baseDockerfile) {
     return { imageTag: null, built: false };
-  }
-
-  if (agent.name === "nemocua") {
-    const runtimeManifest = loadCuaRuntimeManifest();
-    verifyCuaRuntimePayload(runtimeManifest);
-    return { imageTag: getCuaSandboxImageRef(), built: false };
   }
 
   const resolutionOptions = createAgentBaseImageResolutionOptions(agent, baseDockerfile, options);
@@ -613,7 +642,7 @@ export function ensureAgentBaseImage(
           `Hermes final image does not accept base image ref '${pinnedBaseImageTag}'; use the tracked official digest or a repository-built local base`,
         );
       }
-      console.log(`  \u2713 Base image built: ${pinnedBaseImageTag}`);
+      console.log("  \u2713 Base image built.");
       const resolutionMetadata = createLocalResolutionMetadata(
         resolutionOptions,
         pinnedBaseImageTag,
@@ -700,7 +729,7 @@ export function ensureAgentBaseImage(
         : ` (exit ${buildResult.status ?? "unknown"})`;
       throw new Error(`Failed to build ${agent.displayName} base image${detail}`);
     }
-    console.log(`  \u2713 Base image built: ${baseImageTag}`);
+    console.log("  \u2713 Base image built.");
     const resolutionMetadata = createLocalResolutionMetadata(resolutionOptions, baseImageTag);
     return {
       imageTag: baseImageTag,
@@ -709,7 +738,7 @@ export function ensureAgentBaseImage(
     };
   }
 
-  console.log(`  Base image exists: ${baseImageTag}`);
+  console.log("  Base image exists.");
   const resolutionMetadata = createLocalResolutionMetadata(resolutionOptions, baseImageTag);
   return {
     imageTag: baseImageTag,
@@ -723,7 +752,6 @@ export function createAgentSandbox(
   agent: AgentDefinition,
   options: CreateAgentSandboxOptions = {},
 ): CreateAgentSandboxResult {
-  if (agent.name === "nemocua") requireCuaFrameworkEnabled();
   const agentDockerfile = agent.dockerfilePath;
 
   if (!agentDockerfile) {
@@ -736,35 +764,22 @@ export function createAgentSandbox(
     baseImageOptions,
   );
   const buildCtx = fs.mkdtempSync(path.join(os.tmpdir(), SANDBOX_BUILD_CONTEXT_PREFIX));
-  const stagedCuaAgentDir = path.join(buildCtx, "agents", "nemocua");
   const stagedDockerfile = path.join(buildCtx, "Dockerfile");
   try {
-    if (agent.name === "nemocua") {
-      // The external CUA manifest defines the complete Docker input set. Do
-      // not disclose the NemoClaw checkout to the Docker daemon or its cache.
-      stageCuaRuntimePayload(stagedCuaAgentDir);
-      const dockerfile = fs.readFileSync(path.join(stagedCuaAgentDir, "Dockerfile"), "utf8");
-      fs.writeFileSync(
-        stagedDockerfile,
-        baseImageRef
-          ? dockerfile.replace(/^ARG BASE_IMAGE(?:=.*)?$/m, `ARG BASE_IMAGE=${baseImageRef}`)
-          : dockerfile,
-        { flag: "wx", mode: 0o600 },
-      );
-    } else {
+    if (agent.name !== "nemocua") {
       const shouldIncludeBuildContextPath = createCustomBuildContextFilter(rootDir);
       fs.cpSync(rootDir, buildCtx, {
         recursive: true,
         filter: (src) => path.basename(src) !== ".claude" && shouldIncludeBuildContextPath(src),
       });
-      fs.copyFileSync(agentDockerfile, stagedDockerfile);
-      if (baseImageRef) {
-        const dockerfile = fs.readFileSync(stagedDockerfile, "utf8");
-        fs.writeFileSync(
-          stagedDockerfile,
-          dockerfile.replace(/^ARG BASE_IMAGE(?:=.*)?$/m, `ARG BASE_IMAGE=${baseImageRef}`),
-        );
-      }
+    }
+    fs.copyFileSync(agentDockerfile, stagedDockerfile);
+    if (baseImageRef) {
+      const dockerfile = fs.readFileSync(stagedDockerfile, "utf8");
+      fs.writeFileSync(
+        stagedDockerfile,
+        dockerfile.replace(/^ARG BASE_IMAGE(?:=.*)?$/m, `ARG BASE_IMAGE=${baseImageRef}`),
+      );
     }
   } catch (error) {
     try {

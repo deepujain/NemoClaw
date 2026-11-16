@@ -1,4 +1,4 @@
-#!/usr/bin/env -S node --experimental-strip-types
+#!/usr/bin/env node
 
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
@@ -6,6 +6,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   constants,
   cpSync,
@@ -16,9 +17,10 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -28,11 +30,12 @@ import {
   requireRealDirectory as realDirectory,
 } from "./lib/bundled-npm-package.mts";
 
-export const FIXED_TAR_VERSION = "7.5.20";
+export const FIXED_TAR_VERSION = "7.5.21";
 export const FIXED_TAR_INTEGRITY =
-  "sha512-9FcyK4PA6+WbzlTM9WhQm6vB5W7cP7dUiPsv1g7YDwEQnQ1CGpK3MGlKk/ITVWMk05kHZuBhmVhiv8LZoy/PFQ==";
-export const FIXED_TAR_TARBALL = "https://registry.npmjs.org/tar/-/tar-7.5.20.tgz";
-export const MINIMUM_SAFE_TAR_VERSION = "7.5.19";
+  "sha512-XdhtCvlMywwxpCW8YEq3lOXBJpUPTR2OHHcwLPO3HwsJqOHa2Ok/oJ7ruGzp+JrKoRPVCzJwAdEjqLW/vNRPHA==";
+export const FIXED_TAR_TARBALL = "https://registry.npmjs.org/tar/-/tar-7.5.21.tgz";
+export const MINIMUM_SAFE_TAR_VERSION = "7.5.21";
+export const BUNDLED_NPM_TAR_COMMAND_TIMEOUT_MS = 15 * 60_000;
 
 /**
  * Source boundary for this private npm-tree remediation. The pinned upstream
@@ -43,8 +46,7 @@ export const MINIMUM_SAFE_TAR_VERSION = "7.5.19";
  * The Dockerfile contract test forces that review whenever either pin changes.
  */
 export const NODE_BASES_REQUIRING_BUNDLED_NPM_TAR_PATCH = [
-  "node:22-trixie-slim@sha256:db8a96a63e5264607ada2d206758876ebbed6a12be2ada7517793cbfb0c2a29c",
-  "node:24-trixie-slim@sha256:05c08ce4291e9a58f59456a7985176defb12cdd42271f35ff81a3e167ea61d4c",
+  "node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea",
 ] as const;
 
 function parseVersion(version: unknown, label: string): readonly [number, number, number] {
@@ -79,7 +81,7 @@ export function inspectBundledNpmTar(npmRoot: string): BundledNpmTarState {
   const bundleDependencies = manifest.bundleDependencies;
   if (
     manifest.name !== "npm" ||
-    (npmMajor !== 10 && npmMajor !== 11) ||
+    (npmMajor !== 10 && npmMajor !== 11 && npmMajor !== 12) ||
     typeof tarRange !== "string" ||
     !/^\^7\.5\.(0|[1-9]\d*)$/u.test(tarRange) ||
     !Array.isArray(bundleDependencies) ||
@@ -129,16 +131,20 @@ export function patchBundledNpmTar(options: {
   }
 
   const current = inspectBundledNpmTar(npmRoot);
-  if (current.state === "fixed") return current;
-
   const livePath = join(npmRoot, "node_modules", "tar");
+  if (current.state === "fixed") {
+    chmodSync(realDirectory(livePath, "npm bundled tar root"), 0o755);
+    return current;
+  }
   const transactionId = `${process.pid}-${randomBytes(8).toString("hex")}`;
   const stagingRoot = mkdtempSync(join(dirname(livePath), ".tar.nemoclaw-stage-"));
   const stagedPath = join(stagingRoot, "replacement");
   const backupPath = `${livePath}.nemoclaw-backup-${transactionId}`;
-  let mutationStarted = false;
+  let rollbackRequired = false;
   try {
     cpSync(replacementRoot, stagedPath, { dereference: false, recursive: true });
+    // The transaction stays private; its installed package must be readable by the sandbox.
+    chmodSync(stagedPath, 0o755);
     cpSync(livePath, backupPath, {
       dereference: false,
       errorOnExist: true,
@@ -146,17 +152,18 @@ export function patchBundledNpmTar(options: {
       preserveTimestamps: true,
       recursive: true,
     });
-    mutationStarted = true;
+    rollbackRequired = true;
     rmSync(livePath, { recursive: true });
     renameSync(stagedPath, livePath);
     const fixed = verifyBundledNpmTar(npmRoot);
     if (fixed.tarVersion !== FIXED_TAR_VERSION) {
       throw new Error(`npm bundled tar replacement did not reach tar@${FIXED_TAR_VERSION}`);
     }
+    rollbackRequired = false;
     rmSync(backupPath, { force: true, recursive: true });
     return fixed;
   } catch (error) {
-    if (mutationStarted) {
+    if (rollbackRequired) {
       rmSync(livePath, { force: true, recursive: true });
       renameSync(backupPath, livePath);
     }
@@ -172,7 +179,10 @@ function run(command: string, args: readonly string[]): void {
   const result = spawnSync(command, args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: 60_000,
+    // The registry download permits one initial 120-second attempt plus five
+    // retries and their delays. Keep the parent process alive for that complete
+    // bounded curl policy while retaining one command-wide kill boundary.
+    timeout: BUNDLED_NPM_TAR_COMMAND_TIMEOUT_MS,
   });
   if (result.error) throw result.error;
   if (result.status !== 0) {
@@ -190,24 +200,17 @@ export type BundledNpmTarRegistryDependencies = Readonly<{
   prepareReplacement?: (commandRunner: BundledNpmTarCommandRunner) => PreparedReplacement;
 }>;
 
-function prepareFixedTarReplacement(
+function prepareFixedTarReplacementFromArchive(
+  archivePath: string,
   commandRunner: BundledNpmTarCommandRunner,
 ): PreparedReplacement {
+  if (!isAbsolute(archivePath)) {
+    throw new Error("npm bundled tar replacement archive path must be absolute");
+  }
   const rootDirectory = mkdtempSync(join(tmpdir(), "nemoclaw-npm-tar-bootstrap-"));
-  const archivePath = join(rootDirectory, `tar-${FIXED_TAR_VERSION}.tgz`);
+  const verifiedArchivePath = join(rootDirectory, `tar-${FIXED_TAR_VERSION}.tgz`);
   const replacementRoot = join(rootDirectory, "replacement");
   try {
-    commandRunner("curl", [
-      "--proto",
-      "=https",
-      "--tlsv1.2",
-      "--fail",
-      "--silent",
-      "--show-error",
-      "--output",
-      archivePath,
-      FIXED_TAR_TARBALL,
-    ]);
     const archiveDescriptor = openSync(archivePath, constants.O_RDONLY | constants.O_NOFOLLOW);
     let archiveBytes: Buffer;
     try {
@@ -225,12 +228,13 @@ function prepareFixedTarReplacement(
       );
     }
 
+    writeFileSync(verifiedArchivePath, archiveBytes, { flag: "wx", mode: 0o600 });
     mkdirSync(replacementRoot, { mode: 0o700 });
     commandRunner("tar", [
       "--extract",
       "--gzip",
       "--file",
-      archivePath,
+      verifiedArchivePath,
       "--directory",
       replacementRoot,
       "--strip-components=1",
@@ -247,18 +251,59 @@ function prepareFixedTarReplacement(
   }
 }
 
-export function patchBundledNpmTarFromRegistry(
+function prepareFixedTarReplacement(
+  commandRunner: BundledNpmTarCommandRunner,
+): PreparedReplacement {
+  const rootDirectory = mkdtempSync(join(tmpdir(), "nemoclaw-npm-tar-download-"));
+  const archivePath = join(rootDirectory, `tar-${FIXED_TAR_VERSION}.tgz`);
+  try {
+    commandRunner("curl", [
+      "--proto",
+      "=https",
+      "--tlsv1.2",
+      "--fail",
+      "--silent",
+      "--show-error",
+      "--retry",
+      "5",
+      "--retry-all-errors",
+      "--retry-delay",
+      "2",
+      "--connect-timeout",
+      "15",
+      "--max-time",
+      "120",
+      "--output",
+      archivePath,
+      FIXED_TAR_TARBALL,
+    ]);
+    const prepared = prepareFixedTarReplacementFromArchive(archivePath, commandRunner);
+    return {
+      cleanup: () => {
+        prepared.cleanup();
+        rmSync(rootDirectory, { force: true, recursive: true });
+      },
+      replacementRoot: prepared.replacementRoot,
+    };
+  } catch (error) {
+    rmSync(rootDirectory, { force: true, recursive: true });
+    throw error;
+  }
+}
+
+function patchBundledNpmTarWithPreparedReplacement(
   npmRoot: string,
-  dependencies: BundledNpmTarRegistryDependencies = {},
+  commandRunner: BundledNpmTarCommandRunner,
+  prepareReplacement: () => PreparedReplacement,
 ): BundledNpmTarState {
-  const commandRunner = dependencies.commandRunner ?? run;
   const current = inspectBundledNpmTar(npmRoot);
   if (current.state === "fixed") {
+    chmodSync(realDirectory(join(npmRoot, "node_modules", "tar"), "npm bundled tar root"), 0o755);
     commandRunner("npm", ["--version"]);
     commandRunner("npx", ["--version"]);
     return current;
   }
-  const prepared = (dependencies.prepareReplacement ?? prepareFixedTarReplacement)(commandRunner);
+  const prepared = prepareReplacement();
   try {
     const result = patchBundledNpmTar({
       npmRoot,
@@ -272,10 +317,38 @@ export function patchBundledNpmTarFromRegistry(
   }
 }
 
+export function patchBundledNpmTarFromRegistry(
+  npmRoot: string,
+  dependencies: BundledNpmTarRegistryDependencies = {},
+): BundledNpmTarState {
+  const commandRunner = dependencies.commandRunner ?? run;
+  return patchBundledNpmTarWithPreparedReplacement(npmRoot, commandRunner, () =>
+    (dependencies.prepareReplacement ?? prepareFixedTarReplacement)(commandRunner),
+  );
+}
+
+export function patchBundledNpmTarFromArchive(
+  npmRoot: string,
+  archivePath: string,
+  commandRunner: BundledNpmTarCommandRunner = run,
+): BundledNpmTarState {
+  return patchBundledNpmTarWithPreparedReplacement(npmRoot, commandRunner, () =>
+    prepareFixedTarReplacementFromArchive(archivePath, commandRunner),
+  );
+}
+
 function argument(name: string): string {
   const index = process.argv.indexOf(name);
   const value = index >= 0 ? process.argv[index + 1] : undefined;
   if (!value || value.startsWith("--")) throw new Error(`${name} is required`);
+  return value;
+}
+
+function optionalArgument(name: string): string | undefined {
+  const index = process.argv.indexOf(name);
+  if (index < 0) return undefined;
+  const value = process.argv[index + 1];
+  if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
   return value;
 }
 
@@ -285,7 +358,12 @@ function isMainModule(): boolean {
 
 if (isMainModule()) {
   try {
-    const result = patchBundledNpmTarFromRegistry(argument("--npm-root"));
+    const npmRoot = argument("--npm-root");
+    const archivePath = optionalArgument("--archive");
+    const result = archivePath
+      ? patchBundledNpmTarFromArchive(npmRoot, archivePath)
+      : patchBundledNpmTarFromRegistry(npmRoot);
+    if (archivePath) rmSync(archivePath);
     process.stdout.write(
       `Verified npm@${result.npmVersion} bundled tar@${result.tarVersion} (minimum ${MINIMUM_SAFE_TAR_VERSION})\n`,
     );

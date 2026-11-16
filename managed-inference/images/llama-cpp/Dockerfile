@@ -13,6 +13,7 @@ ARG GGML_BACKEND_DIR
 ARG C_COMPILER
 ARG CXX_COMPILER
 ARG CUDA_HOST_CXX_COMPILER
+ARG TARGETARCH
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -22,25 +23,24 @@ RUN test -n "${LLAMA_CPP_REVISION}" \
     && test -n "${GGML_BACKEND_DIR}" \
     && test -n "${C_COMPILER}" \
     && test -n "${CXX_COMPILER}" \
-    && test -n "${CUDA_HOST_CXX_COMPILER}"
+    && test -n "${CUDA_HOST_CXX_COMPILER}" \
+    && { [ "${TARGETARCH}" = "amd64" ] || [ "${TARGETARCH}" = "arm64" ]; }
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       build-essential=12.10ubuntu1 \
-      ca-certificates=20260601~24.04.1 \
+      ca-certificates=20260816ubuntu0.24.04.1 \
       cmake=3.28.3-1build7 \
-      curl=8.5.0-2ubuntu10.11 \
+      curl=8.5.0-2ubuntu10.16 \
       g++-14=14.2.0-4ubuntu2~24.04.1 \
       gcc-14=14.2.0-4ubuntu2~24.04.1 \
-      golang-go=2:1.22~2build1 \
-      libcurl4-openssl-dev=8.5.0-2ubuntu10.11 \
-      libssl-dev=3.0.13-0ubuntu3.12 \
+      libcurl4-openssl-dev=8.5.0-2ubuntu10.16 \
+      libssl-dev=3.0.13-0ubuntu3.16 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CC=${C_COMPILER} \
     CXX=${CXX_COMPILER} \
     CUDAHOSTCXX=${CUDA_HOST_CXX_COMPILER}
-
 WORKDIR /src/llama.cpp
 
 RUN curl --fail --location --proto '=https' --tlsv1.2 --retry 5 \
@@ -81,23 +81,6 @@ RUN cmake -S . -B build \
     && find /opt/llama.cpp/licenses -type d -exec chmod 0555 '{}' + \
     && find /opt/llama.cpp/licenses -type f -exec chmod 0444 '{}' +
 
-WORKDIR /src/nemoclaw-request-guard
-
-COPY request-guard/go.mod request-guard/*.go ./
-
-RUN go test ./... \
-    && CGO_ENABLED=0 go build \
-      -trimpath \
-      -ldflags='-s -w -buildid=' \
-      -o /opt/llama.cpp/bin/nemoclaw-llama-cpp-request-guard . \
-    && mkdir -p /opt/llama.cpp/licenses/go \
-    && set -- /usr/share/doc/golang-[0-9]*-go/copyright \
-    && test "$#" -eq 1 \
-    && cp "$1" /opt/llama.cpp/licenses/go/copyright \
-    && chmod 0555 /opt/llama.cpp/bin/nemoclaw-llama-cpp-request-guard \
-    && chmod 0555 /opt/llama.cpp/licenses/go \
-    && chmod 0444 /opt/llama.cpp/licenses/go/copyright
-
 FROM ${CUDA_RUNTIME_IMAGE} AS runtime
 
 ARG CUDA_DEV_IMAGE
@@ -122,9 +105,11 @@ RUN test -n "${CUDA_DEV_IMAGE}" \
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates=20260601~24.04.1 \
-      libcurl4t64=8.5.0-2ubuntu10.11 \
+      ca-certificates=20260816ubuntu0.24.04.1 \
+      curl=8.5.0-2ubuntu10.16 \
+      libcurl4t64=8.5.0-2ubuntu10.16 \
       libgomp1=14.2.0-4ubuntu2~24.04.1 \
+      libssl3t64=3.0.13-0ubuntu3.16 \
     && groupadd --gid "${RUNTIME_GID}" nemoclaw-llama \
     && useradd --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
       --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin nemoclaw-llama \
@@ -140,7 +125,6 @@ RUN apt-get update \
       /usr/bin/sh
 
 COPY --from=build --chmod=0555 /opt/llama.cpp/bin/llama-server /usr/local/bin/llama-server
-COPY --from=build --chmod=0555 /opt/llama.cpp/bin/nemoclaw-llama-cpp-request-guard /usr/local/bin/nemoclaw-llama-cpp-request-guard
 COPY --from=build --chmod=0555 /opt/llama.cpp/lib/ /opt/llama.cpp/lib/
 COPY --from=build /opt/llama.cpp/licenses/ /usr/local/share/licenses/
 

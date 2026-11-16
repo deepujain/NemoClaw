@@ -12,12 +12,16 @@ import type {
   HostLocalInferenceOperationInput,
   HostLocalInferenceReceipt,
   HostLocalInferenceRuntime,
+  HostLocalManagedInferenceInspection,
 } from "./host-local-inference";
 import { serializeHostLocalInferenceReceipt } from "./host-local-inference";
 import {
+  assertHermesPortableHostLocalInferencePublishedRecoveryTransactionCurrent,
+  assertPreparedHostLocalInferenceRuntimePresent,
   confirmHostLocalInferenceAuthority,
   type ManagedHostLocalInferenceService,
   type PreparedHostLocalInferenceAuthority,
+  prepareHermesPortableHostLocalInferencePublishedRecoveryAuthority,
   prepareSandboxHostLocalInferenceAuthority,
   prepareSandboxHostLocalInferenceDestroyAuthority,
   retirePreparedHostLocalInferenceAuthority,
@@ -172,6 +176,9 @@ function provider(
     readonly engineId?: string;
     readonly preserveForRebuild?: (value: HostLocalInferenceReceipt) => HostLocalInferenceReceipt;
     readonly prepareDestroy?: (value: HostLocalInferenceReceipt) => HostLocalInferenceReceipt;
+    readonly preparePublishedRecoveryEntry?: (
+      value: HostLocalInferenceReceipt,
+    ) => HostLocalManagedInferenceInspection;
     readonly destroy?: (value: HostLocalInferenceReceipt) => HostLocalInferenceDestroyResult;
   } = {},
 ) {
@@ -182,6 +189,9 @@ function provider(
   const prepareDestroy = vi.fn(
     (value: HostLocalInferenceReceipt) => options.prepareDestroy?.(value) ?? value,
   );
+  const preparePublishedRecoveryEntry = options.preparePublishedRecoveryEntry
+    ? vi.fn(options.preparePublishedRecoveryEntry)
+    : undefined;
   let present = true;
   const destroyContainer = (value: HostLocalInferenceReceipt): HostLocalInferenceDestroyResult => {
     const status = present ? "removed" : "already-absent";
@@ -203,10 +213,12 @@ function provider(
     inspectManaged: vi.fn((value) => ({ running: true, receipt: value })),
     stopManaged: vi.fn((value) => ({ running: false, receipt: value })),
     preserveForRebuild,
+    ...(preparePublishedRecoveryEntry ? { preparePublishedRecoveryEntry } : {}),
     prepareDestroy,
     destroy,
   };
   const assertAuthority = vi.fn();
+  const assertTransactionCurrent = vi.fn();
   const operation: HostLocalInferenceOperation = {
     providerId: "mxc",
     engine: {
@@ -217,6 +229,7 @@ function provider(
     } as HostLocalInferenceOperation["engine"],
     bindingSha256: options.bindingSha256 ?? BINDING_SHA256,
     assertAuthority,
+    assertTransactionCurrent,
     spawn: vi.fn() as HostLocalInferenceOperation["spawn"],
     createLlamaCppLifecycle: vi.fn() as HostLocalInferenceOperation["createLlamaCppLifecycle"],
     managedRuntime: runtime,
@@ -237,11 +250,14 @@ function provider(
   });
   return {
     assertAuthority,
+    assertTransactionCurrent,
     bundle,
     createOperation,
     destroy,
+    operation,
     operationInputs,
     prepareDestroy,
+    preparePublishedRecoveryEntry,
     preserveForRebuild,
     runtime,
   };
@@ -388,15 +404,89 @@ describe("host-local inference lifecycle authority", () => {
     );
 
     expect(
-      retirePreparedHostLocalInferenceAuthority(
-        runtimeProvider.bundle,
+      retirePreparedHostLocalInferenceAuthority(runtimeProvider.bundle, alpha, prepared, [
+        beta,
         alpha,
-        prepared,
-        [beta, alpha],
-        lifecycleOptions,
-      ).status,
+      ]).status,
     ).toBe("shared");
     expect(runtimeProvider.destroy).not.toHaveBeenCalled();
+  });
+
+  it("reuses the pre-delete llama.cpp operation for provenance-tracked retirement (#9888)", () => {
+    const qualified = provider();
+    const drifted = provider({ authorityId: `drifted:${"9".repeat(64)}` });
+    qualified.createOperation
+      .mockImplementationOnce(() => qualified.operation)
+      .mockImplementation(() => drifted.operation);
+    const entry = explicitLlamaSandbox();
+    const createLlamaCppAdapter = vi.fn((options) => {
+      const selected = options.operation === qualified.operation ? qualified : drifted;
+      return {
+        gatewayPort: options.gatewayPort ?? 8080,
+        runtimeOwnerSandboxName: options.runtimeOwnerSandboxName,
+        model: "llama-cpp-model",
+        operation: options.operation!,
+        receipt: options.expectedReceipt,
+        runtime: selected.runtime,
+        prepareStartup: vi.fn(),
+      };
+    });
+    const lifecycleOptions = { createLlamaCppAdapter };
+    const prepared = requiredPrepared(
+      prepareSandboxHostLocalInferenceDestroyAuthority(qualified.bundle, entry, lifecycleOptions),
+    );
+
+    expect(
+      retirePreparedHostLocalInferenceAuthority(qualified.bundle, entry, prepared, [entry]).status,
+    ).toBe("removed");
+    expect(qualified.createOperation).toHaveBeenCalledOnce();
+    expect(qualified.assertAuthority).toHaveBeenCalledTimes(2);
+    expect(qualified.destroy).toHaveBeenCalledOnce();
+    expect(drifted.destroy).not.toHaveBeenCalled();
+  });
+
+  it.each(SERVICES)("reuses the pre-delete %s operation during retirement (#9888)", (service) => {
+    const runtimeProvider = provider();
+    const entry = sandbox("alpha", receipt(service));
+    const prepared = requiredPrepared(
+      prepareSandboxHostLocalInferenceDestroyAuthority(runtimeProvider.bundle, entry),
+    );
+
+    expect(
+      retirePreparedHostLocalInferenceAuthority(runtimeProvider.bundle, entry, prepared, [entry])
+        .status,
+    ).toBe(service === "ollama" ? "retained" : "removed");
+    expect(runtimeProvider.createOperation).toHaveBeenCalledOnce();
+    expect(runtimeProvider.assertAuthority).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses provenance-tracked retirement when prepared authority drifts (#9888)", () => {
+    const qualified = provider();
+    qualified.assertAuthority
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => {
+        throw new Error("prepared authority drifted");
+      });
+    const entry = explicitLlamaSandbox();
+    const createLlamaCppAdapter = vi.fn((options) => ({
+      gatewayPort: options.gatewayPort ?? 8080,
+      runtimeOwnerSandboxName: options.runtimeOwnerSandboxName,
+      model: "llama-cpp-model",
+      operation: options.operation!,
+      receipt: options.expectedReceipt,
+      runtime: qualified.runtime,
+      prepareStartup: vi.fn(),
+    }));
+    const prepared = requiredPrepared(
+      prepareSandboxHostLocalInferenceDestroyAuthority(qualified.bundle, entry, {
+        createLlamaCppAdapter,
+      }),
+    );
+
+    expect(() =>
+      retirePreparedHostLocalInferenceAuthority(qualified.bundle, entry, prepared, [entry]),
+    ).toThrow("prepared authority drifted");
+    expect(qualified.destroy).not.toHaveBeenCalled();
   });
 
   it("rejects a llama.cpp peer on a different gateway before retirement", () => {
@@ -422,13 +512,10 @@ describe("host-local inference lifecycle authority", () => {
     );
 
     expect(() =>
-      retirePreparedHostLocalInferenceAuthority(
-        runtimeProvider.bundle,
+      retirePreparedHostLocalInferenceAuthority(runtimeProvider.bundle, alpha, prepared, [
         alpha,
-        prepared,
-        [alpha, beta],
-        lifecycleOptions,
-      ),
+        beta,
+      ]),
     ).toThrow(/conflicting gateway, route, or provenance authority/);
     expect(runtimeProvider.destroy).not.toHaveBeenCalled();
   });
@@ -459,13 +546,10 @@ describe("host-local inference lifecycle authority", () => {
     );
 
     expect(() =>
-      retirePreparedHostLocalInferenceAuthority(
-        runtimeProvider.bundle,
+      retirePreparedHostLocalInferenceAuthority(runtimeProvider.bundle, alpha, prepared, [
         alpha,
-        prepared,
-        [alpha, beta],
-        lifecycleOptions,
-      ),
+        beta,
+      ]),
     ).toThrow(/conflicting gateway, route, or provenance authority/);
     expect(runtimeProvider.destroy).not.toHaveBeenCalled();
   });
@@ -496,13 +580,10 @@ describe("host-local inference lifecycle authority", () => {
     );
 
     expect(() =>
-      retirePreparedHostLocalInferenceAuthority(
-        runtimeProvider.bundle,
+      retirePreparedHostLocalInferenceAuthority(runtimeProvider.bundle, alpha, prepared, [
         alpha,
-        prepared,
-        [alpha, beta],
-        lifecycleOptions,
-      ),
+        beta,
+      ]),
     ).toThrow(/conflicting gateway, route, or provenance authority/);
     expect(runtimeProvider.destroy).not.toHaveBeenCalled();
   });
@@ -622,6 +703,78 @@ describe("host-local inference lifecycle authority", () => {
     expect(runtimeProvider.preserveForRebuild).not.toHaveBeenCalled();
   });
 
+  it("uses only the dedicated published-recovery entry proof for Hermes Ollama", () => {
+    const value = receipt("ollama");
+    const entry = sandbox("alpha", value, { agent: "hermes" });
+    let now = 0;
+    const onTimingComplete = vi.fn(() => {
+      throw new Error("timing sink unavailable");
+    });
+    const runtimeProvider = provider({
+      preparePublishedRecoveryEntry: (current) => ({ running: true, receipt: current }),
+    });
+
+    const prepared = requiredPrepared(
+      prepareHermesPortableHostLocalInferencePublishedRecoveryAuthority(
+        runtimeProvider.bundle,
+        entry,
+        {},
+        { now: () => (now += 4), onComplete: onTimingComplete },
+        runtimeProvider.operation,
+      ),
+    );
+
+    expect(prepared.managedInspection).toEqual({ running: true, receipt: value });
+    expect(runtimeProvider.preparePublishedRecoveryEntry).toHaveBeenCalledOnce();
+    expect(runtimeProvider.preparePublishedRecoveryEntry).toHaveBeenCalledWith(value);
+    expect(runtimeProvider.prepareDestroy).not.toHaveBeenCalled();
+    expect(runtimeProvider.assertAuthority).not.toHaveBeenCalled();
+    expect(runtimeProvider.assertTransactionCurrent).not.toHaveBeenCalled();
+    expect(onTimingComplete).toHaveBeenCalledWith(4);
+  });
+
+  it("retains the published recovery operation between full runtime inspections", () => {
+    const value = receipt("ollama");
+    const entry = sandbox("alpha", value, { agent: "hermes" });
+    const runtimeProvider = provider({
+      preparePublishedRecoveryEntry: (current) => ({ running: false, receipt: current }),
+    });
+    const prepared = requiredPrepared(
+      prepareHermesPortableHostLocalInferencePublishedRecoveryAuthority(
+        runtimeProvider.bundle,
+        entry,
+        {},
+        undefined,
+        runtimeProvider.operation,
+      ),
+    );
+
+    assertHermesPortableHostLocalInferencePublishedRecoveryTransactionCurrent(
+      runtimeProvider.bundle,
+      entry,
+      prepared,
+    );
+
+    expect(runtimeProvider.operation.assertTransactionCurrent).toHaveBeenCalledOnce();
+    expect(runtimeProvider.runtime.inspectManaged).not.toHaveBeenCalled();
+    expect(runtimeProvider.prepareDestroy).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when published recovery has no dedicated entry proof", () => {
+    const runtimeProvider = provider();
+
+    expect(() =>
+      prepareHermesPortableHostLocalInferencePublishedRecoveryAuthority(
+        runtimeProvider.bundle,
+        sandbox("alpha", receipt("ollama"), { agent: "hermes" }),
+        {},
+        undefined,
+        runtimeProvider.operation,
+      ),
+    ).toThrow("published recovery runtime entry authority is missing");
+    expect(runtimeProvider.prepareDestroy).not.toHaveBeenCalled();
+  });
+
   it.each(SERVICES)("retires exact unshared %s authority", (service) => {
     const value = receipt(service);
     const entry = sandbox("alpha", value);
@@ -636,6 +789,19 @@ describe("host-local inference lifecycle authority", () => {
     ).toBe(service === "ollama" ? "retained" : "removed");
     expect(runtimeProvider.destroy).toHaveBeenCalledOnce();
     expect(runtimeProvider.prepareDestroy).toHaveBeenCalledTimes(2);
+  });
+
+  it("inspects prepared runtime presence without another destroy preflight", () => {
+    const entry = sandbox();
+    const runtimeProvider = provider();
+    const prepared = requiredPrepared(
+      prepareSandboxHostLocalInferenceDestroyAuthority(runtimeProvider.bundle, entry),
+    );
+
+    assertPreparedHostLocalInferenceRuntimePresent(runtimeProvider.bundle, entry, prepared);
+
+    expect(runtimeProvider.prepareDestroy).toHaveBeenCalledOnce();
+    expect(runtimeProvider.runtime.inspectManaged).toHaveBeenCalledWith(prepared.receipt);
   });
 
   it("retains an exact runtime referenced by a coherent peer sandbox", () => {

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,6 +20,7 @@ import {
   type PortableCpuDelegationProofMode,
   runPortableCpuDelegationProofMode,
 } from "../../../scripts/checks/run-portable-cpu-delegation-proof.mts";
+import { PORTABLE_HOST_GATEWAY_IP } from "../../../src/lib/onboard/experimental/portable-profile.ts";
 import {
   readRepoText,
   readYaml,
@@ -47,20 +48,9 @@ function proofJob(): WorkflowJob {
   return job!;
 }
 
-function delegationJob(): WorkflowJob {
-  const job = workflow().jobs["portable-cpu-delegation"];
-  expect(job).toBeDefined();
-  return job!;
-}
-
 function namedStep(name: string): WorkflowStep {
   const step = proofJob().steps?.find((candidate) => candidate.name === name);
   expect(step, `missing Podman CPU proof step '${name}'`).toBeDefined();
-  return step!;
-}
-function namedDelegationStep(name: string): WorkflowStep {
-  const step = delegationJob().steps?.find((candidate) => candidate.name === name);
-  expect(step, `missing CPU delegation proof step '${name}'`).toBeDefined();
   return step!;
 }
 type RecordedCommand = {
@@ -360,6 +350,39 @@ function withProofFixture(run: (fixture: ProofFixture) => void): void {
   }
 }
 describe("native Podman CPU proof workflow", () => {
+  it.each([
+    "src/lib/adapters/openshell/sandbox-lifecycle-sdk.ts",
+    "src/lib/adapters/openshell/sdk.ts",
+    "src/lib/onboard/managed-startup/**",
+    "src/lib/onboard/sandbox-create/**",
+    "src/lib/onboard/sandbox-create-launch.ts",
+    "src/lib/onboard/sandbox-create-step.ts",
+    "src/lib/onboard/sandbox-gpu-create-flow.ts",
+    "src/lib/onboard/sandbox-gpu-create-run-attempt.ts",
+    "src/lib/onboard/runtime-provider/contract.ts",
+  ])("selects the proof when %s changes", (adapterPath) => {
+    const selectedPath = workflow().on.pull_request.paths.find(
+      (candidate) => candidate === adapterPath,
+    );
+    expect(selectedPath).toBe(adapterPath);
+  });
+
+  it("installs the reviewed OpenShell SDK before the lifecycle proof", () => {
+    const install = namedStep("Install locked test dependencies");
+    expect(install.run).toContain("openshell-sdk-install.mts prepare");
+    expect(install.run).toContain("--include=optional");
+    expect(install.run).toContain("openshell-sdk-install.mts check");
+  });
+
+  it("selects the rootless proof when the Portable gateway authority changes (#9587)", () => {
+    const authorityPath = "src/lib/onboard/experimental/portable-profile.ts";
+    const selectedPath = workflow().on.pull_request.paths.find(
+      (candidate) => candidate === authorityPath,
+    );
+
+    expect(selectedPath).toBe(authorityPath);
+  });
+
   it("executes the five typed proof modes with exact argv and durable cleanup receipts (#9188)", () => {
     withProofFixture((fixture) => {
       const modes: readonly PortableCpuDelegationProofMode[] = [
@@ -527,7 +550,11 @@ describe("native Podman CPU proof workflow", () => {
         [fixture.runner.envAtCreate.get(delegationTemp), "E2E_CPU_DELEGATION_DROP_IN_TEMP_CREATED"],
         [fixture.runner.envAtCreate.get(userSliceTemp), "E2E_USER_SLICE_DROP_IN_TEMP_CREATED"],
       ] as const;
-      expect(records.every(([environment, name]) => environment?.includes(`${name}=unrecorded\n`) === true)).toBe(true);
+      expect(
+        records.every(
+          ([environment, name]) => environment?.includes(`${name}=unrecorded\n`) === true,
+        ),
+      ).toBe(true);
       expect(fixture.runner.envAtCreate.get(appTemp)).toContain(
         `E2E_APP_SLICE_DROP_IN_TEMP=${appTemp}\n`,
       );
@@ -746,7 +773,6 @@ describe("native Podman CPU proof workflow", () => {
       const imported = spawnSync(
         process.execPath,
         [
-          "--experimental-strip-types",
           "--no-warnings",
           "--input-type=module",
           "-e",
@@ -759,29 +785,29 @@ describe("native Podman CPU proof workflow", () => {
       expect(() => portableCpuDelegationProofCli(["cleanup", "extra"], fixture)).toThrow(
         /Expected exactly one mode/u,
       );
-      const rejected = spawnSync(
-        process.execPath,
-        ["--experimental-strip-types", "--no-warnings", scriptPath, "unknown"],
-        { cwd: path.resolve("."), encoding: "utf8", env },
-      );
+      const rejected = spawnSync(process.execPath, ["--no-warnings", scriptPath, "unknown"], {
+        cwd: path.resolve("."),
+        encoding: "utf8",
+        env,
+      });
       expect(rejected.status).toBe(1);
       expect(rejected.stderr).toContain("Expected exactly one mode");
-      const cleaned = spawnSync(
-        process.execPath,
-        ["--experimental-strip-types", "--no-warnings", scriptPath, "cleanup"],
-        { cwd: path.resolve("."), encoding: "utf8", env },
-      );
+      const cleaned = spawnSync(process.execPath, ["--no-warnings", scriptPath, "cleanup"], {
+        cwd: path.resolve("."),
+        encoding: "utf8",
+        env,
+      });
       expect(cleaned.status).toBe(0);
       fs.writeFileSync(
         path.join(bin, "sudo"),
         "#!/usr/bin/env node\nprocess.kill(process.pid, 'SIGTERM');\n",
         { mode: 0o755 },
       );
-      const signaled = spawnSync(
-        process.execPath,
-        ["--experimental-strip-types", "--no-warnings", scriptPath, "cleanup"],
-        { cwd: path.resolve("."), encoding: "utf8", env },
-      );
+      const signaled = spawnSync(process.execPath, ["--no-warnings", scriptPath, "cleanup"], {
+        cwd: path.resolve("."),
+        encoding: "utf8",
+        env,
+      });
       expect(signaled.status).toBe(1);
       expect(signaled.stderr).toContain("sudo terminated by SIGTERM");
     });
@@ -874,5 +900,107 @@ describe("native Podman CPU proof workflow", () => {
     expect(cleanup.run).toContain('podman --url "$endpoint" network rm openshell-docker');
     const stopGateway = namedStep("Stop the exact portable-retirement proof gateway");
     expect(stopGateway.env?.E2E_PORTABLE_GATEWAY_STOP_SCOPE).toBe("full");
+  });
+
+  it("exports the verified Portable host gateway IP and stops the rootless Podman service after gateway IP lookup fails (#9587)", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-podman-gateway-step-"));
+    const bin = path.join(directory, "bin");
+    const commandLog = path.join(directory, "commands.log");
+    const githubEnv = path.join(directory, "github-env");
+    fs.mkdirSync(bin);
+    fs.writeFileSync(githubEnv, "");
+    const writeCommand = (name: string, body: string) =>
+      fs.writeFileSync(path.join(bin, name), `#!/usr/bin/env bash\nset -euo pipefail\n${body}\n`, {
+        mode: 0o755,
+      });
+    writeCommand(
+      "node",
+      'printf "node\\n" >>"$COMMAND_LOG"; [ "${FAKE_NODE_FAILURE:-0}" = 0 ] || exit 23; printf "%s" "$FAKE_GATEWAY_IP"',
+    );
+    writeCommand(
+      "sudo",
+      'printf "sudo %s\\n" "$*" >>"$COMMAND_LOG"; if [ -n "${E2E_PODMAN_SERVICE_PID:-}" ] && kill -0 "$E2E_PODMAN_SERVICE_PID" 2>/dev/null; then printf "service-running-at-sudo\\n" >>"$COMMAND_LOG"; fi',
+    );
+    writeCommand(
+      "ip",
+      'printf "ip %s\\n" "$*" >>"$COMMAND_LOG"; printf "1: lo inet %s/32 scope host lo\\n" "${FAKE_IP_GATEWAY_IP:-$FAKE_GATEWAY_IP}"',
+    );
+    writeCommand("podman", 'printf "podman %s\\n" "$*" >>"$COMMAND_LOG"');
+    const baseEnv = {
+      ...process.env,
+      COMMAND_LOG: commandLog,
+      FAKE_GATEWAY_IP: PORTABLE_HOST_GATEWAY_IP,
+      GITHUB_ENV: githubEnv,
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+    };
+    const run = (script: string, env: NodeJS.ProcessEnv = {}) =>
+      spawnSync("bash", ["-c", script], {
+        cwd: path.resolve("."),
+        encoding: "utf8",
+        env: { ...baseEnv, ...env },
+      });
+    try {
+      const configure = namedStep("Configure exact Portable host gateway alias").run ?? "";
+      const configured = run(configure);
+      expect(configured.status, configured.stderr).toBe(0);
+      expect(fs.readFileSync(githubEnv, "utf8")).toBe(
+        `E2E_PORTABLE_HOST_GATEWAY_IP=${PORTABLE_HOST_GATEWAY_IP}\n`,
+      );
+      expect(fs.readFileSync(commandLog, "utf8").trim().split("\n")).toEqual([
+        "node",
+        `sudo ip address replace ${PORTABLE_HOST_GATEWAY_IP}/32 dev lo`,
+        "ip -o -4 address show dev lo",
+      ]);
+
+      fs.writeFileSync(githubEnv, "");
+      const unverified = run(configure, { FAKE_IP_GATEWAY_IP: "169.254.99.1" });
+      expect(unverified.status).not.toBe(0);
+      expect(fs.readFileSync(githubEnv, "utf8")).toBe("");
+
+      const cleanup = namedStep("Clean up rootless Podman runtime").run ?? "";
+      const gatewayCleanupStart = cleanup.indexOf("# gateway-alias-cleanup");
+      expect(gatewayCleanupStart).toBeGreaterThanOrEqual(0);
+      const gatewayCleanup = cleanup.slice(gatewayCleanupStart);
+      const runCleanup = async (env: NodeJS.ProcessEnv) => {
+        const service = spawn("sleep", ["60"], { stdio: "ignore" });
+        expect(service.pid).toBeDefined();
+        let timer: ReturnType<typeof setTimeout>;
+        const stoppedPromise = new Promise<boolean>((resolve) => {
+          service.once("exit", () => {
+            clearTimeout(timer);
+            resolve(true);
+          });
+          timer = setTimeout(() => resolve(false), 10_000);
+        });
+        const result = run(gatewayCleanup, {
+          ...env,
+          E2E_PODMAN_SERVICE_PID: String(service.pid),
+        });
+        const stopped = await stoppedPromise;
+        service.kill();
+        return { result, stopped };
+      };
+      fs.writeFileSync(commandLog, "");
+      const cleaned = await runCleanup({
+        E2E_PORTABLE_HOST_GATEWAY_IP: PORTABLE_HOST_GATEWAY_IP,
+      });
+      expect(cleaned.result.status, cleaned.result.stderr).toBe(0);
+      expect(cleaned.stopped).toBe(true);
+      const cleanupLog = fs.readFileSync(commandLog, "utf8");
+      expect(cleanupLog).toContain(`sudo ip address delete ${PORTABLE_HOST_GATEWAY_IP}/32 dev lo`);
+      expect(cleanupLog).toContain("service-running-at-sudo");
+
+      fs.writeFileSync(commandLog, "");
+      const failedLookup = await runCleanup({
+        E2E_PORTABLE_HOST_GATEWAY_IP: PORTABLE_HOST_GATEWAY_IP,
+        FAKE_NODE_FAILURE: "1",
+      });
+      expect(failedLookup.result.status, failedLookup.result.stderr).toBe(0);
+      expect(failedLookup.stopped).toBe(true);
+      const failureLog = fs.readFileSync(commandLog, "utf8");
+      expect(failureLog).not.toContain("sudo ip address delete");
+    } finally {
+      fs.rmSync(directory, { force: true, recursive: true });
+    }
   });
 });

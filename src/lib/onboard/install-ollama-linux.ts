@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import nodePath from "node:path";
@@ -36,13 +37,60 @@ const {
   setResolvedOllamaHost,
 }: typeof import("../inference/local") = require("../inference/local");
 
+export const OFFICIAL_OLLAMA_INSTALLER_URL =
+  "https://raw.githubusercontent.com/ollama/ollama/de25dd526f4c9ba367ee69022168c6c5f2dc3285/scripts/install.sh";
+export const OFFICIAL_OLLAMA_INSTALLER_HOST = new URL(OFFICIAL_OLLAMA_INSTALLER_URL).hostname;
+export const OFFICIAL_OLLAMA_INSTALLER_SHA256 =
+  "25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f";
+const OFFICIAL_OLLAMA_INSTALLER_PROCESS_TIMEOUT_MS = 190_000;
+const CURL_DOWNLOAD_FAILURES: Partial<Record<number, string>> = {
+  5: "Proxy name resolution or configuration failed.",
+  6: "Could not resolve the download host.",
+  7: "Could not connect to the server or proxy.",
+  22: "The server returned an HTTP error.",
+  28: "The download timed out.",
+  35: "The TLS connection failed.",
+  60: "TLS certificate verification failed.",
+};
+
+/**
+ * Build a recovery-oriented failure message for an attempted download of the
+ * pinned official Ollama installer. Names the URL and host that failed,
+ * summarizes common curl failures, and tells the user which host to allow
+ * (or which proxy to use) before rerunning onboarding.
+ */
+export function ollamaInstallerDownloadFailureMessage(exitCode: number | null): string {
+  // Even curl's failure line can contain credentials from proxy configuration.
+  // Display only known summaries, never host-provided stderr.
+  const curlDetail = exitCode === null ? undefined : CURL_DOWNLOAD_FAILURES[exitCode];
+  const lines = [
+    `  Ollama installer download failed after bounded retries (exit ${exitCode ?? "unknown"}).`,
+    `  Could not download: ${OFFICIAL_OLLAMA_INSTALLER_URL}`,
+    `  Required host:     ${OFFICIAL_OLLAMA_INSTALLER_HOST} (outbound HTTPS, port 443)`,
+  ];
+  if (curlDetail) {
+    lines.push(`  curl reported:     ${curlDetail}`);
+  }
+  lines.push(
+    `  Allow outbound HTTPS to ${OFFICIAL_OLLAMA_INSTALLER_HOST} through your firewall or`,
+    `  proxy (for example, export HTTPS_PROXY to a working proxy), verify with:`,
+    `    curl -fsSI "${OFFICIAL_OLLAMA_INSTALLER_URL}"`,
+    `  then rerun ${cliName()} onboard.`,
+  );
+  return lines.join("\n");
+}
+
+export function sha256File(filePath: string): string {
+  return createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
 /**
  * Install location modes.
  *
- *  - `system`     installs into `/usr/local` via the official Ollama
- *                 installer script (`https://ollama.com/install.sh`). Requires
- *                 sudo, configures a systemd service, and writes to a system
- *                 user (`ollama`). This is the historical path.
+ *  - `system`     installs into `/usr/local` via a digest-verified snapshot of
+ *                 the official Ollama installer. Requires sudo, configures a
+ *                 systemd service, and writes to a system user (`ollama`).
+ *                 This is the historical path.
  *  - `user-local` installs into `${HOME}/.local` by downloading the official
  *                 release tarball directly and extracting it as the invoking
  *                 user. No sudo, no systemd, no system user. The daemon is
@@ -64,6 +112,8 @@ export type InstallOllamaLinuxOptions = InstallOllamaLinuxModeOptions & {
   arch?: () => NodeJS.Architecture;
   /** Test seam: override `runShell`. */
   runShellImpl?: typeof runShell;
+  /** Test seam: override local SHA-256 calculation. */
+  sha256FileImpl?: typeof sha256File;
   /** Test seam: override systemd loopback override. */
   ensureManagedOllamaLoopbackSystemdOverrideImpl?: typeof ensureManagedOllamaLoopbackSystemdOverride;
   /** Minimum daemon context length to request for the selected agent. */
@@ -116,15 +166,18 @@ function detectJetpackVariant(opts: InstallOllamaLinuxOptions): "jetpack5" | "je
 }
 
 /**
- * Run the official `https://ollama.com/install.sh`. Sudo-bound. Configures
- * the systemd `ollama.service`, creates the `ollama` system user, and
- * installs CUDA drivers when applicable. An upgrade that replaces a stale
- * binary asks the installer for `MIN_OLLAMA_VERSION` by name; a fresh install
- * has no floor to satisfy and takes latest.
+ * Run the pinned official Ollama installer. Sudo-bound. Configures the
+ * systemd `ollama.service`, creates the `ollama` system user, and installs
+ * CUDA drivers when applicable. An upgrade that replaces a stale binary asks
+ * the installer for `MIN_OLLAMA_VERSION` by name; a fresh install has no floor
+ * to satisfy and takes latest.
  */
 function runOfficialInstallScript(opts: InstallOllamaLinuxOptions): void {
   const log = opts.log ?? ((m: string) => console.log(m));
+  const errorLog = opts.errorLog ?? ((m: string) => console.error(m));
+  const runCaptureExImpl = opts.runCaptureExImpl ?? runCaptureEx;
   const runShellImpl = opts.runShellImpl ?? runShell;
+  const sha256FileImpl = opts.sha256FileImpl ?? sha256File;
   ensureOllamaLinuxExtractionDependencies(opts);
   log(
     "  The Ollama installer creates a system user, a systemd service, and writes to /usr/local. " +
@@ -134,9 +187,86 @@ function runOfficialInstallScript(opts: InstallOllamaLinuxOptions): void {
   if (versionPin) {
     log(`  Requesting Ollama ${MIN_OLLAMA_VERSION} from the installer.`);
   }
-  runShellImpl(`set -o pipefail; curl -fsSL https://ollama.com/install.sh | ${versionPin}sh`, {
-    stdio: "inherit",
-  });
+
+  const installerDirectory = fs.mkdtempSync(
+    nodePath.join(os.tmpdir(), "nemoclaw-ollama-installer-"),
+  );
+  const installerPath = nodePath.join(installerDirectory, "install.sh");
+
+  let failure: { exitCode: number; message: string } | null = null;
+  try {
+    fs.writeFileSync(installerPath, "", { flag: "wx", mode: 0o600 });
+    const fetchResult = runCaptureExImpl(
+      [
+        "curl",
+        "--fail",
+        "--show-error",
+        "--silent",
+        "--location",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "120",
+        "--retry",
+        "3",
+        "--retry-all-errors",
+        "--retry-delay",
+        "1",
+        "--retry-max-time",
+        "180",
+        "--output",
+        installerPath,
+        OFFICIAL_OLLAMA_INSTALLER_URL,
+      ],
+      { timeout: OFFICIAL_OLLAMA_INSTALLER_PROCESS_TIMEOUT_MS },
+    );
+    if (fetchResult.exitCode !== 0) {
+      failure = {
+        exitCode: fetchResult.exitCode ?? 1,
+        message: ollamaInstallerDownloadFailureMessage(fetchResult.exitCode),
+      };
+    } else {
+      let actualSha256 = "";
+      try {
+        actualSha256 = sha256FileImpl(installerPath);
+      } catch (error) {
+        failure = {
+          exitCode: 1,
+          message: `  Unable to verify Ollama installer integrity: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      if (!failure && actualSha256 !== OFFICIAL_OLLAMA_INSTALLER_SHA256) {
+        failure = {
+          exitCode: 1,
+          message:
+            "  Ollama installer integrity check failed; refusing to execute downloaded content.",
+        };
+      }
+    }
+    if (!failure) {
+      const installResult = runShellImpl(`${versionPin}sh ${shellQuote(installerPath)}`, {
+        ignoreError: true,
+        stdio: "inherit",
+      });
+      if (installResult.error || installResult.status !== 0) {
+        failure = {
+          exitCode: installResult.status ?? 1,
+          message: `  Ollama installer failed (exit ${installResult.status ?? "unknown"}).`,
+        };
+      }
+    }
+  } finally {
+    fs.rmSync(installerDirectory, { force: true, recursive: true });
+  }
+
+  if (failure) {
+    errorLog(failure.message);
+    process.exit(failure.exitCode);
+  }
 }
 
 /**

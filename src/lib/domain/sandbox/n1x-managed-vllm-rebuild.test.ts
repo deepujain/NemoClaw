@@ -12,7 +12,63 @@ import {
   parseHostLocalInferenceReceipt,
   serializeHostLocalInferenceReceipt,
 } from "../../onboard/runtime-provider/host-local-inference";
-import { isRecordedN1xManagedVllmRebuildEligible } from "./n1x-managed-vllm-rebuild";
+import {
+  isDeferredN1xManagedVllmAcceptanceRoute,
+  isRecordedN1xManagedVllmRebuildEligible,
+} from "./n1x-managed-vllm-rebuild";
+
+describe("Deferred N1x managed-vLLM acceptance route", () => {
+  const accepted = {
+    provider: "vllm-local",
+    model: "nvidia/Qwen3.6-35B-A3B-NVFP4",
+    endpointUrl: "http://host.openshell.internal:8000/v1",
+    endpointSource: null,
+    nimContainer: null,
+    openshellDriver: "docker",
+  };
+
+  it.each([
+    ["the exact route", accepted, true],
+    ["a derived legacy endpoint", { ...accepted, endpointUrl: null }, true],
+    ["another provider", { ...accepted, provider: "compatible-endpoint" }, false],
+    ["another model", { ...accepted, model: "other" }, false],
+    ["a recorded endpoint", { ...accepted, endpointUrl: "http://localhost:8000/v1" }, false],
+    ["another endpoint source", { ...accepted, endpointSource: "inference-set" }, false],
+    ["a NIM container", { ...accepted, nimContainer: "nemoclaw-nim" }, false],
+    ["another driver", { ...accepted, openshellDriver: "kubernetes" }, false],
+  ])("classifies %s", (_case, route, expected) => {
+    expect(isDeferredN1xManagedVllmAcceptanceRoute(route)).toBe(expected);
+  });
+
+  it.each([1024, 8000, 18000, 65535])(
+    "accepts the canonical endpoint on port %s (#11510)",
+    (port) => {
+      expect(
+        isDeferredN1xManagedVllmAcceptanceRoute({
+          ...accepted,
+          endpointUrl: `http://host.openshell.internal:${port}/v1`,
+        }),
+      ).toBe(true);
+    },
+  );
+
+  it.each([
+    undefined,
+    "",
+    "http://host.openshell.internal:1023/v1",
+    "http://host.openshell.internal:65536/v1",
+    "http://host.openshell.internal:08000/v1",
+    "http://host.openshell.internal.example:8000/v1",
+    "http://user:password@host.openshell.internal:8000/v1",
+    "https://host.openshell.internal:8000/v1",
+    "http://host.openshell.internal:8000/v1/",
+    "http://host.openshell.internal:8000/v1?target=other",
+    "http://host.openshell.internal:8000/v1#other",
+    "http://host.openshell.internal:8000/v1\n",
+  ])("rejects noncanonical endpoint %s (#11510)", (endpointUrl) => {
+    expect(isDeferredN1xManagedVllmAcceptanceRoute({ ...accepted, endpointUrl })).toBe(false);
+  });
+});
 
 describe("recorded N1x managed-vLLM rebuild eligibility", () => {
   const n1xExpressEntry = {
@@ -33,11 +89,13 @@ describe("recorded N1x managed-vLLM rebuild eligibility", () => {
     rebuildSelection: Parameters<
       typeof isRecordedN1xManagedVllmRebuildEligible
     >[1] = n1xExpressSelection,
+    vllmPort = 8000,
   ) =>
     isRecordedN1xManagedVllmRebuildEligible(
       sandboxEntry,
       rebuildSelection,
       parseHostLocalInferenceReceipt,
+      { vllmPort },
     );
 
   it.each([
@@ -57,6 +115,31 @@ describe("recorded N1x managed-vLLM rebuild eligibility", () => {
     expect(eligible(sandboxEntry)).toBe(true);
   });
 
+  it.each([null, "http://host.openshell.internal:8000/v1"])(
+    "accepts recorded N1x preview intent with endpoint %s (#11510)",
+    (endpointUrl) => {
+      expect(
+        eligible({
+          ...n1xExpressEntry,
+          endpointUrl,
+          endpointSource: null,
+          deferredN1xManagedVllmAccepted: true,
+        }),
+      ).toBe(true);
+    },
+  );
+
+  it("accepts an explicit preview retry for a normalized legacy record (#10959)", () => {
+    expect(
+      isRecordedN1xManagedVllmRebuildEligible(
+        { ...n1xExpressEntry, endpointSource: null },
+        n1xExpressSelection,
+        parseHostLocalInferenceReceipt,
+        { explicitPreviewIntent: true },
+      ),
+    ).toBe(true);
+  });
+
   it("accepts a canonical vLLM receipt on the exact N1x Express selection (#9292)", () => {
     const genericReceipt = hostLocalInferenceReceipt("docker");
     const n1xReceipt = serializeHostLocalInferenceReceipt({
@@ -73,6 +156,31 @@ describe("recorded N1x managed-vLLM rebuild eligibility", () => {
     });
 
     expect(eligible({ ...n1xExpressEntry, hostLocalInferenceReceipt: n1xReceipt })).toBe(true);
+  });
+
+  it("uses the configured vLLM port for the recorded endpoint and receipt", () => {
+    const genericReceipt = hostLocalInferenceReceipt("docker");
+    const n1xReceipt = serializeHostLocalInferenceReceipt({
+      ...genericReceipt,
+      endpoint: {
+        ...genericReceipt.endpoint,
+        host: "host.openshell.internal",
+        port: 18000,
+      },
+      inference: {
+        protocol: "openai-chat-completions",
+        model: n1xExpressEntry.model,
+        toolCallingRequired: true,
+      },
+    });
+    const sandboxEntry = {
+      ...n1xExpressEntry,
+      endpointUrl: "http://host.openshell.internal:18000/v1",
+      hostLocalInferenceReceipt: n1xReceipt,
+    };
+
+    expect(eligible(sandboxEntry, n1xExpressSelection, 18000)).toBe(true);
+    expect(eligible(sandboxEntry, n1xExpressSelection, 8000)).toBe(false);
   });
 
   it.each([
@@ -94,6 +202,29 @@ describe("recorded N1x managed-vLLM rebuild eligibility", () => {
     {
       caseName: "different endpoint source",
       sandboxEntry: { ...n1xExpressEntry, endpointSource: "inference-set" },
+      rebuildSelection: n1xExpressSelection,
+    },
+    {
+      caseName: "normalized source without preview provenance",
+      sandboxEntry: { ...n1xExpressEntry, endpointSource: null },
+      rebuildSelection: n1xExpressSelection,
+    },
+    {
+      caseName: "recorded endpoint without preview provenance",
+      sandboxEntry: {
+        ...n1xExpressEntry,
+        endpointUrl: "http://host.openshell.internal:8000/v1",
+        endpointSource: null,
+      },
+      rebuildSelection: n1xExpressSelection,
+    },
+    {
+      caseName: "malformed preview acceptance",
+      sandboxEntry: {
+        ...n1xExpressEntry,
+        endpointSource: null,
+        deferredN1xManagedVllmAccepted: "true",
+      },
       rebuildSelection: n1xExpressSelection,
     },
     {

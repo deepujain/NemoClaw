@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Hosted Runner Recovery
+name: Automation / Recover Platform CI Runner
 
 run-name: Hosted runner recovery for source run ${{ github.event.workflow_run.id }}
 
 on:
   workflow_run:
     workflows:
-      - CI / Platform Evidence
+      - CI / Platform Compatibility
     types:
       - completed
 
@@ -47,14 +47,17 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          node-version: "24.22.1"
+
+      - name: Install reviewed npm
+        uses: ./.github/actions/setup-reviewed-npm
 
       - name: Evaluate exact hosted-runner-loss evidence
         env:
           GITHUB_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
         run: >-
-          node --experimental-strip-types --no-warnings
+          node --no-warnings
           tools/e2e/hosted-runner-recovery.mts
 
       - name: Record static recovery policy

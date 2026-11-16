@@ -3,6 +3,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const WECHAT_PACKAGE = "@tencent-weixin/openclaw-weixin";
 const WECHAT_LOCATION = `node_modules/${WECHAT_PACKAGE}`;
@@ -112,11 +113,11 @@ export function verifyOpenClawPeerCompatibility(runtimeVersion: string, peerRang
   }
 }
 
-export function verifyWechatRuntimeLock(
+export async function verifyWechatRuntimeLock(
   lockFile: string,
   projectsRoot: string,
   openClawVersion: string,
-): void {
+): Promise<void> {
   const expected = expectedWechatGraph(readJson(lockFile) as PackageLock);
   const installedLockFile = findInstalledLock(projectsRoot);
   const installedRoot = path.dirname(installedLockFile);
@@ -149,6 +150,21 @@ export function verifyWechatRuntimeLock(
       verifyOpenClawPeerCompatibility(openClawVersion, expectedPeerRange);
     }
   }
+  // The channel loads its inbound handler lazily. A satisfied peer range does
+  // not prove that the installed host exports the SDK APIs this handler uses.
+  await import(
+    pathToFileURL(
+      path.join(installedRoot, WECHAT_LOCATION, "dist/src/messaging/process-message.js"),
+    ).href
+  );
+  // The typing factory is loaded only when an inbound message reaches dispatch.
+  // Importing the handler alone does not exercise this SDK dependency.
+  const { loadTypingCallbacksFactory } = await import(
+    pathToFileURL(path.join(installedRoot, WECHAT_LOCATION, "dist/src/messaging/typing.js")).href
+  );
+  if (typeof (await loadTypingCallbacksFactory()) !== "function") {
+    throw new Error("installed WeChat typing callback factory is unavailable");
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -158,5 +174,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       "usage: verify-wechat-runtime-lock.mts <package-lock.json> <npm-projects-root> <openclaw-version>",
     );
   }
-  verifyWechatRuntimeLock(lockFile, projectsRoot, openClawVersion);
+  await verifyWechatRuntimeLock(lockFile, projectsRoot, openClawVersion);
 }

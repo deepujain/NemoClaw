@@ -9,15 +9,24 @@ const canonicalCredentialFilterBoundary = path.resolve(
   import.meta.dirname,
   "src/shared/credential-filter-boundary.cts",
 );
+const canonicalOpenShellExternalTargetBoundary = path.resolve(
+  import.meta.dirname,
+  "src/shared/openshell-external-target-boundary.cts",
+);
+const canonicalOpenShellObservationBoundary = path.resolve(
+  import.meta.dirname,
+  "src/shared/openshell-observation-boundary.cts",
+);
 const canonicalOpenShellPolicyBoundary = path.resolve(
   import.meta.dirname,
   "src/shared/openshell-policy-boundary.cts",
 );
-const canonicalSandboxName = path.resolve(import.meta.dirname, "src/shared/sandbox-name.cts");
-const canonicalSnapshotSanitizerBoundary = path.resolve(
+const canonicalPortBoundary = path.resolve(import.meta.dirname, "src/shared/port-boundary.cts");
+const canonicalPrivateNetworksBoundary = path.resolve(
   import.meta.dirname,
-  "src/shared/snapshot-sanitizer-boundary.cts",
+  "src/shared/private-networks-boundary.cts",
 );
+const canonicalSandboxName = path.resolve(import.meta.dirname, "src/shared/sandbox-name.cts");
 
 type PluginVitestProjectOptions = {
   root: string;
@@ -57,16 +66,28 @@ const pluginVitestProjectOptions = {
         replacement: canonicalCredentialFilterBoundary,
       },
       {
+        find: /^.*openshell-external-target-boundary\.cjs$/,
+        replacement: canonicalOpenShellExternalTargetBoundary,
+      },
+      {
+        find: /^.*openshell-observation-boundary\.cjs$/,
+        replacement: canonicalOpenShellObservationBoundary,
+      },
+      {
         find: /^.*openshell-policy-boundary\.cjs$/,
         replacement: canonicalOpenShellPolicyBoundary,
       },
       {
-        find: /^.*sandbox-name\.cjs$/,
-        replacement: canonicalSandboxName,
+        find: /^.*port-boundary\.cjs$/,
+        replacement: canonicalPortBoundary,
       },
       {
-        find: /^.*snapshot-sanitizer-boundary\.cjs$/,
-        replacement: canonicalSnapshotSanitizerBoundary,
+        find: /^.*private-networks-boundary\.cjs$/,
+        replacement: canonicalPrivateNetworksBoundary,
+      },
+      {
+        find: /^.*sandbox-name\.cjs$/,
+        replacement: canonicalSandboxName,
       },
     ],
     env: {

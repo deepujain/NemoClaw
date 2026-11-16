@@ -1,24 +1,43 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { recordTelemetryTarget } from "../../telemetry/operation";
 import * as agentRuntime from "../../../agent/runtime";
-import { withMcpLifecycleLock } from "../../../state/mcp-lifecycle-lock";
+import { inspectPortableAgentReceiptDisposition } from "../../../onboard/experimental/portable-agent-lifecycle";
+import { withSandboxLifecycleLock } from "../lifecycle/lock";
 import { connectSandbox } from "../connect";
 import {
   prepareHermesCronRestoreRecovery,
   recoverHermesCronRestore,
 } from "../rebuild-hermes-post-restore";
+import { waitForGatedHermesGatewayRecovery } from "./hermes-lifecycle";
 
 const RECOVERY_LOCK_TIMEOUT_MS = 30_000;
 
 /** Re-establish a Hermes gate before gateway repair, then validate and release it. */
 export async function recoverSandboxWithHermesCronRestore(sandboxName: string): Promise<void> {
-  await withMcpLifecycleLock(
+  await withSandboxLifecycleLock(
     sandboxName,
     async () => {
+      const portable = inspectPortableAgentReceiptDisposition(sandboxName);
+      if (portable.kind === "hermes") {
+        await connectSandbox(sandboxName, {
+          probeOnly: true,
+          requireLaunchReadinessPublication: false,
+        });
+        return;
+      }
       const agent = agentRuntime.getSessionAgent(sandboxName);
       if (agent?.name === "hermes") {
-        prepareHermesCronRestoreRecovery(sandboxName);
+        const preparation = prepareHermesCronRestoreRecovery(sandboxName);
+        if (preparation !== "unsupported" && preparation.gatewayRecoveryRequested) {
+          const started = await waitForGatedHermesGatewayRecovery(sandboxName);
+          if (!started) {
+            throw new Error(
+              `Hermes gateway did not become observable after its gated recovery request in sandbox '${sandboxName}'`,
+            );
+          }
+        }
       }
       await connectSandbox(sandboxName, {
         probeOnly: true,
@@ -45,4 +64,5 @@ export async function recoverSandboxWithHermesCronRestore(sandboxName: string): 
     },
     { timeoutMs: RECOVERY_LOCK_TIMEOUT_MS },
   );
+  recordTelemetryTarget({ scope: "sandbox", sandboxName, outcome: "completed", state: "applied" });
 }

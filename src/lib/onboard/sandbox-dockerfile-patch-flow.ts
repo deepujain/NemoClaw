@@ -7,8 +7,8 @@ import {
   SandboxBaseImageResolutionError,
   type SandboxBaseImageResolutionMetadata,
 } from "../sandbox-base-image";
-import type { PreservedEnvFile } from "../state/preserved-env";
 import { DEFAULT_TOOL_DISCLOSURE, type ToolDisclosure } from "../tool-disclosure";
+import { readDockerfilePatchSnapshot } from "./dockerfile-tool-disclosure-contract";
 import type { DcodeAutoApprovalMode } from "./dcode-auto-approval";
 import type { SelectedDockerGpuRoute } from "./docker-gpu-route";
 import type { SandboxGpuConfig } from "./sandbox-gpu-mode";
@@ -42,11 +42,11 @@ export type PrepareSandboxDockerfilePatchInput = {
   chatUiUrl: string;
   provider: string | null;
   endpointUrl?: string | null;
+  nativeProvider?: boolean;
   compatibleEndpointReasoning?: "true" | "false";
   preferredInferenceApi: string | null;
   webSearchConfig: WebSearchConfig | null;
   toolDisclosure?: ToolDisclosure;
-  rebuildPreservedEnv?: readonly PreservedEnvFile[];
   dcodeAutoApprovalMode?: DcodeAutoApprovalMode;
   hermesToolGateways: string[];
   sandboxGpuConfig: SandboxGpuConfig;
@@ -99,6 +99,12 @@ function enforceDockerGpuPatchPreserveNetwork(
   return impl(...args);
 }
 
+function reverifySandboxBridgeGatewayReachability(port?: number): Promise<void> {
+  const { verifySandboxBridgeGatewayReachableOrExit } =
+    require("./gateway-sandbox-reachability") as typeof import("./gateway-sandbox-reachability");
+  return verifySandboxBridgeGatewayReachableOrExit(true, { skip: false, port });
+}
+
 function patchStagedDockerfile(
   ...args: Parameters<PatchStagedDockerfile>
 ): ReturnType<PatchStagedDockerfile> {
@@ -117,11 +123,11 @@ export async function prepareSandboxDockerfilePatch({
   chatUiUrl,
   provider,
   endpointUrl = null,
+  nativeProvider,
   compatibleEndpointReasoning,
   preferredInferenceApi,
   webSearchConfig,
   toolDisclosure = DEFAULT_TOOL_DISCLOSURE,
-  rebuildPreservedEnv,
   dcodeAutoApprovalMode,
   hermesToolGateways,
   sandboxGpuConfig,
@@ -134,7 +140,14 @@ export async function prepareSandboxDockerfilePatch({
   warn = console.warn,
   deps = {},
 }: PrepareSandboxDockerfilePatchInput): Promise<SandboxDockerfilePatchResult> {
-  const shouldResolveBaseImage = !(agent && !fromDockerfile);
+  // Decide against the same immutable source that the patcher will commit.
+  // A literal custom FROM cannot consume the default sandbox-base resolution.
+  const sourceSnapshot = fromDockerfile ? readDockerfilePatchSnapshot(stagedDockerfile) : null;
+  const shouldResolveBaseImage = sourceSnapshot
+    ? (require("./dockerfile-patch") as typeof import("./dockerfile-patch")).hasSandboxBaseImageArg(
+        sourceSnapshot.content,
+      )
+    : !agent;
   const getDockerDriverGateway =
     deps.isLinuxDockerDriverGatewayEnabled ?? linuxDockerDriverGatewayEnabled;
   const dockerDriverGateway = getDockerDriverGateway();
@@ -181,6 +194,7 @@ export async function prepareSandboxDockerfilePatch({
       selectedRoute: selectedGpuRoute,
       gatewayPort,
       log,
+      reverifyBridgeReachability: () => reverifySandboxBridgeGatewayReachability(gatewayPort),
     },
   );
   const darwinVmCompat = false;
@@ -209,10 +223,11 @@ export async function prepareSandboxDockerfilePatch({
     (() => {
       const metadata = fromDockerfile ? null : (resolved?.metadata ?? preResolvedBaseImageMetadata);
       return {
+        ...(sourceSnapshot ? { sourceSnapshot } : {}),
         agentName: managedAgentName,
+        nativeProvider,
         buildIdPolicy,
         toolDisclosure,
-        ...(rebuildPreservedEnv ? { rebuildPreservedEnv } : {}),
         ...(!fromDockerfile ? { trustedManagedDockerfile: true } : {}),
         ...(!fromDockerfile && managedAgentName === "openclaw"
           ? { wslDashboardExposure: managedOpenClawWslExposure }

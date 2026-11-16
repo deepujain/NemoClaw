@@ -107,11 +107,13 @@ export function makeDeps(overrides: Partial<SetupNimFlowDeps> = {}): SetupNimFlo
     createNvidiaFeaturedModelSession: () => ({
       select: async () => unexpected("featured model selection"),
     }),
-    detectInferenceProviderHostState: () => makeHostState(),
+    detectInferenceProviderHostState: vi.fn(() => makeHostState()),
     getAgentInferenceProviderOptions: () => [],
-    loadRoutedProfile: () => null,
+
     readRecordedProvider: () => null,
     readRecordedNimContainer: () => null,
+    readRecordedManagedLlamaCpp: () => false,
+    readRecordedManagedLlamaCppRecipeId: () => null,
     readRecordedModel: () => null,
     rejectWindowsHostOllama: () => false,
     prompt: async () => "",
@@ -122,14 +124,15 @@ export function makeDeps(overrides: Partial<SetupNimFlowDeps> = {}): SetupNimFlo
     exitProcess: (code) => unexpected(`exitProcess(${code})`),
     abortNonInteractive: (message) => unexpected(`abortNonInteractive(${message})`),
     handleLlamaCppSelection: async () => unexpected("llama.cpp selection"),
-    handleRemoteProviderSelection: async () => unexpected("remote provider selection"),
+    handleRemoteProviderSelection: vi.fn(async () => unexpected("remote provider selection")),
     handleNimLocalSelection: async () => unexpected("local NIM selection"),
     handleRunningOllamaSelection: async () => unexpected("running Ollama selection"),
     handleWindowsHostOllamaSelection: async () => unexpected("Windows Ollama selection"),
     handleInstallOllamaSelection: async () => unexpected("Ollama install selection"),
     installVllm: async () => unexpected("vLLM install"),
     handleVllmSelection: async () => unexpected("vLLM selection"),
-    handleRoutedSelection: async () => unexpected("routed selection"),
+    selectVllmModelFromEnv: () => null,
+
     coerceAgentInferenceApi: (_agent, preferredInferenceApi) => preferredInferenceApi,
     resolveAgentInferenceApi: (_agentName, _provider, preferredInferenceApi) =>
       preferredInferenceApi,

@@ -3,11 +3,13 @@
 
 import type { HermesBuildSettings } from "./build-env.ts";
 import {
+  HERMES_RELAY_PLUGINS_ENV,
+  HERMES_RELAY_PLUGINS_FILE,
+} from "../../../src/lib/hermes-switchyard-routing.ts";
+import {
   effectiveManagedToolGatewayPresets,
   loadManagedToolGatewayMatrix,
 } from "./managed-tool-gateway.ts";
-
-const TAVILY_API_KEY_PLACEHOLDER = "openshell:resolve:env:TAVILY_API_KEY";
 
 export function buildHermesEnvLines(
   settings: HermesBuildSettings,
@@ -15,12 +17,12 @@ export function buildHermesEnvLines(
 ): string[] {
   const envLines = ["API_SERVER_PORT=18642", "API_SERVER_HOST=127.0.0.1"];
 
-  for (const { envKey, placeholder } of settings.messagingCredentialPlaceholders) {
-    envLines.push(`${envKey}=${placeholder}`);
+  if (settings.switchyardRouting) {
+    envLines.push(`${HERMES_RELAY_PLUGINS_ENV}=${HERMES_RELAY_PLUGINS_FILE}`);
   }
 
-  if (settings.webSearchProvider === "tavily") {
-    envLines.push(`TAVILY_API_KEY=${TAVILY_API_KEY_PLACEHOLDER}`);
+  for (const { envKey, placeholder } of settings.messagingCredentialPlaceholders) {
+    envLines.push(`${envKey}=${placeholder}`);
   }
 
   const managedToolGatewayPresets = effectiveManagedToolGatewayPresets(settings);

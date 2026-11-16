@@ -8,21 +8,100 @@ import {
   installRebuildFlowTestHooks,
   snapshotEnv,
 } from "../../../../test/helpers/rebuild-flow-generic-harness";
+import type { ServingProfileProvenance } from "../../inference/serving/profile-provenance";
+
+const savedProfileProvenance: ServingProfileProvenance = {
+  schemaVersion: 1,
+  catalogDigest: `sha256:${"1".repeat(64)}`,
+  preset: {
+    id: "vllm.dgx-spark-gb10.single.example",
+    digest: `sha256:${"2".repeat(64)}`,
+    displayName: "Example Spark profile",
+    supportState: "experimental",
+  },
+  recipe: {
+    id: "vllm.dgx-spark-gb10.single.example",
+    digest: `sha256:${"3".repeat(64)}`,
+    backend: "vllm",
+  },
+  model: { id: "example/model", revision: "revision-1" },
+  runtimeImage: null,
+  estimatedImageDownloadBytes: null,
+  estimatedModelDownloadBytes: null,
+};
 
 describe("rebuildSandbox flow: target session", () => {
   installRebuildFlowTestHooks();
+
+  it.each(["alpha", "other"])(
+    "preserves saved profile metadata with current session %s (#11417)",
+    async (sessionSandboxName) => {
+      let recreatedProvenance: unknown;
+      const harness = createRebuildFlowHarness({
+        sessionSandboxName,
+        sandboxEntry: {
+          provider: "build",
+          model: "example/model",
+          servingProfileProvenance: savedProfileProvenance,
+        },
+        onboard: (session) => {
+          recreatedProvenance = session.servingProfileProvenance;
+        },
+      });
+      harness.session.provider = "build";
+      harness.session.model = "example/model";
+      // Stale session metadata must not replace the sandbox's saved metadata.
+      harness.session.servingProfileProvenance = {
+        ...savedProfileProvenance,
+        catalogDigest: `sha256:${"4".repeat(64)}`,
+      };
+
+      await harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true });
+
+      expect(recreatedProvenance).toEqual(savedProfileProvenance);
+    },
+  );
+
+  it.each(["alpha", "other"])(
+    "keeps missing profile metadata absent with current session %s (#11417)",
+    async (sessionSandboxName) => {
+      let recreatedProvenance: unknown;
+      const harness = createRebuildFlowHarness({
+        sessionSandboxName,
+        sandboxEntry: {
+          provider: "build",
+          model: "example/model",
+          servingProfileProvenance: undefined,
+        },
+        onboard: (session) => {
+          recreatedProvenance = session.servingProfileProvenance;
+        },
+      });
+      harness.session.provider = "build";
+      harness.session.model = "example/model";
+      harness.session.servingProfileProvenance = savedProfileProvenance;
+
+      await harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true });
+
+      expect(recreatedProvenance).toBeNull();
+    },
+  );
+
   it("isolates ambient onboard-selection env during recreate, then restores it (#5735)", async () => {
     const restoreEnv = snapshotEnv([
       "NEMOCLAW_AGENT",
+      "NEMOCLAW_PROVIDER",
       "NEMOCLAW_PROVIDER_KEY",
       "NVIDIA_INFERENCE_API_KEY",
     ]);
     process.env.NEMOCLAW_AGENT = "langchain-deepagents-code";
+    process.env.NEMOCLAW_PROVIDER = "install-vllm";
     process.env.NEMOCLAW_PROVIDER_KEY = "sk-bogus-installer-key";
     process.env.NVIDIA_INFERENCE_API_KEY = "hosted-source-key";
 
     let envSeenInsideOnboard: {
       agent: string | undefined;
+      provider: string | undefined;
       providerKey: string | undefined;
       hostedSourceKey: string | undefined;
     } | null = null;
@@ -33,6 +112,7 @@ describe("rebuildSandbox flow: target session", () => {
         onboard: () => {
           envSeenInsideOnboard = {
             agent: process.env.NEMOCLAW_AGENT,
+            provider: process.env.NEMOCLAW_PROVIDER,
             providerKey: process.env.NEMOCLAW_PROVIDER_KEY,
             hostedSourceKey: process.env.NVIDIA_INFERENCE_API_KEY,
           };
@@ -45,14 +125,49 @@ describe("rebuildSandbox flow: target session", () => {
 
       expect(envSeenInsideOnboard).toEqual({
         agent: undefined,
+        provider: undefined,
         providerKey: undefined,
         hostedSourceKey: "hosted-source-key",
       });
       const logged = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
       expect(logged).toContain("Ignoring ambient NEMOCLAW_AGENT='langchain-deepagents-code'");
       expect(process.env.NEMOCLAW_AGENT).toBe("langchain-deepagents-code");
+      expect(process.env.NEMOCLAW_PROVIDER).toBe("install-vllm");
       expect(process.env.NEMOCLAW_PROVIDER_KEY).toBe("sk-bogus-installer-key");
       expect(process.env.NVIDIA_INFERENCE_API_KEY).toBe("hosted-source-key");
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("stops an unattached N1x managed-vLLM rebuild before deleting the sandbox (#10955)", async () => {
+    const restoreEnv = snapshotEnv(["NEMOCLAW_PROVIDER"]);
+    process.env.NEMOCLAW_PROVIDER = "install-vllm";
+    try {
+      const harness = createRebuildFlowHarness({
+        applyPreset: () => true,
+        sandboxEntry: {
+          provider: "vllm-local",
+          model: "nvidia/Qwen3.6-35B-A3B-NVFP4",
+          endpointUrl: null,
+          endpointSource: null,
+          openshellDriver: "docker",
+          hostLocalInferenceReceipt: null,
+          nimContainer: null,
+        },
+      });
+      harness.session.provider = "vllm-local";
+      harness.session.model = "nvidia/Qwen3.6-35B-A3B-NVFP4";
+      harness.session.endpointUrl = null;
+      harness.session.credentialEnv = null;
+      harness.session.preferredInferenceApi = "openai-completions";
+
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
+      ).rejects.toThrow("Legacy shared local inference cannot be rebuilt safely");
+      expectNoSandboxDelete(harness.runOpenshellSpy);
+      expect(harness.onboardSpy).not.toHaveBeenCalled();
+      expect(process.env.NEMOCLAW_PROVIDER).toBe("install-vllm");
     } finally {
       restoreEnv();
     }
@@ -66,7 +181,7 @@ describe("rebuildSandbox flow: target session", () => {
 
     try {
       const harness = createRebuildFlowHarness({
-        sandboxEntry: { agent: "hermes" },
+        sandboxEntry: { agent: "hermes", provider: "build" },
         baseImagePreflight: {
           ok: true,
           imageRef: "nemoclaw-hermes-sandbox-base-local:12345678",

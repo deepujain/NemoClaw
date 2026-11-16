@@ -15,11 +15,7 @@
  * paired-but-idle channel cannot be mistaken for working.
  */
 
-import type {
-  ChannelHealthReport,
-  DiagnosticSeverity,
-  DiagnosticSignal,
-} from "../../channel-health";
+import type { ChannelHealthReport, DiagnosticSignal } from "../../channel-health";
 
 export type { DiagnosticSeverity, DiagnosticSignal } from "../../channel-health";
 
@@ -79,7 +75,7 @@ export type WhatsappProbeInput = {
   // depending on the system clock.
   probedAt: string;
   // Whether the whatsapp preset is recorded in the sandbox registry.
-  presetInRegistry: boolean;
+  presetApplied: boolean;
   // Whether the whatsapp preset's network policy is loaded on the gateway,
   // or null when the gateway could not be reached.
   presetOnGateway: boolean | null;
@@ -132,9 +128,10 @@ function isParseableTimestamp(value: string | null): value is string {
   return value !== null && Number.isFinite(Date.parse(value));
 }
 
-// A rebuild restores the legacy dashboard session instead of dropping it, so
-// re-pairing alone leaves the sandbox holding two credential sets. Send the
-// operator through `channels remove`, which clears every WhatsApp session path.
+// Successfully started current images migrate this legacy session. If the
+// compatibility probe still sees it, send the operator through the explicit
+// removal flow rather than guessing whether an older image or a migration
+// collision left two credential sets.
 const HERMES_LEGACY_DASHBOARD_SESSION_HINT =
   "Run `nemoclaw <sandbox> channels remove whatsapp` to clear every WhatsApp session path, then `nemoclaw <sandbox> channels add whatsapp`. Pair again from the dashboard so credentials are stored in `/sandbox/.hermes/platforms/whatsapp/session`. Rerun `nemoclaw <sandbox> channels status --channel whatsapp`.";
 
@@ -382,7 +379,7 @@ function inboundSignal(input: WhatsappProbeInput): DiagnosticSignal {
 }
 
 function policyCoverageSignal(input: WhatsappProbeInput): DiagnosticSignal {
-  if (input.presetOnGateway === false && input.presetInRegistry) {
+  if (input.presetOnGateway === false && input.presetApplied) {
     return {
       label: "Policy coverage",
       severity: "fail",
@@ -390,7 +387,7 @@ function policyCoverageSignal(input: WhatsappProbeInput): DiagnosticSignal {
       hint: "rebuild the sandbox so the preset is reapplied to the OpenShell gateway",
     };
   }
-  if (!input.presetInRegistry) {
+  if (!input.presetApplied) {
     // A missing local preset is a deterministic gap regardless of gateway
     // reachability — the next rebuild will not reapply WhatsApp egress and
     // the channel will eventually fail closed. Treat it as a fail so the

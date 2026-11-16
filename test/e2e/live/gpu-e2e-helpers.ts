@@ -3,81 +3,67 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { ownChildProcess } from "../../helpers/child-process-lifecycle.ts";
 
-import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
 import { resultText } from "../fixtures/clients/index.ts";
-import { type SandboxClient, validateSandboxName } from "../fixtures/clients/sandbox.ts";
+import type { SandboxClient } from "../fixtures/clients/sandbox.ts";
+import type { CleanupRegistry } from "../fixtures/cleanup.ts";
 import { expect } from "../fixtures/e2e-test.ts";
+import type { LifecyclePhaseFixture } from "../fixtures/phases/lifecycle.ts";
 import { CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
+import { spawnObservedChild } from "../fixtures/observed-child-process.ts";
+import { pollUntil } from "../fixtures/polling.ts";
+import type { TestProgress } from "../fixtures/progress.ts";
 import type { ShellProbeResult } from "../fixtures/shell-probe.ts";
 import { stripAnsi } from "./json-envelope.ts";
+import { cleanupOllama, env, SANDBOX_NAME, PROXY_PORT } from "./gpu-e2e-ollama.ts";
+
+export {
+  cleanupOllama,
+  ollamaCleanupScript,
+  env,
+  SANDBOX_NAME,
+  PROXY_PORT,
+} from "./gpu-e2e-ollama.ts";
 
 export { REPO_ROOT };
 
+/** The export fixture owns only this attached daemon; onboarding owns the auth proxy. */
+export function startAttachedOllama(progress: TestProgress, environment: NodeJS.ProcessEnv) {
+  const child = spawnObservedChild("ollama", ["serve"], {
+    activityLabel: "attached Ollama daemon",
+    progress,
+    spawn: { cwd: REPO_ROOT, env: environment, stdio: "ignore" },
+  });
+  return ownChildProcess(child);
+}
+
+export function waitForAttachedOllama(
+  host: HostCliClient,
+  environment: NodeJS.ProcessEnv,
+  artifactPrefix = "export-daemon-ready",
+) {
+  // Connection refusal and curl timeouts are transient while this fixture's child starts.
+  return pollUntil({
+    artifactPrefix,
+    attempts: 20,
+    delayMs: 500,
+    probe: (_attempt, artifactName) =>
+      host.command(
+        "curl",
+        ["-q", "--noproxy", "*", "-fsS", "--max-time", "2", "http://127.0.0.1:11439/api/tags"],
+        { artifactName, env: environment, timeoutMs: 5000 },
+      ),
+    accept: (result) => result.exitCode === 0,
+    terminal: (result) =>
+      result.exitCode !== 0 && result.exitCode !== 7 && result.exitCode !== 28
+        ? "The attached daemon readiness read failed."
+        : undefined,
+  });
+}
+
 export const CLI = CLI_ENTRYPOINT;
-export const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-gpu-ollama";
-const DEFAULT_GPU_E2E_MODEL = "qwen3.5:9b";
-validateSandboxName(SANDBOX_NAME);
-export const PROXY_PORT = tcpPort(process.env.NEMOCLAW_OLLAMA_PROXY_PORT, "11435");
-
-export function shouldBootstrapLlamaCppGenericGpuTarget(
-  environment: NodeJS.ProcessEnv = process.env,
-): boolean {
-  return (
-    environment.NEMOCLAW_RUN_LIVE_E2E === "1" &&
-    /^[a-f0-9]{40}$/u.test(environment.NEMOCLAW_E2E_EXPECTED_SHA ?? "") &&
-    environment.E2E_LLAMA_CPP_DEDICATED_LANE !== "1"
-  );
-}
-
-export function buildLlamaCppCompatibilityTargetEnv(
-  base: NodeJS.ProcessEnv = process.env,
-): NodeJS.ProcessEnv {
-  const forwarded = [
-    "NEMOCLAW_E2E_CORRELATION_ID",
-    "NEMOCLAW_E2E_EXPECTED_SHA",
-    "NEMOCLAW_E2E_SHARD",
-  ].reduce<NodeJS.ProcessEnv>(
-    (selected, key) => ({
-      ...selected,
-      ...(base[key] === undefined ? {} : { [key]: base[key] }),
-    }),
-    {},
-  );
-  return {
-    ...buildAvailabilityProbeEnv(base),
-    ...forwarded,
-    NEMOCLAW_RUN_LIVE_E2E: "1",
-  };
-}
-
-function tcpPort(value: string | undefined, fallback: string): string {
-  const raw = value ?? fallback;
-  if (!/^[1-9][0-9]*$/u.test(raw)) throw new Error(`invalid TCP port: ${raw}`);
-  const port = Number.parseInt(raw, 10);
-  if (port < 1 || port > 65_535) throw new Error(`invalid TCP port: ${raw}`);
-  return raw;
-}
-
-export function env(
-  extra: NodeJS.ProcessEnv = {},
-  base: NodeJS.ProcessEnv = process.env,
-): NodeJS.ProcessEnv {
-  return {
-    ...buildAvailabilityProbeEnv(base),
-    NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE: "1",
-    NEMOCLAW_NON_INTERACTIVE: "1",
-    NEMOCLAW_MODEL: base.NEMOCLAW_MODEL ?? DEFAULT_GPU_E2E_MODEL,
-    NEMOCLAW_PROVIDER: "ollama",
-    NEMOCLAW_OLLAMA_PROXY_PORT: PROXY_PORT,
-    NEMOCLAW_RECREATE_SANDBOX: "1",
-    NEMOCLAW_SANDBOX_NAME: SANDBOX_NAME,
-    OPENSHELL_GATEWAY: process.env.OPENSHELL_GATEWAY ?? "nemoclaw",
-    ...extra,
-  };
-}
-
 function isShellProbeResult(value: unknown): value is ShellProbeResult {
   return (
     typeof value === "object" &&
@@ -106,10 +92,13 @@ export async function preCleanBestEffort(
   }
 }
 
-export function ollamaProxyTokenFile(): string {
-  const home = process.env.HOME;
+export function ollamaProxyTokenFile(home = process.env.HOME): string {
   if (!home) throw new Error("HOME environment variable is required");
   return path.join(home, ".nemoclaw", "ollama-proxy-token");
+}
+
+export function createGpuPrivateHome(home: string): string {
+  return fs.mkdtempSync(path.join(home, ".nemoclaw-gpu-e2e-"));
 }
 
 export function openClawModelConfigProjectionScript(
@@ -206,25 +195,31 @@ export function assertAgentExecutionSucceeded(
   );
 }
 
-export async function cleanupGpu(host: HostCliClient, sandbox: SandboxClient): Promise<void> {
+export async function cleanupGpu(
+  host: HostCliClient,
+  lifecycle: LifecyclePhaseFixture,
+  sandbox: SandboxClient,
+  environment: NodeJS.ProcessEnv = env(),
+): Promise<void> {
   await preCleanBestEffort("destroy GPU sandbox", () =>
     host.command("node", [CLI, SANDBOX_NAME, "destroy", "--yes"], {
       artifactName: "cleanup-destroy-gpu",
-      env: env(),
+      env: environment,
       timeoutMs: 120_000,
     }),
   );
   await preCleanBestEffort("delete OpenShell sandbox", () =>
     sandbox.cleanupSandbox(SANDBOX_NAME, {
       artifactName: "cleanup-delete-gpu",
-      env: env(),
+      env: environment,
       timeoutMs: 60_000,
     }),
   );
-  await preCleanBestEffort("destroy OpenShell gateway", () =>
-    sandbox.openshell(["gateway", "destroy", "-g", "nemoclaw"], {
+  await lifecycle.stopGatewayRuntime({ env: environment, userServiceMode: "permanent" });
+  await preCleanBestEffort("remove OpenShell gateway registration", () =>
+    host.cleanupGatewayRegistration("nemoclaw", {
       artifactName: "cleanup-gateway-destroy-gpu",
-      env: env(),
+      env: environment,
       timeoutMs: 60_000,
     }),
   );
@@ -232,50 +227,23 @@ export async function cleanupGpu(host: HostCliClient, sandbox: SandboxClient): P
   expect(ollamaCleanup.exitCode, resultText(ollamaCleanup)).toBe(0);
 }
 
-export async function cleanupOllama(
+export function trackGpuGatewayCleanup(
+  cleanup: Pick<CleanupRegistry, "trackDisposable">,
   host: HostCliClient,
+  lifecycle: LifecyclePhaseFixture,
+  environment: NodeJS.ProcessEnv,
   artifactName: string,
-): Promise<ShellProbeResult> {
-  return await host.command("bash", ["-lc", ollamaCleanupScript()], {
-    artifactName,
-    env: env(),
-    timeoutMs: 30_000,
+  dependentCleanup?: () => Promise<void> | void,
+): void {
+  cleanup.trackDisposable("stop GPU gateway runtime before removing its state", async () => {
+    await lifecycle.stopGatewayRuntime({ env: environment, userServiceMode: "permanent" });
+    await host.cleanupGatewayRegistration("nemoclaw", {
+      artifactName,
+      env: environment,
+      timeoutMs: 60_000,
+    });
+    await dependentCleanup?.();
   });
-}
-
-export function ollamaCleanupScript(listenerPort = 11434): string {
-  if (!Number.isInteger(listenerPort) || listenerPort < 1 || listenerPort > 65_535) {
-    throw new Error(`invalid Ollama listener port: ${String(listenerPort)}`);
-  }
-  return `set -euo pipefail
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl --user stop ollama.service >/dev/null 2>&1 || true
-  if systemctl cat ollama.service >/dev/null 2>&1; then
-    if [ "$(id -u)" -eq 0 ]; then
-      systemctl stop ollama.service
-    elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-      sudo -n systemctl stop ollama.service
-    else
-      echo 'Ollama system service exists but passwordless sudo is unavailable' >&2
-      exit 1
-    fi
-  fi
-fi
-pkill -f '[o]llama-auth-proxy' >/dev/null 2>&1 || true
-pkill -f '[o]llama serve' >/dev/null 2>&1 || true
-if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-  sudo -n pkill -f '[o]llama serve' >/dev/null 2>&1 || true
-fi
-
-if pgrep -f '[o]llama serve' >/dev/null 2>&1; then
-  echo 'Ollama cleanup left a daemon process' >&2
-  pgrep -af '[o]llama serve' >&2 || true
-  exit 1
-fi
-if (exec 3<>/dev/tcp/127.0.0.1/${listenerPort}) 2>/dev/null; then
-  echo 'Ollama cleanup left a listener on 127.0.0.1:${listenerPort}' >&2
-  exit 1
-fi`;
 }
 
 export function assertNvidiaAvailable(

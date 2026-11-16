@@ -28,6 +28,7 @@ import {
   resolveAgentName,
   resolveAgentNameAlias,
 } from "./defs";
+import { resolveAgent } from "./onboard";
 
 const tempAgentDirs: string[] = [];
 
@@ -43,6 +44,7 @@ const qualificationFixtures: CandidateQualificationFixture[] = [];
 afterEach(() => {
   vi.restoreAllMocks();
   delete process.env.NEMOCLAW_AGENT;
+  delete process.env.NEMOCLAW_CUA_ENABLED;
   authority.digests.splice(0, authority.digests.length);
   while (qualificationFixtures.length > 0) qualificationFixtures.pop()?.cleanup();
   while (tempAgentDirs.length > 0) {
@@ -54,25 +56,31 @@ afterEach(() => {
 });
 
 describe("agent definitions", () => {
-  it("cannot discover or load a local NemoCUA manifest while the feature is disabled (#7755)", () => {
-    const realExistsSync = fs.existsSync.bind(fs);
-    vi.spyOn(fs, "existsSync").mockImplementation((candidate) =>
-      candidate === path.join(AGENTS_DIR, "nemocua", "manifest.yaml")
-        ? true
-        : realExistsSync(candidate),
-    );
-    vi.spyOn(fs, "readdirSync").mockReturnValue([
-      { name: "nemocua", isDirectory: () => true } as fs.Dirent,
-    ] as never);
-    const disabledEnv = {
-      NEMOCLAW_CUA_RUNTIME_MANIFEST: "/private/untrusted/runtime-manifest.json",
-      NEMOCLAW_CUA_RUNTIME_MANIFEST_SHA256: "a".repeat(64),
-    };
+  it("exposes NemoCUA only behind the exact experimental feature flag (#9649)", () => {
+    expect(fs.existsSync(path.join(AGENTS_DIR, "nemocua", "manifest.yaml"))).toBe(true);
+    expect(listAgents({})).not.toContain("nemocua");
+    expect(listAgents({ NEMOCLAW_CUA_ENABLED: "true" })).not.toContain("nemocua");
+    expect(() => loadAgent("nemocua", {})).toThrow("NemoCUA is disabled");
 
-    expect(listAgents(disabledEnv)).not.toContain("nemocua");
-    expect(() => loadAgent("nemocua", disabledEnv)).toThrow(
-      "use the controlled Brev Launchable activation",
-    );
+    const enabledEnv = { NEMOCLAW_CUA_ENABLED: "1" };
+    expect(listAgents(enabledEnv)).toContain("nemocua");
+    expect(loadAgent("nemocua", enabledEnv)).toMatchObject({
+      name: "nemocua",
+      runtime: {
+        kind: "terminal",
+        headless_command: "python3 /app/run_with_harness.py",
+      },
+    });
+  });
+
+  it("keeps NemoCUA out of choices and direct resolution until enabled (#9649)", () => {
+    expect(getAgentChoices().map((choice) => choice.name)).not.toContain("nemocua");
+    expect(() => resolveAgent({ agentFlag: "nemocua" })).toThrow("Unknown agent 'nemocua'");
+
+    vi.stubEnv("NEMOCLAW_CUA_ENABLED", "1");
+
+    expect(getAgentChoices().map((choice) => choice.name)).toContain("nemocua");
+    expect(resolveAgent({ agentFlag: "nemocua" })?.name).toBe("nemocua");
   });
 
   it("keeps the Pi candidate manifest out of agent selection by default (#7925)", () => {
@@ -128,45 +136,48 @@ describe("agent definitions", () => {
       expected_version: string;
       runtime: { kind: string };
       config: { dir: string };
-      state_dirs: { path: string; backup?: boolean }[];
-      state_files: { path: string; restore: Record<string, unknown> }[];
+      state_dirs?: unknown;
+      state_files?: unknown;
     };
 
     expect(manifest.name).toBe("pi");
     expect(manifest.expected_version).toBe("0.84.1");
     expect(manifest.runtime.kind).toBe("terminal");
     expect(manifest.config.dir).toBe("/sandbox/.pi/agent");
-    expect(
-      manifest.state_dirs.filter(({ backup }) => backup !== false).map(({ path }) => path),
-    ).toEqual(["sessions", "prompts", "themes"]);
-    expect(
-      manifest.state_dirs.filter(({ backup }) => backup === false).map(({ path }) => path),
-    ).toEqual(["tools", "bin"]);
-    expect(manifest.state_files.map((file) => file.path)).toEqual(["settings.json"]);
-    const restore = manifest.state_files[0]?.restore as {
-      merge?: string;
-      user_keys?: unknown[];
-    };
-    expect(restore?.merge).toBe("key-allowlist");
-    expect(restore?.user_keys).toEqual([
-      { key: "theme", type: "string", max_length: 128 },
-      { key: "hideThinkingBlock", type: "boolean" },
-      { key: "showCacheMissNotices", type: "boolean" },
-      { key: "quietStartup", type: "boolean" },
-      { key: "steeringMode", type: "enum", values: ["all", "one-at-a-time"] },
-      { key: "followUpMode", type: "enum", values: ["all", "one-at-a-time"] },
-      {
-        key: "defaultThinkingLevel",
-        type: "enum",
-        values: ["off", "minimal", "low", "medium", "high", "xhigh"],
-      },
-    ]);
+    expect(manifest.state_dirs).toBeUndefined();
+    expect(manifest.state_files).toBeUndefined();
   });
 
   it("orders OpenClaw first in interactive choices", () => {
     const choices = getAgentChoices();
     expect(choices[0]?.name).toBe("openclaw");
     expect(choices.map((choice) => choice.name)).toContain("hermes");
+  });
+
+  it("loads deferred onboarding as an explicit agent-manifest capability", () => {
+    expect(loadAgent("hermes").deferred_onboarding).toBe(true);
+    expect(loadAgent("langchain-deepagents-code").deferred_onboarding).toBe(true);
+    expect(loadAgent("openclaw").deferred_onboarding).toBe(false);
+  });
+
+  it("rejects a non-boolean deferred onboarding capability", () => {
+    const agentName = `invalid-deferred-onboarding-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [`name: ${agentName}`, "deferred_onboarding: enabled"].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/deferred_onboarding/);
+  });
+
+  it("uses agent display names in interactive choices", () => {
+    const choices = getAgentChoices();
+    expect(choices).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "openclaw", displayName: "OpenClaw" }),
+        expect.objectContaining({ name: "hermes", displayName: "Hermes Agent" }),
+      ]),
+    );
   });
 
   it("requires a readable regular policy-additions file for non-OpenClaw baselines (#7194)", () => {
@@ -232,64 +243,23 @@ describe("agent definitions", () => {
     expect(() => loadAgent(agentName)).toThrow(/YAML object/);
   });
 
-  it("rejects the superseded runtime auth directory inventory (#8006)", () => {
-    const agentName = `runtime-auth-inventory-${String(Date.now())}`;
-    writeTempAgentManifest(
-      agentName,
-      [
-        `name: ${agentName}`,
-        "display_name: Runtime Auth Inventory",
-        "state_dirs:",
-        "  - identity",
-        "runtime_auth_state_dirs:",
-        "  - identity",
-      ].join("\n"),
-    );
+  it.each(["state_dirs", "state_files", "runtime_auth_state_dirs"])(
+    "rejects the retired %s inventory",
+    (field) => {
+      const agentName = `retired-state-inventory-${String(Date.now())}`;
+      writeTempAgentManifest(
+        agentName,
+        [
+          `name: ${agentName}`,
+          "display_name: Retired State Inventory",
+          `${field}:`,
+          "  - identity",
+        ].join("\n"),
+      );
 
-    expect(() => loadAgent(agentName)).toThrow(/replaced.*backup: false/);
-  });
-
-  it("derives protected configuration files from each agent manifest (#8006)", () => {
-    expect(loadAgent("hermes").configPaths.shieldsFiles).toEqual([".env"]);
-    expect(loadAgent("openclaw").configPaths.shieldsFiles).toEqual([]);
-    expect(loadAgent("langchain-deepagents-code").configPaths.shieldsFiles).toEqual([]);
-  });
-
-  it("derives image state-lock-plan support from each agent manifest (#8006)", () => {
-    expect(loadAgent("openclaw").stateLockPlanInImage).toBe(true);
-    expect(loadAgent("hermes").stateLockPlanInImage).toBe(true);
-    expect(loadAgent("langchain-deepagents-code").stateLockPlanInImage).toBe(false);
-  });
-
-  it("rejects a non-boolean image state-lock-plan declaration (#8006)", () => {
-    const agentName = `invalid-image-plan-${String(Date.now())}`;
-    writeTempAgentManifest(
-      agentName,
-      [`name: ${agentName}`, "state_lock_plan_in_image: yes-please"].join("\n"),
-    );
-
-    expect(() => loadAgent(agentName)).toThrow(/state_lock_plan_in_image.*boolean/);
-  });
-
-  it.each([
-    ["a scalar", "  shields_files: .env"],
-    ["a non-string entry", "  shields_files:\n    - 42"],
-  ])("rejects config.shields_files with %s", (_case, declaration) => {
-    const agentName = `invalid-shields-files-${String(Date.now())}-${_case.replaceAll(" ", "-")}`;
-    writeTempAgentManifest(
-      agentName,
-      [
-        `name: ${agentName}`,
-        "display_name: Invalid Shields Files",
-        "config:",
-        "  dir: /sandbox/.invalid",
-        "  config_file: config.json",
-        declaration,
-      ].join("\n"),
-    );
-
-    expect(() => loadAgent(agentName)).toThrow(/config\.shields_files/);
-  });
+      expect(() => loadAgent(agentName)).toThrow(new RegExp(`${field}.*retired`));
+    },
+  );
 
   it.each([1023, 70000])("rejects invalid forward_ports value %s in manifests", (port) => {
     const agentName = `invalid-forward-port-${String(port)}-${String(Date.now())}`;

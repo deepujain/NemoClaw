@@ -1,58 +1,44 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import type { CuaRuntimeReadiness } from "../../cua/contract";
+import type { NativeLocalProviderAttachment } from "../../inference/native-local/contract";
+import type { NativeProviderAttachment } from "../../inference/native-provider/contract";
+import type { NativeHostedProviderAuthorities } from "./native-provider-authority-state";
 import type { InferenceSelection } from "../../inference/selection";
+import type { NativeNvidiaProviderAttachment } from "../../inference/native-nvidia";
+import type {
+  AppliedPolicySelection,
+  ModelAssignmentSelection,
+  ModelSelectionProvenance,
+} from "../../domain/telemetry/provenance";
 import type { ServingProfileProvenance } from "../../inference/serving/types";
 import type { WebSearchProvider } from "../../inference/web-search";
 import type { DcodeAutoApprovalMode } from "../../onboard/dcode-auto-approval";
 import type { NativeArtifactWorkloadReceiptV1 } from "../../onboard/workload/native-artifact";
-import type { TrustedPrivatePolicyPinReceipt } from "../../policy/trusted-private-endpoints";
 import type { ToolDisclosure } from "../../tool-disclosure";
-import type { OpenClawImagePluginInstall } from "../openclaw-plugin-restore";
-import type { SandboxMcpState } from "../registry-mcp";
 import type { SandboxMessagingState } from "../registry-messaging";
 
-export interface CustomPolicyEntry {
-  name: string;
-  content: string;
-  /** Desired content reserved before a crash-safe generated-policy transition. */
-  pendingContent?: string;
-  sourcePath?: string;
-  appliedAt?: string;
-  /** Content-bound authority for generated exact destination pins. */
-  trustedPrivatePins?: TrustedPrivatePolicyPinReceipt;
-}
-
-export interface BaselineExclusionEntry {
-  /** Persistence schema version for this reviewed exclusion intent. */
-  version: 1;
-  /** Agent baseline that supplied the reviewed entry. */
-  agent: string;
-  /** Exact baseline network policy key excluded, e.g. "nous_research". */
-  key: string;
-  /** Digest of the reviewed baseline entry content the approval was bound to. */
-  digest: string;
-  /** When the exclusion was acknowledged. */
-  acknowledgedAt?: string;
-  /** Agent build/version recorded when the exclusion was last applied. */
-  appliedAgentVersion?: string | null;
-}
-
-export type BaselineExclusionTransitionOperation = "exclude" | "restore";
-
-/**
- * Durable journal for the one cross-system baseline mutation that is in flight.
- * `baselineExclusions` remains the last committed operator intent until this
- * transaction is published after the live OpenShell mutation succeeds.
- */
-export interface BaselineExclusionTransition {
-  id: string;
-  operation: BaselineExclusionTransitionOperation;
-  exclusion: BaselineExclusionEntry;
-  /** Exact live-entry digest that completes the transition; null means absent. */
-  targetLiveDigest: string | null;
-  startedAt: string;
+/** Bounded identity checkpoint for one incomplete sandbox create. */
+export interface PendingSandboxCreateIdentity {
+  readonly schemaVersion: 1;
+  readonly state: "verified-create";
+  readonly gatewayName: string;
+  readonly gatewayPort: number;
+  /** Custom gateway state directory retained across interrupted creation. */
+  readonly openshellGatewayStateDir?: string;
+  readonly sandboxName: string;
+  readonly lifecycleGeneration: string;
+  readonly sandboxIdentityFingerprint: string;
+  readonly createAttemptNonce?: string;
+  /** Exact managed-startup hold identity reused by an interrupted create resume. */
+  readonly managedBootstrapIdentity?: string;
+  readonly route: "none" | "native" | "compatibility";
+  /** The exact final handoff crossed its durable commit fence. */
+  readonly exactFinalHandoffCommitStarted?: true;
+  /** Exact Docker replacement ID authorized before compatibility handoff commit. */
+  readonly exactFinalHandoffRuntimeId?: string;
+  /** OpenShell acknowledged the exact replacement handoff for this identity. */
+  readonly exactFinalHandoffAcknowledged?: true;
 }
 
 // Outcome of the last live sandbox GPU proof run during onboarding/recovery.
@@ -104,9 +90,16 @@ export interface SandboxHostLocalInferenceProvenance {
 
 export interface SandboxEntry extends Partial<InferenceSelection> {
   name: string;
+  appliedPolicySelection?: AppliedPolicySelection;
+  /** Private selection origin matched to the current native model/provider/API. */
+  nativeModelSelectionProvenance?: ModelSelectionProvenance;
+  /** Private source receipts bound to verified native agent/model assignments. */
+  modelAssignmentSelections?: ModelAssignmentSelection[];
+  /** Agent configuration was persisted but has not crossed verified activation. */
+  configurationApplyPending?: true;
   /** Route-only placeholder created before sandbox creation; never eligible as the default. */
   pendingRouteReservation?: true;
-  /** Onboard session that owns a pending reservation, so resume preserves its own row while abandoned reservations stay reconcilable. */
+  /** Onboard session that owns this route transaction, retained after publication for exact idempotence. */
   reservationSessionId?: string;
   createdAt?: string;
   /** Immutable catalog provenance for an explicitly selected serving profile. */
@@ -120,19 +113,8 @@ export interface SandboxEntry extends Partial<InferenceSelection> {
   hostMounts?: SandboxHostMount[];
   openshellDriver?: string | null;
   openshellVersion?: string | null;
-  policies?: string[];
-  customPolicies?: CustomPolicyEntry[];
-  /** Operator exclusions from the agent baseline policy, replayed on rebuild. */
-  baselineExclusions?: BaselineExclusionEntry[];
-  /** Crash-recoverable journal for an exclusion/restore live-policy mutation. */
-  baselineExclusionTransition?: BaselineExclusionTransition;
-  policyTier?: string | null;
-  // True once the onboard policy step has fully completed and reconciled the
-  // effective preset selection (set by the post-policy registry write). Absent
-  // on a sandbox whose registration recorded only boot-time presets but whose
-  // policy step never finished — so re-onboard knows whether `policies`
-  // represents a final selection it can carry forward. See #4621.
-  policyPresetsFinalized?: boolean;
+  /** Verified create boundary retained until final registration publishes atomically. */
+  pendingCreateIdentity?: PendingSandboxCreateIdentity;
   webSearchEnabled?: boolean;
   /** Selected disclosure preference; model compatibility safeguards may downgrade runtime behavior. */
   toolDisclosure?: ToolDisclosure;
@@ -144,10 +126,8 @@ export interface SandboxEntry extends Partial<InferenceSelection> {
   webSearchProvider?: WebSearchProvider | null;
   agent?: string | null;
   agentVersion?: string | null;
-  /** Candidate runtime authority recorded only by canonical CUA onboarding. */
-  cuaRuntimeReadiness?: CuaRuntimeReadiness;
-  /** Plugin install baseline captured before state is restored into a fresh OpenClaw image. */
-  openclawImagePluginInstalls?: OpenClawImagePluginInstall[];
+  /** Route committed before OpenClaw config synchronization; invalidates retained context on retry. */
+  openClawConfigSyncPending?: true;
   // NemoClaw build fingerprint (the NemoClaw CLI/build version) stamped only on
   // NemoClaw-managed images at create/rebuild time. `upgrade-sandboxes` compares
   // it against the running NemoClaw build so an image/build change with an
@@ -164,12 +144,22 @@ export interface SandboxEntry extends Partial<InferenceSelection> {
    * through per-sandbox image deletion.
    */
   workload?: SandboxWorkloadReceipt;
+  /** Image-owned startup handshake used by managed-image onboarding finalization. */
+  managedStartupProtocol?: "identity-bound" | "legacy-unbound";
   /** Canonical provider-neutral receipt for an out-of-sandbox inference runtime. */
   hostLocalInferenceReceipt?: string | null;
+  /** Exact host-local provider identity attached to this sandbox. */
+  nativeLocalProviderAttachment?: NativeLocalProviderAttachment;
+  /** Exact OpenShell provider identity attached for native NVIDIA hosted inference. */
+  nativeNvidiaProviderAttachment?: NativeNvidiaProviderAttachment;
+  /** Exact selected fixed hosted provider identity; separate from gateway ownership. */
+  nativeHostedProviderAttachment?: NativeProviderAttachment;
+  hermesSwitchyard?: import("../../hermes-switchyard-routing").SwitchyardBindingState;
   /** Explicit hidden-lifecycle provenance; absence keeps llama.cpp on its legacy path. */
   hostLocalInferenceProvenance?: SandboxHostLocalInferenceProvenance;
+  /** Explicit Deferred N1x managed-vLLM choice retained after successful onboarding. */
+  deferredN1xManagedVllmAccepted?: true;
   messaging?: SandboxMessagingState;
-  mcp?: SandboxMcpState;
   hermesToolGateways?: string[];
   /** Destination-scoped provider holding the host-minted Hermes inference key. */
   hermesInferenceProvider?: string;
@@ -185,6 +175,13 @@ export interface SandboxEntry extends Partial<InferenceSelection> {
    */
   hermesApiPort?: number | null;
   dashboardPort?: number | null;
+  /**
+   * Browser-facing external dashboard URL resolved from `CHAT_UI_URL` at
+   * onboard time (host + scheme with the effective dashboard port). Persisted
+   * only when an external origin was configured; a plain loopback dashboard is
+   * left unset and reported as `http://127.0.0.1:<dashboardPort>/` (#11439).
+   */
+  dashboardExternalUrl?: string | null;
   /** Remote dashboard exposure was included in the sandbox's generated config. */
   dashboardRemoteBindPrepared?: boolean;
   /** Generation proving which durable same-name recreate registered this row. */
@@ -197,6 +194,12 @@ export interface SandboxEntry extends Partial<InferenceSelection> {
   // different NEMOCLAW_GATEWAY_PORT no longer recreates/kills the first (#4422).
   gatewayName?: string | null;
   gatewayPort?: number | null;
+  /** Resolved custom OpenShell gateway state directory used when this sandbox was onboarded. */
+  openshellGatewayStateDir?: string | null;
+  /** Whether the sandbox was intentionally stopped via the stop command (#11025). */
+  stopped?: boolean;
+  /** Explicit retained Portable lifecycle owner; absent for every standard sandbox. */
+  portableLifecycleProfile?: "openclaw" | "hermes";
 }
 
 export type SandboxWorkloadReceipt =
@@ -228,6 +231,18 @@ export type SandboxWorkloadReceipt =
     }
   | {
       readonly schemaVersion: 1;
+      readonly kind: "external-image";
+      /** Exact publisher-owned OCI image digest requested by the operator. */
+      readonly reference: string;
+      /** Platform selected by the local runtime when the digest was inspected. */
+      readonly platform: "linux/amd64" | "linux/arm64";
+      /** Immutable host-local content identity returned by the container runtime. */
+      readonly runtimeImageContentId: string;
+      /** Publisher-owned images are never removed by NemoClaw cleanup. */
+      readonly shared: true;
+    }
+  | {
+      readonly schemaVersion: 1;
       readonly kind: "legacy-dockerfile";
       readonly reference: string | null;
       readonly shared: false;
@@ -239,4 +254,9 @@ export interface SandboxRegistry {
   defaultSandbox: string | null;
   defaultSelectionRevision?: number;
   extraProviders?: string[];
+  /** NemoClaw-owned host-local provider identities keyed by provider name. */
+  nativeLocalProviderAuthorities?: Record<string, NativeLocalProviderAttachment>;
+  /** Exact NemoClaw-owned native NVIDIA provider identity for each OpenShell gateway. */
+  nativeNvidiaProviderAuthorities?: Record<string, NativeNvidiaProviderAttachment>;
+  nativeHostedProviderAuthorities?: NativeHostedProviderAuthorities;
 }

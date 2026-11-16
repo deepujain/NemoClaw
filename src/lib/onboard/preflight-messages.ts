@@ -14,8 +14,25 @@
 
 import { failLine, warnLine } from "../cli/terminal-style";
 import { formatNvidiaGpuPreflightLines, type GpuDetection } from "../inference/nim";
-import { cliDisplayName } from "./branding";
+import type { SystemReadinessReport } from "../readiness/types";
+import { cliDisplayName, cliName } from "./branding";
 import type { SandboxGpuConfig } from "./sandbox-gpu-mode";
+
+const ONBOARD_OS_RELEASE_WARNING_IDS = new Set([
+  "host.os.release_unqualified",
+  "host.os.release_inconclusive",
+]);
+
+/** Present admitted host OS qualification warnings before onboarding effects. */
+export function printOnboardOsReleaseWarnings(
+  report: Pick<SystemReadinessReport, "findings">,
+): void {
+  for (const finding of report.findings) {
+    if (finding.severity === "warning" && ONBOARD_OS_RELEASE_WARNING_IDS.has(finding.id)) {
+      console.error(warnLine(finding.summary));
+    }
+  }
+}
 
 /** Docker cannot be reached, so onboarding cannot continue. */
 export function printDockerNotReachableError(): void {
@@ -94,7 +111,7 @@ export function printMessagingProviderMissing(providerName: string): void {
   console.warn(warnLine(`Messaging provider '${providerName}' was not found in the gateway.`));
   console.warn("    The credential may not be available inside the sandbox.");
   console.warn(
-    `    To fix: openshell provider create --name ${providerName} --type generic --credential <KEY>`,
+    `    To fix: rerun ${cliName()} onboard with the required messaging credentials so NemoClaw can register the OpenShell provider profile.`,
   );
 }
 

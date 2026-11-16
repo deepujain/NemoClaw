@@ -12,29 +12,32 @@
 
 import os from "node:os";
 
-import { dockerCapture, dockerRun } from "../adapters/docker/run";
 import { failLine, warnLine } from "../cli/terminal-style";
 import { GATEWAY_PORT } from "../core/ports";
+import type { GatewayRecoveryOutput } from "./gateway-recovery";
 import { parseDockerDaemonObservation } from "../domain/docker-host";
 import { cliDisplayName, cliName } from "./branding";
+import {
+  DEFAULT_DOCKER_DRIVER_NETWORK_NAME,
+  parseDockerNetworkIpamEntries,
+  resolveDockerDriverNetworkName,
+} from "./experimental/docker-network-authority";
 import {
   isPortableExperimentalProfile,
   PORTABLE_HOST_GATEWAY_IP,
 } from "./experimental/portable-profile";
-import {
-  DOCKER_DESKTOP_WSL_INTEGRATION_HINT,
-  ensureProbeImageCached,
-  isDockerDaemonUnreachable,
-} from "./preflight";
+import { DOCKER_DESKTOP_WSL_INTEGRATION_HINT, isDockerDaemonUnreachable } from "./preflight";
 import type { UfwAutoApplyResult } from "./ufw-auto-apply";
 import { isUfwAutoApplyOptedIn, tryAutoApplyUfwRule } from "./ufw-auto-apply";
+import type { RuntimeProviderGatewayHostRuntime } from "./runtime-provider/contract";
+import { observeConfiguredGatewayHostRuntime } from "./docker-driver-gateway-env";
 
 export type { UfwAutoApplyOptions, UfwAutoApplyResult } from "./ufw-auto-apply";
 export { tryAutoApplyUfwRule } from "./ufw-auto-apply";
 
 const DEFAULT_PROBE_IMAGE =
   "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
-const DEFAULT_NETWORK_NAME = "openshell-docker";
+const DEFAULT_NETWORK_NAME = DEFAULT_DOCKER_DRIVER_NETWORK_NAME;
 const HOST_INTERNAL_NAME = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL_NAME = "host.docker.internal";
 const DEFAULT_PROBE_TIMEOUT_SEC = 5;
@@ -49,7 +52,11 @@ export type SandboxBridgeReachabilityReason =
   | "probe_timeout"
   | "veth_unsupported"
   | "docker_daemon_unreachable";
-export type SandboxBridgeRouteKind = "bridge_gateway" | "host_gateway" | "portable_host_gateway";
+export type SandboxBridgeRouteKind =
+  | "bridge_gateway"
+  | "host_gateway"
+  | "portable_host_gateway"
+  | "provider_host_gateway";
 
 export interface DockerBridgeNetworkInfo {
   subnet?: string;
@@ -94,8 +101,10 @@ export interface SandboxBridgeReachabilityOptions {
   runImpl?: (args: readonly string[], timeoutMs: number) => SandboxBridgeProbeRunResult;
   inspectNetworkImpl?: (networkName: string) => DockerBridgeNetworkInfo | undefined;
   usesHostGatewayRouteImpl?: () => boolean;
+  platform?: NodeJS.Platform;
 
   runtimeProbeImpl?: (args: readonly string[], timeoutMs: number) => SandboxBridgeProbeRunResult;
+  gatewayRuntime?: RuntimeProviderGatewayHostRuntime;
   /** Inject a precomputed image-cache result; bypasses real pre-pull. */
   ensureImageCachedOverride?: import("./preflight").EnsureProbeImageCachedResult;
 }
@@ -109,23 +118,8 @@ function isRunningInWsl(env: NodeJS.ProcessEnv = process.env, release = os.relea
 }
 
 function parseDockerNetworkIpamConfig(raw: string): DockerBridgeNetworkInfo | undefined {
-  const text = raw.trim();
-  if (!text || text === "<no value>") return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-  if (!Array.isArray(parsed)) return undefined;
-  const candidates: DockerBridgeNetworkInfo[] = [];
-  for (const entry of parsed) {
-    if (!entry || typeof entry !== "object") continue;
-    const record = entry as Record<string, unknown>;
-    const subnet = typeof record.Subnet === "string" ? record.Subnet : undefined;
-    const gatewayIp = typeof record.Gateway === "string" ? record.Gateway : undefined;
-    if (subnet || gatewayIp) candidates.push({ subnet, gatewayIp });
-  }
+  const candidates = parseDockerNetworkIpamEntries(raw);
+  if (!candidates) return undefined;
   return (
     candidates.find((candidate) => candidate.gatewayIp && !candidate.gatewayIp.includes(":")) ??
     candidates.find((candidate) => candidate.subnet && /^\d+\./.test(candidate.subnet)) ??
@@ -133,55 +127,23 @@ function parseDockerNetworkIpamConfig(raw: string): DockerBridgeNetworkInfo | un
   );
 }
 
-function defaultInspectNetwork(networkName: string): DockerBridgeNetworkInfo | undefined {
-  const raw = dockerCapture(
-    ["network", "inspect", "--format", "{{json .IPAM.Config}}", networkName],
-    { ignoreError: true },
-  );
-  return parseDockerNetworkIpamConfig(raw);
-}
-
-function defaultUsesHostGatewayRoute(): boolean {
-  if (process.platform !== "linux") return true;
-  const info = dockerCapture(
-    ["info", "--format", "{{.OperatingSystem}}\n{{range .Labels}}{{.}}\n{{end}}"],
-    { ignoreError: true },
-  );
-  return /Docker Desktop|com\.docker\.desktop\./i.test(info);
-}
-
-function defaultRunImpl(args: readonly string[], timeoutMs: number): SandboxBridgeProbeRunResult {
-  const result = dockerRun(args, {
-    timeout: timeoutMs,
-    ignoreError: true,
-    suppressOutput: true,
-  });
-  const error = result.error as NodeJS.ErrnoException | undefined;
-  return {
-    status: result.status ?? null,
-    signal: result.signal,
-    error: error?.message,
-    timedOut: error?.code === "ETIMEDOUT",
-    errorCode: error?.code ?? null,
-    stderr: result.stderr,
-    stdout: result.stdout,
-  };
-}
-
 function buildOpenShellDockerRoute(
   networkName: string,
   network: DockerBridgeNetworkInfo | undefined,
   usesHostGatewayRoute: boolean,
-  portableHostGatewayIp?: string,
+  providerHostGateway?: {
+    address: string;
+    routeKind: "portable_host_gateway" | "provider_host_gateway";
+  },
 ): OpenShellDockerRoute | undefined {
   if (!network) return undefined;
-  if (portableHostGatewayIp) {
+  if (providerHostGateway) {
     return {
       networkName,
       subnet: network.subnet,
-      gatewayIp: portableHostGatewayIp,
-      routeKind: "portable_host_gateway",
-      addHosts: [`${HOST_INTERNAL_NAME}:${portableHostGatewayIp}`],
+      gatewayIp: providerHostGateway.address,
+      routeKind: providerHostGateway.routeKind,
+      addHosts: [`${HOST_INTERNAL_NAME}:${providerHostGateway.address}`],
     };
   }
   if (usesHostGatewayRoute) {
@@ -309,24 +271,36 @@ function buildProbeArgs(
 export async function isSandboxBridgeGatewayReachable(
   opts: SandboxBridgeReachabilityOptions = {},
 ): Promise<SandboxBridgeReachabilityResult> {
-  const networkName =
-    opts.networkName ?? process.env.OPENSHELL_DOCKER_NETWORK_NAME ?? DEFAULT_NETWORK_NAME;
+  const networkName = opts.networkName ?? resolveDockerDriverNetworkName();
   const port = opts.port ?? GATEWAY_PORT;
   const timeoutSec = opts.timeoutSec ?? DEFAULT_PROBE_TIMEOUT_SEC;
   const probeImage = opts.probeImage ?? DEFAULT_PROBE_IMAGE;
-  const inspectNetwork = opts.inspectNetworkImpl ?? defaultInspectNetwork;
-  const usesHostGatewayRoute = opts.usesHostGatewayRouteImpl ?? defaultUsesHostGatewayRoute;
-  const runImpl = opts.runImpl ?? defaultRunImpl;
 
   const portableProfile = isPortableExperimentalProfile();
-  const runtimeProbe = opts.runtimeProbeImpl ?? defaultRunImpl;
+  const platform = opts.platform ?? process.platform;
+  const managedGatewayRuntime =
+    opts.gatewayRuntime ??
+    observeConfiguredGatewayHostRuntime({ environment: process.env, platform });
+  const providerHostGateway = portableProfile
+    ? { address: PORTABLE_HOST_GATEWAY_IP, routeKind: "portable_host_gateway" as const }
+    : managedGatewayRuntime?.sandboxHostAddress
+      ? {
+          address: managedGatewayRuntime.sandboxHostAddress,
+          routeKind: "provider_host_gateway" as const,
+        }
+      : undefined;
+  const inspectNetwork = opts.inspectNetworkImpl ?? managedGatewayRuntime.network.inspect;
+  const usesHostGatewayRoute =
+    opts.usesHostGatewayRouteImpl ?? managedGatewayRuntime.network.usesHostGatewayRoute;
+  const runImpl = opts.runImpl ?? managedGatewayRuntime.network.run;
+  const runtimeProbe = opts.runtimeProbeImpl ?? managedGatewayRuntime.network.run;
 
   const network = inspectNetwork(networkName);
   const route = buildOpenShellDockerRoute(
     networkName,
     network,
-    usesHostGatewayRoute(),
-    portableProfile ? PORTABLE_HOST_GATEWAY_IP : undefined,
+    managedGatewayRuntime.usesHostGatewayRoute === true || usesHostGatewayRoute(),
+    providerHostGateway,
   );
   if (!route) {
     if (portableProfile) {
@@ -364,7 +338,9 @@ export async function isSandboxBridgeGatewayReachable(
   // skip the pre-pull there unless the test supplies an explicit
   // ensureImageCachedOverride.
   if (opts.ensureImageCachedOverride !== undefined || opts.runImpl === undefined) {
-    const cached = opts.ensureImageCachedOverride ?? ensureProbeImageCached(probeImage);
+    const cached =
+      opts.ensureImageCachedOverride ??
+      managedGatewayRuntime.network.ensureProbeImageCached(probeImage);
     if (!cached.ok) {
       // A wedged docker daemon (inspect_unavailable) is a fatal Docker
       // outage, not a probe/pull uncertainty — keep onboarding from
@@ -545,6 +521,14 @@ export function formatSandboxBridgeUnreachableMessage(
     ].join("\n");
   }
 
+  if (result.routeKind === "provider_host_gateway") {
+    return [
+      failLine(`Sandbox containers cannot reach the gateway at ${HOST_INTERNAL_NAME}:${port}.`),
+      `    The probe mapped ${HOST_INTERNAL_NAME} to the selected runtime provider's host gateway.`,
+      `    Restart the selected container runtime and OpenShell gateway, then re-run \`${cliName()} onboard\`.`,
+    ].join("\n");
+  }
+
   if (result.routeKind === "host_gateway") {
     return [
       failLine(`Sandbox containers cannot reach the gateway at ${HOST_INTERNAL_NAME}:${port}.`),
@@ -575,6 +559,7 @@ export function formatSandboxBridgeUnreachableMessage(
 }
 
 interface SandboxBridgeVerifierOptions {
+  output?: Pick<GatewayRecoveryOutput, "error" | "log" | "warn">;
   skip?: boolean;
   port?: number;
   reachabilityImpl?: (options?: {
@@ -610,8 +595,11 @@ export async function verifySandboxBridgeGatewayReachableOrExit(
   exitOnFailure: boolean,
   options: SandboxBridgeVerifierOptions = {},
 ): Promise<void> {
+  const log = options.output?.log ?? console.log;
+  const warn = options.output?.warn ?? console.warn;
+  const printError = options.output?.error ?? console.error;
   if (options.skip) {
-    console.log(
+    log(
       "  Docker-driver GPU host networking active; skipping sandbox bridge gateway reachability probe.",
     );
     return;
@@ -634,13 +622,13 @@ export async function verifySandboxBridgeGatewayReachableOrExit(
     attempt <= retryAttempts && isRetriableHostGatewayFailure(reach);
     attempt += 1
   ) {
-    console.log(
+    log(
       `  OpenShell gateway reachability probe attempt ${attempt - 1}/${retryAttempts} failed (${reach.reason}); retrying in ${retryDelayMs} ms...`,
     );
     await sleep(retryDelayMs);
     reach = await reachability({ port });
     if (reach.ok) {
-      console.log(`  ✓ OpenShell gateway reachable on attempt ${attempt}/${retryAttempts}`);
+      log(`  ✓ OpenShell gateway reachable on attempt ${attempt}/${retryAttempts}`);
       return;
     }
   }
@@ -656,11 +644,11 @@ export async function verifySandboxBridgeGatewayReachableOrExit(
         reach.subnet && reach.gatewayIp
           ? `allow from ${reach.subnet} to ${reach.gatewayIp}:${port}/tcp`
           : `allow sandbox bridge traffic to port ${port}/tcp`;
-      console.log(`  ✓ Applied UFW rule (NEMOCLAW_AUTO_FIX_FIREWALL=1): ${ruleDescription}`);
+      log(`  ✓ Applied UFW rule (NEMOCLAW_AUTO_FIX_FIREWALL=1): ${ruleDescription}`);
       reach = await reachability({ port });
       if (reach.ok) return;
     } else if (!SILENT_UFW_AUTO_APPLY_REASONS.has(autoApplyResult.reason)) {
-      console.warn(
+      warn(
         warnLine(
           `NEMOCLAW_AUTO_FIX_FIREWALL=1 set but could not auto-apply UFW rule (${autoApplyResult.reason}${autoApplyResult.detail ? `: ${autoApplyResult.detail}` : ""}); falling back to manual instructions.`,
         ),
@@ -670,11 +658,11 @@ export async function verifySandboxBridgeGatewayReachableOrExit(
 
   const message = formatSandboxBridgeUnreachableMessage(reach, port);
   if (reach.reason === "probe_unavailable") {
-    console.warn(message);
+    warn(message);
     return;
   }
 
-  console.error(message);
+  printError(message);
   if (exitOnFailure) {
     process.exit(1);
   }

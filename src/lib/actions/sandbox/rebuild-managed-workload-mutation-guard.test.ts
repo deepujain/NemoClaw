@@ -3,6 +3,8 @@
 
 import { describe, expect, it, vi } from "vitest";
 
+import { managedStartupE2eProfile } from "../../../../scripts/checks/generate-managed-startup-profile-fixture.mts";
+import { mapManagedStartupProfileToAgentEnvironment } from "../../onboard/managed-startup/agent-environment";
 import * as managedWorkload from "../../onboard/workload/rebuild";
 import * as registry from "../../state/registry";
 import type { SandboxEntry } from "../../state/registry/types";
@@ -57,12 +59,13 @@ describe("managed workload rebuild mutation guard", () => {
     expect(revalidateManagedWorkloadRebuildBeforeDelete("alpha", undefined)).toBeNull();
   });
 
-  it("stages compatible-endpoint OpenClaw reasoning authority before deletion", () => {
+  it("rejects a changed compatible endpoint without selected-route context evidence", () => {
     const catalogHandoff = {
       agent: "openclaw",
       previousProfile: {
         inference: { model: "previous-model", upstreamProvider: "nvidia-prod" },
         dashboard: { agent: "openclaw", bindAddress: "127.0.0.1", wslExposure: false },
+        tuning: { contextWindow: 16_384 },
       },
     } as unknown as managedWorkload.ManagedWorkloadRebuildCatalogHandoff;
     const targetConfig = {
@@ -82,12 +85,13 @@ describe("managed workload rebuild mutation guard", () => {
       .spyOn(managedWorkload, "stageManagedWorkloadRebuildProfile")
       .mockReturnValue(handoff);
     vi.spyOn(managedRebuildProfileDependencies, "resolveContextWindowForModel").mockReturnValue(
-      131_072,
+      null,
     );
 
-    expect(
+    expect(() =>
       prepareManagedRebuildProfileHandoff({
         catalogHandoff,
+        gatewayPort: 8080,
         targetConfig,
         recreateOptions: {
           controlUiPort: 18_789,
@@ -98,23 +102,10 @@ describe("managed workload rebuild mutation guard", () => {
         messagingPlan: null,
         environment: {},
       }),
-    ).toBe(handoff);
-    expect(stage).toHaveBeenCalledWith(
-      catalogHandoff,
-      expect.objectContaining({
-        inference: expect.objectContaining({
-          model: "reasoning-model",
-          upstreamProvider: "compatible-endpoint",
-          api: "openai-completions",
-        }),
-      }),
-      {},
-      {
-        openClawContextWindow: 131_072,
-        openClawReasoning: true,
-        openClawReasoningEffort: "high",
-      },
+    ).toThrow(
+      "Cannot determine a context window for the current OpenClaw target 'compatible-endpoint/reasoning-model'.",
     );
+    expect(stage).not.toHaveBeenCalled();
 
     vi.spyOn(
       managedRebuildProfileDependencies,
@@ -126,9 +117,13 @@ describe("managed workload rebuild mutation guard", () => {
       inferenceApi: "unsupported-api",
       inferenceCompat: null,
     });
+    vi.spyOn(managedRebuildProfileDependencies, "resolveContextWindowForModel").mockReturnValue(
+      16_384,
+    );
     expect(() =>
       prepareManagedRebuildProfileHandoff({
         catalogHandoff,
+        gatewayPort: 8080,
         targetConfig,
         recreateOptions: {
           controlUiPort: 18_789,
@@ -140,5 +135,242 @@ describe("managed workload rebuild mutation guard", () => {
         environment: {},
       }),
     ).toThrow("Unsupported managed startup inference API 'unsupported-api'.");
+  });
+
+  it("rejects a legacy Hermes dashboard before retaining a recorded browser host", () => {
+    const previousProfile = managedStartupE2eProfile("hermes");
+    const previousDashboard = previousProfile.dashboard as Extract<
+      typeof previousProfile.dashboard,
+      { readonly agent: "hermes" }
+    >;
+    expect(previousDashboard.agent).toBe("hermes");
+    const browserUrl = "https://secure-link.example/dashboard";
+    const catalogHandoff = {
+      agent: "hermes",
+      previousProfile: {
+        ...previousProfile,
+        dashboard: { ...previousDashboard, browserUrl },
+      },
+      previousReceipt: { credentialProxyReplayRequired: false },
+      corporateCa: null,
+    } as unknown as managedWorkload.ManagedWorkloadRebuildCatalogHandoff;
+    const targetConfig = {
+      agentDefinition: {},
+      resumeConfig: {
+        provider: "nvidia",
+        model: previousProfile.inference!.model,
+        preferredInferenceApi: "openai-completions",
+        endpointUrl: null,
+        compatibleEndpointReasoning: null,
+        compatibleEndpointReasoningEffort: null,
+      },
+      durableConfig: { webSearchConfig: null },
+      hermesToolGateways: [],
+    } as unknown as RebuildTargetConfig;
+    vi.spyOn(
+      managedRebuildProfileDependencies,
+      "resolveManagedStartupInferenceRoute",
+    ).mockReturnValue({
+      providerKey: "inference",
+      primaryModelRef: "inference/unused-for-hermes",
+      inferenceBaseUrl: "https://inference.local/v1",
+      inferenceApi: "openai-completions",
+      inferenceCompat: null,
+    });
+    const recreateOptions = {
+      controlUiPort: 29_443,
+      toolDisclosure: "progressive",
+      dcodeAutoApprovalMode: "disabled",
+      observabilityEnabled: false,
+    } as unknown as RebuildRecreateOnboardOpts;
+    const environment = {
+      NEMOCLAW_HERMES_DASHBOARD: "1",
+      NEMOCLAW_HERMES_DASHBOARD_INTERNAL_PORT: "19443",
+    };
+    const { browserUrl: _browserUrl, ...legacyDashboard } = previousDashboard;
+    expect(() =>
+      prepareManagedRebuildProfileHandoff({
+        catalogHandoff: {
+          ...catalogHandoff,
+          previousProfile: {
+            ...catalogHandoff.previousProfile,
+            dashboard: legacyDashboard,
+          },
+        },
+        gatewayPort: 8080,
+        targetConfig,
+        recreateOptions,
+        messagingPlan: null,
+        environment,
+      }),
+    ).toThrow(
+      "Cannot rebuild the Hermes dashboard because its managed startup profile has no recorded browser URL. Rerun onboarding, then rebuild the sandbox.",
+    );
+
+    const prepared = prepareManagedRebuildProfileHandoff({
+      catalogHandoff,
+      gatewayPort: 8080,
+      targetConfig,
+      recreateOptions,
+      messagingPlan: null,
+      environment,
+    });
+
+    expect(prepared.replacementProfile.profile.dashboard).toMatchObject({
+      agent: "hermes",
+      browserUrl,
+      publicPort: 29_443,
+      url: "http://127.0.0.1:29443",
+    });
+    expect(
+      mapManagedStartupProfileToAgentEnvironment(prepared.replacementProfile.profile, {})
+        .runtimeEnvironment.CHAT_UI_URL,
+    ).toBe(browserUrl);
+
+    const loopbackBrowserUrl = "http://127.0.0.2:18789/dashboard";
+    const loopbackPrepared = prepareManagedRebuildProfileHandoff({
+      catalogHandoff: {
+        ...catalogHandoff,
+        previousProfile: {
+          ...catalogHandoff.previousProfile,
+          dashboard: { ...previousDashboard, browserUrl: loopbackBrowserUrl },
+        },
+      },
+      gatewayPort: 8080,
+      targetConfig,
+      recreateOptions,
+      messagingPlan: null,
+      environment,
+    });
+
+    expect(loopbackPrepared.replacementProfile.profile.dashboard).toMatchObject({
+      browserUrl: "http://127.0.0.2:29443/dashboard",
+      publicPort: 29_443,
+    });
+    expect(
+      mapManagedStartupProfileToAgentEnvironment(loopbackPrepared.replacementProfile.profile, {})
+        .runtimeEnvironment.CHAT_UI_URL,
+    ).toBe("http://127.0.0.2:29443/dashboard");
+  });
+
+  describe("OpenClaw dashboard origin (#13177)", () => {
+    const previousProfile = managedStartupE2eProfile("openclaw");
+    const loopbackDashboard = previousProfile.dashboard as Extract<
+      typeof previousProfile.dashboard,
+      { readonly agent: "openclaw" }
+    >;
+    const targetConfig = {
+      agentDefinition: {},
+      resumeConfig: {
+        provider: "nvidia-prod",
+        model: previousProfile.inference!.model,
+        preferredInferenceApi: "openai-completions",
+        endpointUrl: null,
+        compatibleEndpointReasoning: null,
+        compatibleEndpointReasoningEffort: null,
+      },
+      durableConfig: { webSearchConfig: null },
+      hermesToolGateways: [],
+    } as unknown as RebuildTargetConfig;
+    const recreateOptions = {
+      controlUiPort: 18_790,
+      toolDisclosure: "progressive",
+      dcodeAutoApprovalMode: "disabled",
+      observabilityEnabled: false,
+    } as unknown as RebuildRecreateOnboardOpts;
+
+    /** Build the OpenClaw replacement profile from a previous dashboard and registry origin. */
+    function prepare(
+      dashboard: typeof loopbackDashboard,
+      options: {
+        recordedDashboardExternalUrl?: string | null;
+        environment?: NodeJS.ProcessEnv;
+      } = {},
+    ) {
+      vi.spyOn(
+        managedRebuildProfileDependencies,
+        "resolveManagedStartupInferenceRoute",
+      ).mockReturnValue({
+        providerKey: "inference",
+        primaryModelRef: previousProfile.inference!.primaryModelRef!,
+        inferenceBaseUrl: "https://inference.local/v1",
+        inferenceApi: "openai-completions",
+        inferenceCompat: null,
+      });
+      vi.spyOn(managedRebuildProfileDependencies, "resolveContextWindowForModel").mockReturnValue(
+        131_072,
+      );
+      const catalogHandoff = {
+        agent: "openclaw",
+        previousProfile: { ...previousProfile, dashboard },
+        previousReceipt: { credentialProxyReplayRequired: false },
+        corporateCa: null,
+      } as unknown as managedWorkload.ManagedWorkloadRebuildCatalogHandoff;
+      const prepared = prepareManagedRebuildProfileHandoff({
+        catalogHandoff,
+        gatewayPort: 8080,
+        targetConfig,
+        recreateOptions,
+        messagingPlan: null,
+        environment: options.environment ?? {},
+        recordedDashboardExternalUrl: options.recordedDashboardExternalUrl,
+      });
+      return {
+        dashboard: prepared.replacementProfile.profile.dashboard,
+        chatUiUrl: mapManagedStartupProfileToAgentEnvironment(
+          prepared.replacementProfile.profile,
+          {},
+        ).configurationEnvironment.CHAT_UI_URL,
+      };
+    }
+
+    const remoteDashboard = {
+      ...loopbackDashboard,
+      mode: "remote" as const,
+      url: "https://launchpad.example.test:18789",
+    };
+
+    it("keeps the previous profile's browser origin on the effective dashboard port", () => {
+      const { dashboard, chatUiUrl } = prepare(remoteDashboard);
+
+      expect(dashboard).toMatchObject({
+        agent: "openclaw",
+        mode: "remote",
+        url: "https://launchpad.example.test:18790",
+        port: 18_790,
+        bindAddress: "127.0.0.1",
+      });
+      expect(chatUiUrl).toBe("https://launchpad.example.test:18790");
+    });
+
+    it("applies the origin that onboarding recorded for the sandbox", () => {
+      const { dashboard } = prepare(loopbackDashboard, {
+        recordedDashboardExternalUrl: "https://recorded.example.test:18789",
+      });
+
+      expect(dashboard).toMatchObject({
+        mode: "remote",
+        url: "https://recorded.example.test:18790",
+      });
+    });
+
+    it("drops the browser origin after onboarding cleared it", () => {
+      const { dashboard } = prepare(remoteDashboard, { recordedDashboardExternalUrl: null });
+
+      expect(dashboard).toMatchObject({ mode: "loopback", url: "http://127.0.0.1:18790" });
+    });
+
+    it("ignores CHAT_UI_URL from the rebuild environment", () => {
+      const { dashboard } = prepare(remoteDashboard, {
+        environment: { CHAT_UI_URL: "https://ambient.example.test" },
+      });
+
+      expect(dashboard).toMatchObject({ url: "https://launchpad.example.test:18790" });
+      expect(
+        prepare(loopbackDashboard, {
+          environment: { CHAT_UI_URL: "https://ambient.example.test" },
+        }).dashboard,
+      ).toMatchObject({ mode: "loopback", url: "http://127.0.0.1:18790" });
+    });
   });
 });

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { loadAgent } from "../agent/defs";
 import { waitUntil } from "../core/wait";
 import type { SandboxGpuConfig } from "./sandbox-gpu-mode";
 import { SANDBOX_RECREATE_PROBE_TIMEOUT_MS } from "./sandbox-recreate-probe";
@@ -9,6 +10,7 @@ import { fingerprintSandboxRecreateValue } from "./sandbox-recreate-transaction"
 import {
   applyReusedSandboxDashboardState,
   createSandboxReuseHelpers,
+  restoreReusedSandboxDashboardState,
   type SandboxReuseDeps,
 } from "./sandbox-reuse";
 
@@ -30,84 +32,67 @@ describe("applyReusedSandboxDashboardState", () => {
     vi.restoreAllMocks();
   });
 
-  it("updates dashboard URL, Hermes forwarding, reuse metadata, and gateway registry fields", () => {
+  it.each([false, true])(
+    "restores Hermes dashboard metadata when enabled is %s",
+    async (enabled) => {
+      const updateSandbox = vi.fn();
+      const ensureDashboardForward = vi.fn(() => 18789);
+      const sandboxGpuConfig: SandboxGpuConfig = {
+        hostGpuDetected: false,
+        hostGpuPlatform: null,
+        sandboxGpuEnabled: false,
+        mode: "auto",
+        sandboxGpuDevice: null,
+        errors: [],
+      };
+      const hermesDashboardState = {
+        enabled,
+        config: enabled
+          ? { enabled: true, port: 18789, internalPort: 19119, tuiEnabled: false }
+          : null,
+      };
+      const ensureForState = vi.fn();
+      const result = await applyReusedSandboxDashboardState({
+        sandboxName: "reuse-me",
+        chatUiUrl: "http://127.0.0.1:18789",
+        env: {},
+        agent: loadAgent("hermes"),
+        model: "test-model",
+        provider: "openai-compatible",
+        selectionVerified: true,
+        sandboxGpuConfig,
+        gatewayName: "nemoclaw",
+        gatewayPort: 8080,
+        ensureDashboardForward,
+        hermesDashboardForwarding: {
+          resolveStateForPort: vi.fn(() => hermesDashboardState),
+          ensureForState,
+        },
+        updateSandbox,
+        updateReusedSandboxMetadata: vi.fn(),
+      });
+
+      expect(updateSandbox).toHaveBeenCalledWith("reuse-me", {
+        hermesDashboardEnabled: enabled ? true : undefined,
+        hermesDashboardPort: enabled ? 18789 : undefined,
+        hermesDashboardInternalPort: enabled ? 19119 : undefined,
+        hermesDashboardTui: undefined,
+        // No external CHAT_UI_URL configured -> loopback stays the reported form.
+        dashboardExternalUrl: null,
+        gatewayName: "nemoclaw",
+        gatewayPort: 8080,
+      });
+      expect(ensureForState).toHaveBeenCalledTimes(enabled ? 0 : 1);
+      expect(result.hermesDashboardState).toBe(hermesDashboardState);
+      expect(ensureDashboardForward).toHaveBeenCalledWith("reuse-me", "http://127.0.0.1:18789", {
+        reuseExistingForward: true,
+      });
+    },
+  );
+
+  it("persists the external dashboard URL rebound to the effective port on reuse (#11439)", async () => {
     const updateSandbox = vi.fn();
-    const env: NodeJS.ProcessEnv = {};
-    const sandboxGpuConfig: SandboxGpuConfig = {
-      hostGpuDetected: true,
-      hostGpuPlatform: "linux",
-      sandboxGpuEnabled: true,
-      mode: "auto",
-      sandboxGpuDevice: null,
-      errors: [],
-      sandboxGpuProof: null,
-    };
-    const hermesDashboardState = {
-      enabled: true,
-      config: {
-        enabled: true,
-        port: 9123,
-        internalPort: 19123,
-        tuiEnabled: true,
-      },
-    };
-    const hermesDashboardForwarding = {
-      resolveStateForPort: vi.fn(() => hermesDashboardState),
-      ensureForState: vi.fn(),
-    };
     const ensureDashboardForward = vi.fn(() => 18790);
-    const updateReusedSandboxMetadata = vi.fn();
-
-    const result = applyReusedSandboxDashboardState({
-      sandboxName: "reuse-me",
-      chatUiUrl: "http://127.0.0.1:18789",
-      env,
-      agent: null,
-      model: "test-model",
-      provider: "openai-compatible",
-      selectionVerified: false,
-      sandboxGpuConfig,
-      gatewayName: "nemoclaw-19080",
-      gatewayPort: 19080,
-      ensureDashboardForward,
-      hermesDashboardForwarding,
-      updateSandbox,
-      updateReusedSandboxMetadata,
-    });
-
-    expect(ensureDashboardForward).toHaveBeenCalledWith("reuse-me", "http://127.0.0.1:18789");
-    expect(env.CHAT_UI_URL).toBe("http://127.0.0.1:18790");
-    expect(hermesDashboardForwarding.resolveStateForPort).toHaveBeenCalledWith(18790);
-    expect(hermesDashboardForwarding.ensureForState).toHaveBeenCalledWith(
-      hermesDashboardState,
-      "reuse-me",
-    );
-    expect(updateReusedSandboxMetadata).toHaveBeenCalledWith(
-      "reuse-me",
-      null,
-      "test-model",
-      "openai-compatible",
-      18790,
-      false,
-      sandboxGpuConfig,
-    );
-    expect(updateSandbox).toHaveBeenCalledWith("reuse-me", {
-      hermesDashboardEnabled: true,
-      hermesDashboardPort: 9123,
-      hermesDashboardInternalPort: 19123,
-      hermesDashboardTui: true,
-      gatewayName: "nemoclaw-19080",
-      gatewayPort: 19080,
-    });
-    expect(result).toEqual({
-      chatUiUrl: "http://127.0.0.1:18790",
-      dashboardPort: 18790,
-      hermesDashboardState,
-    });
-  });
-
-  it("clears Hermes dashboard registry fields when the reused sandbox has it disabled", () => {
-    const updateSandbox = vi.fn();
     const sandboxGpuConfig: SandboxGpuConfig = {
       hostGpuDetected: false,
       hostGpuPlatform: null,
@@ -116,39 +101,105 @@ describe("applyReusedSandboxDashboardState", () => {
       sandboxGpuDevice: null,
       errors: [],
     };
-    const hermesDashboardState = { enabled: false, config: null };
-    const result = applyReusedSandboxDashboardState({
+
+    await applyReusedSandboxDashboardState({
       sandboxName: "reuse-me",
-      chatUiUrl: "http://127.0.0.1:18789",
-      env: {},
-      agent: null,
+      chatUiUrl: "http://127.0.0.1:18790",
+      env: { CHAT_UI_URL: "https://dash.example.com:18789" },
+      agent: loadAgent("hermes"),
       model: "test-model",
       provider: "openai-compatible",
       selectionVerified: true,
       sandboxGpuConfig,
       gatewayName: "nemoclaw",
       gatewayPort: 8080,
-      ensureDashboardForward: vi.fn(() => 18789),
+      ensureDashboardForward,
       hermesDashboardForwarding: {
-        resolveStateForPort: vi.fn(() => hermesDashboardState),
+        resolveStateForPort: vi.fn(() => ({ enabled: false, config: null })),
         ensureForState: vi.fn(),
       },
       updateSandbox,
       updateReusedSandboxMetadata: vi.fn(),
     });
 
-    expect(updateSandbox).toHaveBeenCalledWith("reuse-me", {
-      hermesDashboardEnabled: undefined,
-      hermesDashboardPort: undefined,
-      hermesDashboardInternalPort: undefined,
-      hermesDashboardTui: undefined,
-      gatewayName: "nemoclaw",
-      gatewayPort: 8080,
-    });
-    expect(result.hermesDashboardState).toBe(hermesDashboardState);
+    expect(updateSandbox).toHaveBeenCalledWith(
+      "reuse-me",
+      expect.objectContaining({
+        dashboardExternalUrl: "https://dash.example.com:18790",
+      }),
+    );
   });
 
-  it("skips dashboard forwarding while preserving reuse metadata for terminal agents", () => {
+  describe("OpenClaw dashboard origin change (#13177)", () => {
+    const sandboxGpuConfig: SandboxGpuConfig = {
+      hostGpuDetected: false,
+      hostGpuPlatform: null,
+      sandboxGpuEnabled: false,
+      mode: "auto",
+      sandboxGpuDevice: null,
+      errors: [],
+    };
+
+    /** Reuse a sandbox with the requested and recorded origins; return the note spy. */
+    async function reuseWith(
+      requested: string | undefined,
+      recorded: string | null | undefined,
+      agentName = "openclaw",
+    ): Promise<ReturnType<typeof vi.fn>> {
+      const note = vi.fn();
+      await applyReusedSandboxDashboardState({
+        sandboxName: "reuse-me",
+        chatUiUrl: "http://127.0.0.1:18789",
+        env: requested === undefined ? {} : { CHAT_UI_URL: requested },
+        agent: loadAgent(agentName),
+        model: "test-model",
+        provider: "nvidia-prod",
+        selectionVerified: true,
+        sandboxGpuConfig,
+        gatewayName: "nemoclaw",
+        gatewayPort: 8080,
+        getSandbox: () => ({ name: "reuse-me", dashboardExternalUrl: recorded }) as never,
+        ensureDashboardForward: vi.fn(() => 18789),
+        hermesDashboardForwarding: {
+          resolveStateForPort: vi.fn(() => ({ enabled: false, config: null })),
+          ensureForState: vi.fn(),
+        },
+        updateSandbox: vi.fn(),
+        updateReusedSandboxMetadata: vi.fn(),
+        note,
+        cliName: "nemoclaw",
+      });
+      return note;
+    }
+
+    it("tells the operator that a rebuild applies a new origin", async () => {
+      const note = await reuseWith("https://launchpad.example.test", undefined);
+
+      expect(note).toHaveBeenCalledWith(
+        "  Dashboard origin changed to https://launchpad.example.test:18789. The running sandbox still allows only its previous origins; run: nemoclaw reuse-me rebuild",
+      );
+    });
+
+    it("tells the operator that a rebuild removes a cleared origin", async () => {
+      const note = await reuseWith(undefined, "https://launchpad.example.test:18789");
+
+      expect(note).toHaveBeenCalledWith(
+        "  Dashboard origin https://launchpad.example.test:18789 was removed. The running sandbox still allows it until you run: nemoclaw reuse-me rebuild",
+      );
+    });
+
+    it("stays quiet when the recorded origin does not change", async () => {
+      expect(
+        await reuseWith("https://launchpad.example.test", "https://launchpad.example.test:18789"),
+      ).not.toHaveBeenCalled();
+      expect(await reuseWith(undefined, undefined)).not.toHaveBeenCalled();
+      expect(
+        await reuseWith("https://launchpad.example.test", undefined, "hermes"),
+      ).not.toHaveBeenCalled();
+    });
+  });
+
+  it("skips dashboard forwarding while preserving reuse metadata for terminal agents", async () => {
     const updateSandbox = vi.fn();
     const env: NodeJS.ProcessEnv = { CHAT_UI_URL: "https://chat.example.test:19000" };
     const sandboxGpuConfig: SandboxGpuConfig = {
@@ -168,7 +219,7 @@ describe("applyReusedSandboxDashboardState", () => {
     };
     const updateReusedSandboxMetadata = vi.fn();
 
-    const result = applyReusedSandboxDashboardState({
+    const result = await applyReusedSandboxDashboardState({
       sandboxName: "terminal-box",
       chatUiUrl: "",
       env,
@@ -198,6 +249,7 @@ describe("applyReusedSandboxDashboardState", () => {
       0,
       true,
       sandboxGpuConfig,
+      undefined,
     );
     expect(updateSandbox).toHaveBeenCalledWith("terminal-box", {
       hermesDashboardEnabled: undefined,
@@ -212,6 +264,160 @@ describe("applyReusedSandboxDashboardState", () => {
       dashboardPort: 0,
       hermesDashboardState: { enabled: false, config: null },
     });
+  });
+
+  it("passes the receipt check into dashboard forwarding after release (#9833)", async () => {
+    const revalidateSandboxIdentity = vi
+      .fn<(operation: string) => void>()
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => {
+        throw new Error("Sandbox identity changed before the dashboard entry");
+      });
+    const ensureDashboardForward = vi.fn(
+      (
+        _sandboxName: string,
+        _chatUiUrl: string,
+        options?: { revalidateSandboxIdentity?: (operation: string) => void },
+      ) => {
+        options?.revalidateSandboxIdentity?.("start the dashboard forward");
+        return 18790;
+      },
+    );
+    const env: NodeJS.ProcessEnv = {};
+    const ensureForState = vi.fn();
+    const updateReusedSandboxMetadata = vi.fn();
+    const updateSandbox = vi.fn();
+
+    await expect(
+      restoreReusedSandboxDashboardState({
+        sandboxName: "reuse-me",
+        chatUiUrl: "http://127.0.0.1:18789",
+        env,
+        agent: null,
+        model: "test-model",
+        provider: "openai-compatible",
+        selectionVerified: true,
+        sandboxGpuConfig: {
+          hostGpuDetected: false,
+          hostGpuPlatform: null,
+          sandboxGpuEnabled: false,
+          mode: "auto",
+          sandboxGpuDevice: null,
+          errors: [],
+        },
+        gatewayName: "nemoclaw",
+        gatewayPort: 8080,
+        getSandbox: () => null,
+        releaseDashboardPort: vi.fn(async () => undefined),
+        ensureDashboardForward,
+        hermesDashboardForwarding: {
+          resolveStateForPort: vi.fn(() => ({ enabled: false, config: null })),
+          ensureForState,
+        },
+        updateSandbox,
+        updateReusedSandboxMetadata,
+        revalidateSandboxIdentity,
+      }),
+    ).rejects.toThrow(/Sandbox identity changed before/u);
+
+    expect(ensureDashboardForward).toHaveBeenCalledOnce();
+    expect(env.CHAT_UI_URL).toBeUndefined();
+    expect(ensureForState).not.toHaveBeenCalled();
+    expect(updateReusedSandboxMetadata).not.toHaveBeenCalled();
+    expect(updateSandbox).not.toHaveBeenCalled();
+  });
+
+  it.each(["openclaw", "hermes"])("restores the registered %s dashboard port", async (name) => {
+    const releaseDashboardPort = vi.fn(async () => undefined);
+    const ensureDashboardForward = vi.fn(() => 18_789);
+
+    const result = await restoreReusedSandboxDashboardState({
+      sandboxName: "reuse-me",
+      chatUiUrl: "http://127.0.0.1:18790",
+      env: {},
+      agent: loadAgent(name),
+      model: "test-model",
+      provider: "openai-compatible",
+      selectionVerified: true,
+      sandboxGpuConfig: {
+        hostGpuDetected: false,
+        hostGpuPlatform: null,
+        sandboxGpuEnabled: false,
+        mode: "auto",
+        sandboxGpuDevice: null,
+        errors: [],
+      },
+      gatewayName: "nemoclaw",
+      gatewayPort: 8080,
+      getSandbox: () => ({ dashboardPort: 18_789 }) as never,
+      releaseDashboardPort,
+      ensureDashboardForward,
+      hermesDashboardForwarding: {
+        resolveStateForPort: vi.fn(() => ({ enabled: false, config: null })),
+        ensureForState: vi.fn(),
+      },
+      updateSandbox: vi.fn(),
+      updateReusedSandboxMetadata: vi.fn(),
+    });
+
+    expect(releaseDashboardPort).toHaveBeenCalledOnce();
+    expect(ensureDashboardForward).toHaveBeenCalledWith("reuse-me", "http://127.0.0.1:18789", {
+      reuseExistingForward: true,
+    });
+    expect(result.dashboardPort).toBe(18_789);
+  });
+
+  it("rechecks after Hermes forwarding before reuse metadata (#9833)", async () => {
+    const revalidateSandboxIdentity = vi
+      .fn<(operation: string) => void>()
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => {
+        throw new Error("Sandbox identity changed before the dashboard entry");
+      });
+    const ensureForState = vi.fn();
+    const ensureDashboardForward = vi.fn(() => 18790);
+    const updateReusedSandboxMetadata = vi.fn();
+    const updateSandbox = vi.fn();
+
+    await expect(
+      applyReusedSandboxDashboardState({
+        sandboxName: "reuse-me",
+        chatUiUrl: "http://127.0.0.1:18789",
+        env: {},
+        agent: { name: "hermes" } as any,
+        model: "test-model",
+        provider: "openai-compatible",
+        selectionVerified: true,
+        sandboxGpuConfig: {
+          hostGpuDetected: false,
+          hostGpuPlatform: null,
+          sandboxGpuEnabled: false,
+          mode: "auto",
+          sandboxGpuDevice: null,
+          errors: [],
+        },
+        gatewayName: "nemoclaw",
+        gatewayPort: 8080,
+        ensureDashboardForward,
+        hermesDashboardForwarding: {
+          resolveStateForPort: vi.fn(() => ({ enabled: false, config: null })),
+          ensureForState,
+        },
+        updateSandbox,
+        updateReusedSandboxMetadata,
+        revalidateSandboxIdentity,
+      }),
+    ).rejects.toThrow(/Sandbox identity changed before/u);
+
+    expect(ensureForState).toHaveBeenCalledOnce();
+    expect(ensureDashboardForward).toHaveBeenCalledWith("reuse-me", "http://127.0.0.1:18789", {
+      reuseExistingForward: true,
+      revalidateSandboxIdentity,
+    });
+    expect(updateReusedSandboxMetadata).not.toHaveBeenCalled();
+    expect(updateSandbox).not.toHaveBeenCalled();
   });
 });
 
@@ -244,6 +450,51 @@ describe("createSandboxReuseHelpers", () => {
       "alpha",
       expect.stringContaining("Id: openshell-source-id"),
       "alpha Ready\n",
+    );
+  });
+
+  it.each([
+    ["Ready", `Error:   × code: 'Internal error', message: "sandbox has no spec"`],
+    ["Stopped", `Error:   × code: 'Internal error', message: "sandbox has no spec"`],
+    [
+      "Provisioning",
+      `Error:   × code: 'The system is not in a state required for the operation's\n  │ execution', message: "provider 'compatible-endpoint' not found"`,
+    ],
+  ])("observes retained legacy identity in phase %s through onboarding", (phase, diagnostic) => {
+    const captureOpenshell = vi
+      .fn()
+      .mockReturnValueOnce(failedCapture(diagnostic))
+      .mockReturnValueOnce(
+        successfulCapture(
+          JSON.stringify([
+            {
+              id: "legacy-source-id",
+              name: "alpha",
+              labels: {},
+              resource_version: 1,
+              created_at: "2026-09-14T00:00:00Z",
+              phase,
+              current_policy_version: 1,
+            },
+          ]),
+        ),
+      );
+    const helpers = createSandboxReuseHelpers({
+      runCaptureOpenshell: vi.fn(),
+      captureOpenshell,
+      getSandboxStateFromOutputs: vi.fn(() => "missing"),
+      getGatewayName: () => "wrong-gateway",
+    });
+    expect(helpers.getSandboxRecreateObservation("alpha", "nemoclaw-9090")).toEqual({
+      state: phase === "Ready" ? "ready" : "not_ready",
+      liveIdentityFingerprint: fingerprintSandboxRecreateValue("legacy-source-id"),
+    });
+    expect(captureOpenshell).toHaveBeenLastCalledWith(
+      ["sandbox", "list", "-g", "nemoclaw-9090", "-o", "json"],
+      expect.objectContaining({
+        includeStreams: true,
+        timeout: SANDBOX_RECREATE_PROBE_TIMEOUT_MS,
+      }),
     );
   });
 

@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { finalizationHandlerDeps, finalizationHandlerRuntime } from "../finalization-deps";
 
 import type { SessionUpdates } from "../../../state/onboard-session";
+import type { PreparedExternalComponent } from "../../external-component";
+import type { ExternalComponentActivationProof } from "../../external-component/activation";
 import {
   type FinalizationStateOptions,
   handleFinalizationState as handleFinalizationPhase,
@@ -24,18 +28,47 @@ type Agent = {
 type VerifyChain = { port: number };
 type VerificationResult = { ok: boolean };
 
+const sandboxIdentityFingerprint = `sha256:${"b".repeat(64)}`;
+const externalComponent: PreparedExternalComponent = {
+  declaration: {
+    schemaVersion: 1,
+    componentId: "policy-governance",
+    interceptorSocketPath: "/run/user/1000/component/interceptor.sock",
+    activationSocketPath: "/run/user/1000/component/activation.sock",
+  },
+  revalidateBeforeGateway: vi.fn(),
+  revalidateBeforeActivation: vi.fn(),
+};
+const activationProof: ExternalComponentActivationProof = {
+  gatewayName: "nemoclaw",
+  sandboxId: "sandbox-123",
+  sandboxIdentityFingerprint,
+  lifecycleGeneration: "generation-1",
+  policySource: "sandbox",
+  policyHash: `sha256:${"a".repeat(64)}`,
+  policyActiveVersion: 7,
+  revalidate: vi.fn(),
+};
+const activationEvidence = {
+  schemaVersion: 1 as const,
+  activationId: "4b5a8e18-f967-4e27-a3b2-f2cc315abe21",
+  componentId: "policy-governance",
+  lifecycleGeneration: "generation-1",
+  sandboxIdentityFingerprint,
+};
+
 function createDeps(
   overrides: Partial<FinalizationStateOptions<Agent, VerifyChain, VerificationResult>["deps"]> = {},
 ) {
   const calls = {
     setDefaultSandbox: vi.fn(),
-    ensureAgentDashboard: vi.fn(() => 18789),
-    persistDashboardPort: vi.fn(),
     removeLegacy: vi.fn(),
     cleanupHost: vi.fn(),
-    recoverProcesses: vi.fn(),
-    warmupScopeUpgrade: vi.fn(),
-    autoPairScopeApproval: vi.fn(),
+    recoverProcesses: vi.fn(async () => true),
+    settleOrdinaryPairing: vi.fn(async () => ({ kind: "settled" as const })),
+    ordinaryPairingIncompleteMessage: vi.fn(
+      () => "OpenClaw onboarding is incomplete; resume onboarding.",
+    ),
     readRegistryAgent: vi.fn(() => "openclaw"),
     settlePortablePairing: vi.fn(async () => ({ kind: "settled" as const })),
     portablePairingIncompleteMessage: vi.fn(
@@ -44,32 +77,40 @@ function createDeps(
     getChatUiUrl: vi.fn(() => "http://127.0.0.1:18789"),
     buildChain: vi.fn(() => ({ port: 18789 })),
     verify: vi.fn(async () => ({ ok: true })),
+    probeTerminalInference: vi.fn(async () => ({ ok: true })),
     diagnostics: vi.fn(() => ["  ✓ verified"]),
-    verifyWebSearch: vi.fn(() => true),
-    dashboard: vi.fn(),
+    verifyWebSearch: vi.fn(async () => true),
+    dashboard: vi.fn(async () => undefined),
     isHealthy: vi.fn(() => true),
     reportReadiness: vi.fn(),
+    createExternalComponentActivationProof: vi.fn(() => activationProof),
+    createExternalComponentActivationId: vi.fn(() => "4b5a8e18-f967-4e27-a3b2-f2cc315abe21"),
+    activateExternalComponent: vi.fn(async () => ({ kind: "activated" as const })),
+    setExternalComponentActivationEvidence: vi.fn(),
     error: vi.fn(),
     log: vi.fn(),
   };
   return {
     calls,
     deps: {
-      ensureAgentDashboardForward: calls.ensureAgentDashboard,
-      persistDashboardPort: calls.persistDashboardPort,
       setDefaultSandbox: calls.setDefaultSandbox,
+      createExternalComponentActivationProof: calls.createExternalComponentActivationProof,
+      createExternalComponentActivationId: calls.createExternalComponentActivationId,
+      activateExternalComponent: calls.activateExternalComponent,
+      setExternalComponentActivationEvidence: calls.setExternalComponentActivationEvidence,
       toSessionUpdates: (updates: Record<string, unknown>) => updates as SessionUpdates,
       removeLegacyCredentialsFile: calls.removeLegacy,
       cleanupStaleHostFiles: calls.cleanupHost,
       checkAndRecoverSandboxProcesses: calls.recoverProcesses,
-      warmupScopeUpgrade: calls.warmupScopeUpgrade,
-      autoPairScopeApproval: calls.autoPairScopeApproval,
+      settleOrdinaryOpenClawPairing: calls.settleOrdinaryPairing,
+      ordinaryOpenClawPairingIncompleteMessage: calls.ordinaryPairingIncompleteMessage,
       readRegistryAgent: calls.readRegistryAgent,
       settlePortablePairing: calls.settlePortablePairing,
       portablePairingIncompleteMessage: calls.portablePairingIncompleteMessage,
       getChatUiUrl: calls.getChatUiUrl,
       buildVerifyChain: calls.buildChain,
       verifyDeployment: calls.verify,
+      probeTerminalInference: calls.probeTerminalInference,
       formatVerificationDiagnostics: calls.diagnostics,
       verifyWebSearchInsideSandbox: calls.verifyWebSearch,
       printDashboard: calls.dashboard,
@@ -113,6 +154,152 @@ async function runFinalizationHandlers(
 }
 
 describe("finalization handlers", () => {
+  it("defers registry-bound runtime verification to the outer rebuild transaction", async () => {
+    const { deps, calls } = createDeps();
+
+    const result = await handleFinalizationPhase({
+      ...baseOptions(deps),
+      deferRuntimeVerification: true,
+    });
+
+    expect(result.stateResult).toEqual({
+      type: "transition",
+      next: "post_verify",
+      transitionKind: "advance",
+      updates: undefined,
+      metadata: { state: "finalizing" },
+    });
+    expect(calls.setDefaultSandbox).toHaveBeenCalledExactlyOnceWith("my-assistant");
+    expect(calls.cleanupHost).toHaveBeenCalledOnce();
+    expect(calls.recoverProcesses).not.toHaveBeenCalled();
+    expect(calls.verify).not.toHaveBeenCalled();
+
+    const postVerify = await handlePostVerifyState({
+      ...baseOptions(deps),
+      deferRuntimeVerification: true,
+    });
+    expect(postVerify).toEqual({
+      stateResult: { type: "complete", updates: {}, metadata: { state: "post_verify" } },
+      verificationDiagnostics: [],
+      deploymentHealthy: true,
+    });
+    expect(calls.recoverProcesses).not.toHaveBeenCalled();
+    expect(calls.verify).not.toHaveBeenCalled();
+  });
+
+  it("completes providerless component activation without ordinary setup (#11486)", async () => {
+    const { deps, calls } = createDeps();
+    const result = await handleFinalizationPhase({
+      ...baseOptions(deps),
+      externalComponent,
+      providerless: true,
+      provider: "",
+      model: "",
+    });
+    expect(result.stateResult).toMatchObject({ type: "transition", next: "post_verify" });
+    expect(calls.activateExternalComponent).toHaveBeenCalledOnce();
+    expect(calls.setExternalComponentActivationEvidence).toHaveBeenLastCalledWith(null);
+    expect(calls.setDefaultSandbox).not.toHaveBeenCalled();
+    expect(calls.removeLegacy).not.toHaveBeenCalled();
+    expect(calls.cleanupHost).not.toHaveBeenCalled();
+    expect(calls.recoverProcesses).not.toHaveBeenCalled();
+    expect(calls.verify).not.toHaveBeenCalled();
+    expect(calls.dashboard).not.toHaveBeenCalled();
+  });
+
+  it("activates the registered component before declaring the sandbox ready (#11340)", async () => {
+    const { deps, calls } = createDeps();
+
+    const result = await handleFinalizationPhase({
+      ...baseOptions(deps),
+      externalComponent,
+    });
+
+    expect(calls.createExternalComponentActivationProof).toHaveBeenCalledWith("my-assistant");
+    expect(calls.activateExternalComponent).toHaveBeenCalledWith(
+      externalComponent,
+      activationProof,
+      "4b5a8e18-f967-4e27-a3b2-f2cc315abe21",
+    );
+    expect(calls.setExternalComponentActivationEvidence).toHaveBeenNthCalledWith(1, {
+      ...activationEvidence,
+      resultClass: "ambiguous",
+    });
+    expect(calls.setExternalComponentActivationEvidence).toHaveBeenNthCalledWith(2, null);
+    expect(calls.setExternalComponentActivationEvidence.mock.invocationCallOrder[0]).toBeLessThan(
+      calls.activateExternalComponent.mock.invocationCallOrder[0],
+    );
+    expect(calls.activateExternalComponent.mock.invocationCallOrder[0]).toBeLessThan(
+      calls.setDefaultSandbox.mock.invocationCallOrder[0],
+    );
+    expect(result.stateResult).toMatchObject({
+      type: "transition",
+      next: "post_verify",
+    });
+  });
+
+  it.each([
+    ["rejected", "failed", false],
+    ["ambiguous", "ambiguous", false],
+    ["rejected", "failed", true],
+    ["ambiguous", "ambiguous", true],
+  ] as const)(
+    "preserves identity-bound incomplete state for %s activation (#11340)",
+    async (kind, resultClass, providerless) => {
+      const activationId = "4b5a8e18-f967-4e27-a3b2-f2cc315abe21";
+      const activate = vi.fn(async () =>
+        kind === "rejected"
+          ? ({ kind, activationId } as const)
+          : ({ kind, activationId, reason: "timeout" } as const),
+      );
+      const { deps, calls } = createDeps({ activateExternalComponent: activate });
+
+      const result = await handleFinalizationPhase({
+        ...baseOptions(deps),
+        externalComponent,
+        providerless,
+      });
+
+      expect(result.stateResult).toEqual({
+        type: "pause",
+        updates: {
+          externalComponentActivation: {
+            schemaVersion: 1,
+            activationId,
+            componentId: "policy-governance",
+            lifecycleGeneration: "generation-1",
+            sandboxIdentityFingerprint,
+            resultClass,
+          },
+        },
+        metadata: {
+          state: "finalizing",
+          reason: "external_component_activation_incomplete",
+        },
+      });
+      expect(result.stateResult.updates?.externalComponentActivation).not.toHaveProperty(
+        "sandboxName",
+      );
+      expect(calls.setDefaultSandbox).not.toHaveBeenCalled();
+      expect(calls.removeLegacy).not.toHaveBeenCalled();
+      expect(calls.cleanupHost).not.toHaveBeenCalled();
+      expect(calls.error).toHaveBeenCalledWith(
+        `  External component activation is incomplete. Reason class: ${resultClass}. The sandbox was preserved.`,
+      );
+      expect(JSON.stringify(calls.error.mock.calls)).not.toMatch(
+        /policy-governance|activation\.sock|credential|secret|token|password|api.?key/iu,
+      );
+      expect(calls.setExternalComponentActivationEvidence).toHaveBeenNthCalledWith(1, {
+        ...activationEvidence,
+        resultClass: "ambiguous",
+      });
+      expect(calls.setExternalComponentActivationEvidence).toHaveBeenLastCalledWith({
+        ...activationEvidence,
+        resultClass,
+      });
+    },
+  );
+
   it("advances to post verification before deployment verification runs", async () => {
     const { deps, calls } = createDeps();
 
@@ -168,7 +355,31 @@ describe("finalization handlers", () => {
     expect(result.verificationDiagnostics).toEqual(["  ✓ verified"]);
   });
 
-  it("uses strict Portable settlement instead of ordinary warm-up and approval (#9207)", async () => {
+  it("waits for dashboard completion before reporting readiness", async () => {
+    let resolveDashboard!: () => void;
+    const dashboardPending = new Promise<void>((resolve) => {
+      resolveDashboard = resolve;
+    });
+    const printDashboard = vi.fn(() => dashboardPending);
+    const { deps, calls } = createDeps({ printDashboard });
+    const settled = vi.fn();
+
+    const pending = handlePostVerifyState(baseOptions(deps));
+    void pending.then(settled);
+    await vi.waitFor(() => expect(printDashboard).toHaveBeenCalledOnce());
+
+    expect(calls.reportReadiness).not.toHaveBeenCalled();
+    expect(settled).not.toHaveBeenCalled();
+
+    resolveDashboard();
+    const result = await pending;
+
+    expect(calls.reportReadiness).toHaveBeenCalledExactlyOnceWith(true);
+    expect(settled).toHaveBeenCalledOnce();
+    expect(result.stateResult).toMatchObject({ type: "complete" });
+  });
+
+  it("uses strict Portable settlement instead of ordinary pairing settlement (#9207)", async () => {
     const { deps, calls } = createDeps();
     const options = {
       ...baseOptions(deps),
@@ -179,8 +390,7 @@ describe("finalization handlers", () => {
     const result = await runFinalizationHandlers(options);
 
     expect(result.stateResult.type).toBe("complete");
-    expect(calls.warmupScopeUpgrade).not.toHaveBeenCalled();
-    expect(calls.autoPairScopeApproval).not.toHaveBeenCalled();
+    expect(calls.settleOrdinaryPairing).not.toHaveBeenCalled();
     expect(calls.settlePortablePairing).toHaveBeenCalledExactlyOnceWith("my-assistant", {
       portableRequired: true,
     });
@@ -197,8 +407,7 @@ describe("finalization handlers", () => {
     const result = await runFinalizationHandlers(options);
 
     expect(result.stateResult.type).toBe("complete");
-    expect(calls.warmupScopeUpgrade).not.toHaveBeenCalled();
-    expect(calls.autoPairScopeApproval).not.toHaveBeenCalled();
+    expect(calls.settleOrdinaryPairing).not.toHaveBeenCalled();
     expect(calls.settlePortablePairing).toHaveBeenCalledExactlyOnceWith("my-assistant", {
       portableRequired: true,
     });
@@ -229,8 +438,7 @@ describe("finalization handlers", () => {
     });
     expect(calls.verify).not.toHaveBeenCalled();
     expect(calls.dashboard).not.toHaveBeenCalled();
-    expect(calls.warmupScopeUpgrade).not.toHaveBeenCalled();
-    expect(calls.autoPairScopeApproval).not.toHaveBeenCalled();
+    expect(calls.settleOrdinaryPairing).not.toHaveBeenCalled();
     expect(calls.reportReadiness).toHaveBeenCalledWith(false);
     expect(calls.error).toHaveBeenCalledWith(
       "  Portable onboarding is incomplete; resume onboarding.",
@@ -248,8 +456,7 @@ describe("finalization handlers", () => {
     const result = await runFinalizationHandlers(options);
 
     expect(result.stateResult.type).toBe("complete");
-    expect(calls.warmupScopeUpgrade).toHaveBeenCalledOnce();
-    expect(calls.autoPairScopeApproval).toHaveBeenCalledOnce();
+    expect(calls.settleOrdinaryPairing).not.toHaveBeenCalled();
     expect(calls.settlePortablePairing).not.toHaveBeenCalled();
   });
 
@@ -271,8 +478,7 @@ describe("finalization handlers", () => {
         metadata: { state: "post_verify", reason: "portable_pairing_incomplete" },
       },
     });
-    expect(calls.warmupScopeUpgrade).not.toHaveBeenCalled();
-    expect(calls.autoPairScopeApproval).not.toHaveBeenCalled();
+    expect(calls.settleOrdinaryPairing).not.toHaveBeenCalled();
     expect(calls.settlePortablePairing).not.toHaveBeenCalled();
     expect(calls.verify).not.toHaveBeenCalled();
   });
@@ -305,74 +511,37 @@ describe("finalization handlers", () => {
     });
   });
 
-  it("restores the default OpenClaw dashboard forward after process recovery", async () => {
-    let forwardLive = true;
-    const recoverProcesses = vi.fn(() => {
-      forwardLive = false;
-    });
-    const ensureDashboard = vi.fn(() => {
+  it("relies on process recovery to restore the default OpenClaw dashboard forward", async () => {
+    let forwardLive = false;
+    const recoverProcesses = vi.fn(async () => {
       forwardLive = true;
-      return 18789;
+      return true;
     });
     const verify = vi.fn(async () => ({ ok: forwardLive }));
     const { deps } = createDeps({
       checkAndRecoverSandboxProcesses: recoverProcesses,
-      ensureAgentDashboardForward: ensureDashboard,
       verifyDeployment: verify,
       isDeploymentHealthy: vi.fn((result) => result.ok),
     });
 
     const result = await runFinalizationHandlers(baseOptions(deps));
 
-    expect(ensureDashboard).toHaveBeenCalledWith("my-assistant", null);
-    expect(ensureDashboard.mock.invocationCallOrder[0]).toBeGreaterThan(
-      recoverProcesses.mock.invocationCallOrder[1],
-    );
-    expect(ensureDashboard.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(recoverProcesses).toHaveBeenCalledTimes(2);
+    expect(recoverProcesses.mock.invocationCallOrder[1]).toBeLessThan(
       verify.mock.invocationCallOrder[0],
     );
     expect(result.deploymentHealthy).toBe(true);
     expect(result.stateResult.type).toBe("complete");
   });
 
-  it("persists the dashboard port selected after final recovery (#8214)", async () => {
-    const persistDashboardPort = vi.fn();
-    const { deps } = createDeps({
-      ensureAgentDashboardForward: vi.fn(() => 18792),
-      persistDashboardPort,
-    });
-
-    await handleFinalizationPhase({
-      ...baseOptions(deps),
-      agent: { name: "hermes" },
-    });
-
-    expect(persistDashboardPort).toHaveBeenCalledWith("my-assistant", 18792);
-  });
-
-  it("does not persist a zero dashboard port after final recovery (#8214)", async () => {
-    const persistDashboardPort = vi.fn();
-    const { deps } = createDeps({
-      ensureAgentDashboardForward: vi.fn(() => 0),
-      persistDashboardPort,
-    });
-
-    await handleFinalizationPhase({
-      ...baseOptions(deps),
-      agent: { name: "hermes" },
-    });
-
-    expect(persistDashboardPort).not.toHaveBeenCalled();
-  });
-
-  it("ensures agent dashboard forwarding before completion for non-OpenClaw agents", async () => {
+  it("recovers agent dashboard forwarding before completion for non-OpenClaw agents", async () => {
     const { deps, calls } = createDeps();
     const agent = { name: "hermes" };
 
     await runFinalizationHandlers({ ...baseOptions(deps), agent });
 
-    expect(calls.ensureAgentDashboard).toHaveBeenCalledWith("my-assistant", agent);
-    expect(calls.ensureAgentDashboard.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(calls.recoverProcesses).toHaveBeenCalledWith("my-assistant", { quiet: true });
+    expect(calls.recoverProcesses.mock.invocationCallOrder[0]).toBeLessThan(
       calls.dashboard.mock.invocationCallOrder[0],
     );
     expect(calls.dashboard).toHaveBeenCalledWith(
@@ -397,15 +566,12 @@ describe("finalization handlers", () => {
     });
 
     const recoveryOrders = calls.recoverProcesses.mock.invocationCallOrder;
-    const refreshOrder = calls.ensureAgentDashboard.mock.invocationCallOrder[0];
     expect(recoveryOrders).toHaveLength(2);
-    expect(recoveryOrders[1]).toBeGreaterThan(calls.warmupScopeUpgrade.mock.invocationCallOrder[0]);
+    expect(calls.settleOrdinaryPairing).toHaveBeenCalledExactlyOnceWith("my-assistant");
     expect(recoveryOrders[1]).toBeGreaterThan(
-      calls.autoPairScopeApproval.mock.invocationCallOrder[0],
+      calls.settleOrdinaryPairing.mock.invocationCallOrder[0],
     );
-    expect(refreshOrder).toBeGreaterThan(recoveryOrders[1]);
-    expect(calls.verifyWebSearch.mock.invocationCallOrder[0]).toBeGreaterThan(refreshOrder);
-    expect(refreshOrder).toBeLessThan(calls.verify.mock.invocationCallOrder[0]);
+    expect(calls.verifyWebSearch.mock.invocationCallOrder[0]).toBeGreaterThan(recoveryOrders[1]);
     expect(calls.verifyWebSearch.mock.invocationCallOrder[0]).toBeLessThan(
       calls.verify.mock.invocationCallOrder[0],
     );
@@ -429,9 +595,8 @@ describe("finalization handlers", () => {
       webSearchEnabled: true,
     });
 
-    expect(calls.ensureAgentDashboard).not.toHaveBeenCalled();
     expect(calls.recoverProcesses).not.toHaveBeenCalled();
-    expect(calls.autoPairScopeApproval).not.toHaveBeenCalled();
+    expect(calls.settleOrdinaryPairing).not.toHaveBeenCalled();
     expect(calls.getChatUiUrl).not.toHaveBeenCalled();
     expect(calls.buildChain).not.toHaveBeenCalled();
     expect(calls.verify).not.toHaveBeenCalled();
@@ -450,6 +615,82 @@ describe("finalization handlers", () => {
     expect(result.stateResult.type).toBe("complete");
   });
 
+  it.each([false, true])(
+    "verifies Deep Code OpenRouter inference before reporting the terminal ready (deferred: %s)",
+    async (deferRuntimeVerification) => {
+      const { deps, calls } = createDeps();
+      const agent = {
+        name: "langchain-deepagents-code",
+        displayName: "LangChain Deep Agents Code",
+        runtime: { kind: "terminal", interactive_command: "dcode" },
+      };
+
+      const result = await runFinalizationHandlers({
+        ...baseOptions(deps),
+        provider: "openrouter-api",
+        model: "moonshotai/kimi-k2.6",
+        preferredInferenceApi: "openai-completions",
+        agent,
+        deferRuntimeVerification,
+      });
+
+      expect(calls.probeTerminalInference).toHaveBeenCalledExactlyOnceWith({
+        sandboxName: "my-assistant",
+        agentName: "langchain-deepagents-code",
+        provider: "openrouter-api",
+        model: "moonshotai/kimi-k2.6",
+        preferredInferenceApi: "openai-completions",
+      });
+      expect(calls.log).toHaveBeenCalledWith(
+        "  ✓ LangChain Deep Agents Code terminal runtime is ready",
+      );
+      expect(calls.reportReadiness).toHaveBeenCalledExactlyOnceWith(true);
+      expect(result.deploymentHealthy).toBe(true);
+      expect(result.stateResult.type).toBe("complete");
+    },
+  );
+
+  it.each([false, true])(
+    "keeps Deep Code OpenRouter onboarding incomplete when inference is unavailable (deferred: %s)",
+    async (deferRuntimeVerification) => {
+      const { deps, calls } = createDeps({
+        probeTerminalInference: vi.fn(async () => ({
+          ok: false,
+          detail: "sandbox inference invocation probe returned HTTP 503",
+        })),
+      });
+      const agent = {
+        name: "langchain-deepagents-code",
+        displayName: "LangChain Deep Agents Code",
+        runtime: { kind: "terminal", interactive_command: "dcode" },
+      };
+
+      const result = await runFinalizationHandlers({
+        ...baseOptions(deps),
+        provider: "openrouter-api",
+        model: "moonshotai/kimi-k2.6",
+        agent,
+        deferRuntimeVerification,
+      });
+
+      expect(result).toMatchObject({
+        deploymentHealthy: false,
+        stateResult: {
+          type: "pause",
+          metadata: { state: "post_verify", reason: "deployment_not_ready" },
+        },
+      });
+      expect(result.verificationDiagnostics).toEqual([
+        expect.stringContaining("sandbox inference invocation probe returned HTTP 503"),
+      ]);
+      expect(calls.error).toHaveBeenCalledWith(
+        expect.stringContaining("Deep Code inference for 'my-assistant' is not ready"),
+      );
+      expect(calls.log).not.toHaveBeenCalledWith(expect.stringContaining("runtime is ready"));
+      expect(calls.reportReadiness).toHaveBeenCalledExactlyOnceWith(false);
+    },
+  );
+
   it("does not complete the session when deployment verification fails", async () => {
     const { deps, calls } = createDeps({
       verifyDeployment: vi.fn(async () => {
@@ -461,7 +702,7 @@ describe("finalization handlers", () => {
 
     expect(calls.dashboard).not.toHaveBeenCalled();
     // The sandbox reached finalization (policies confirmed), so it stays the default
-    // even when post-policy verification flakes — only a pre-policy cancel rolls back.
+    // even when post-identity verification flakes — only a pre-policy cancel rolls back.
     expect(calls.setDefaultSandbox).toHaveBeenCalledWith("my-assistant");
   });
 
@@ -517,7 +758,7 @@ describe("finalization handlers", () => {
 
   it("does not complete when web-search credentials are exposed in the sandbox (#7425)", async () => {
     const { deps, calls } = createDeps({
-      verifyWebSearchInsideSandbox: vi.fn(() => false),
+      verifyWebSearchInsideSandbox: vi.fn(async () => false),
     });
     const agent = { name: "openclaw" };
 
@@ -544,114 +785,205 @@ describe("finalization handlers", () => {
     expect(calls.reportReadiness).toHaveBeenCalledWith(false);
   });
 
-  // Scenario A (#4504): the auto-pair scope-approval sweep runs against the
-  // freshly-recovered gateway — strictly after process recovery (which can
-  // restart the gateway, #3573) and strictly before deployment verification
-  // (so the gateway state is settled before we probe it).
-  it("runs the auto-pair scope-approval sweep after process recovery and before verify (#4504)", async () => {
-    const { deps, calls } = createDeps();
+  it("waits for ordinary OpenClaw pairing after recovery and before verification (#10479)", async () => {
+    let releasePairing!: () => void;
+    const pairingPending = new Promise<void>((resolve) => {
+      releasePairing = resolve;
+    });
+    const events: string[] = [];
+    const settleOrdinaryPairing = vi.fn(async () => {
+      events.push("pairing-started");
+      await pairingPending;
+      events.push("pairing-settled");
+      return { kind: "settled" as const };
+    });
+    const verifyDeployment = vi.fn(async () => {
+      events.push("verify");
+      return { ok: true };
+    });
+    const { deps, calls } = createDeps({
+      settleOrdinaryOpenClawPairing: settleOrdinaryPairing,
+      verifyDeployment,
+    });
 
-    await runFinalizationHandlers(baseOptions(deps));
+    const finalization = runFinalizationHandlers(baseOptions(deps));
+    await vi.waitFor(() => expect(events).toContain("pairing-started"));
+    expect(verifyDeployment).not.toHaveBeenCalled();
+    releasePairing();
+    await finalization;
 
-    expect(calls.autoPairScopeApproval).toHaveBeenCalledOnce();
-    expect(calls.autoPairScopeApproval).toHaveBeenCalledWith("my-assistant");
-    // Ordering: recover → autoPairScopeApproval → verify.
-    expect(calls.autoPairScopeApproval.mock.invocationCallOrder[0]).toBeGreaterThan(
+    expect(settleOrdinaryPairing).toHaveBeenCalledExactlyOnceWith("my-assistant");
+    expect(settleOrdinaryPairing.mock.invocationCallOrder[0]).toBeGreaterThan(
       calls.recoverProcesses.mock.invocationCallOrder[0],
     );
-    expect(calls.autoPairScopeApproval.mock.invocationCallOrder[0]).toBeLessThan(
-      calls.verify.mock.invocationCallOrder[0],
+    expect(settleOrdinaryPairing.mock.invocationCallOrder[0]).toBeLessThan(
+      calls.recoverProcesses.mock.invocationCallOrder[1],
     );
+    expect(calls.recoverProcesses.mock.invocationCallOrder[1]).toBeLessThan(
+      verifyDeployment.mock.invocationCallOrder[0],
+    );
+    expect(events).toEqual(["pairing-started", "pairing-settled", "verify"]);
   });
 
-  // Scenario B (#4504): the sweep is agent-agnostic — the stuck CLI/webchat
-  // scope upgrade can occur regardless of which agent the sandbox runs.
-  it("runs the scope-approval sweep regardless of agent type (#4504)", async () => {
+  it("does not run OpenClaw pairing settlement for Hermes (#9844)", async () => {
     const { deps, calls } = createDeps();
     const agent = { name: "hermes" };
 
     await runFinalizationHandlers({ ...baseOptions(deps), agent });
 
-    expect(calls.autoPairScopeApproval).toHaveBeenCalledWith("my-assistant");
+    expect(calls.settleOrdinaryPairing).not.toHaveBeenCalled();
   });
 
-  // Scenario C (#4504): the dep is documented as best-effort / never-throws and
-  // the handler wraps no try/catch around it. Per the contract we assert the
-  // implemented behavior: the sweep is invoked and, because it returns cleanly,
-  // post verification proceeds to completion. A dependency that threw would
-  // abort finalization here — the regression this guards.
-  it("treats the scope-approval sweep as best-effort and still completes the session (#4504)", async () => {
-    const { deps, calls } = createDeps();
+  it("pauses onboarding when canonical OpenClaw pairing does not settle (#9844)", async () => {
+    const { deps, calls } = createDeps({
+      settleOrdinaryOpenClawPairing: vi.fn(async () => ({
+        kind: "incomplete" as const,
+        reason: "pairing-unavailable" as const,
+      })),
+    });
 
     const result = await runFinalizationHandlers(baseOptions(deps));
 
-    expect(calls.autoPairScopeApproval).toHaveBeenCalledOnce();
-    // The non-throwing sweep does not abort finalization: it proceeds through
-    // verification and the dashboard print to a completed result. (#4472 moved
-    // session completion to the imported completeOnboardMachine, so completion
-    // is asserted via the downstream dashboard + diagnostics rather than a dep.)
-    expect(calls.dashboard).toHaveBeenCalledOnce();
-    expect(result.verificationDiagnostics).toEqual(["  ✓ verified"]);
+    expect(result).toMatchObject({
+      deploymentHealthy: false,
+      stateResult: {
+        type: "pause",
+        metadata: { state: "post_verify", reason: "deployment_not_ready" },
+      },
+    });
+    expect(result.verificationDiagnostics).toEqual([
+      "OpenClaw onboarding is incomplete; resume onboarding.",
+    ]);
+    expect(calls.verify).not.toHaveBeenCalled();
+    expect(calls.dashboard).not.toHaveBeenCalled();
+    expect(calls.reportReadiness).toHaveBeenCalledWith(false);
+    expect(calls.error).toHaveBeenCalledWith(
+      "  OpenClaw onboarding is incomplete; resume onboarding.",
+    );
   });
 
-  // Scenario 1 (#4504-v2, HEADLINE): the warm-up provokes the operator.write
-  // scope upgrade so the approval pass below has something pending to approve.
-  // The order is load-bearing: process recovery (gateway live) → warmup
-  // (provoke / create pending) → autoPairScopeApproval (approve / clear
-  // pending). Reversing warmup and approval makes the approval pass a no-op and
-  // the user's first real run falls back — exactly the bug v2 fixes.
-  it("provokes the scope upgrade after recovery and before the approval pass in v2 (#4504)", async () => {
-    const { deps, calls } = createDeps();
+  it("passes the allowlisted pairing field to the onboarding diagnostic (#13709)", async () => {
+    const { deps, calls } = createDeps({
+      settleOrdinaryOpenClawPairing: vi.fn(async () => ({
+        kind: "incomplete" as const,
+        reason: "pairing-incompatible" as const,
+        pairingField: "paired.clientMode",
+      })),
+    });
 
     await runFinalizationHandlers(baseOptions(deps));
 
-    expect(calls.warmupScopeUpgrade).toHaveBeenCalledOnce();
-    expect(calls.warmupScopeUpgrade).toHaveBeenCalledWith("my-assistant");
-    // recover → warmup (provoke) → autoPairScopeApproval (approve).
-    expect(calls.warmupScopeUpgrade.mock.invocationCallOrder[0]).toBeGreaterThan(
-      calls.recoverProcesses.mock.invocationCallOrder[0],
-    );
-    expect(calls.warmupScopeUpgrade.mock.invocationCallOrder[0]).toBeLessThan(
-      calls.autoPairScopeApproval.mock.invocationCallOrder[0],
+    expect(calls.ordinaryPairingIncompleteMessage).toHaveBeenCalledWith(
+      "my-assistant",
+      "pairing-incompatible",
+      "paired.clientMode",
     );
   });
+});
 
-  // Scenario 2 (#4504-v2): the warm-up is best-effort / non-blocking. The
-  // handler wraps no try/catch around the dep and relies on the dep itself
-  // never throwing (the production leaf swallows every failure — covered in
-  // auto-pair-warmup.test.ts). Per the contract we assert the implemented
-  // behavior here: the warm-up is invoked and, because the (non-throwing) dep
-  // returns cleanly, finalization is NOT ordered to depend on its success — it
-  // proceeds straight to the approval pass, verification, and the dashboard.
-  // The dep returning nothing useful (no pending provoked, gateway slow) does
-  // not change the downstream flow: behavior degrades to v1, never blocks.
-  it("completes v2 finalization without depending on the warm-up succeeding (#4504)", async () => {
-    // The default warm-up mock returns undefined (e.g. gateway not up → the
-    // production leaf swallowed and provoked nothing). Finalization must be
-    // unaffected.
-    const { deps, calls } = createDeps();
+describe("secret-boundary refusal during finalization", () => {
+  afterEach(() => vi.restoreAllMocks());
 
-    const result = await runFinalizationHandlers(baseOptions(deps));
+  it.each([
+    { phase: "finalizing", run: handleFinalizationPhase },
+    { phase: "post_verify", run: handlePostVerifyState },
+  ])(
+    "pauses $phase before successful handoff on a recovery refusal (#11758)",
+    async ({ phase, run }) => {
+      vi.spyOn(finalizationHandlerRuntime, "loadLaunchReadiness").mockReturnValue({
+        resolveOrdinaryOpenClawPairingTarget: () => null,
+      } as never);
+      vi.spyOn(finalizationHandlerRuntime, "loadProcessRecovery").mockReturnValue({
+        checkAndRecoverSandboxProcesses: vi.fn(async () => ({
+          checked: true,
+          wasRunning: true,
+          recovered: false,
+          forwardRecovered: false,
+          secretBoundaryRefused: true,
+          secretBoundaryReason: "unexpected-marker" as const,
+        })),
+        waitForRecreatedSandboxOpenShellReady: vi.fn(async () => true),
+        waitForStartedNativeGatewayProcess: vi.fn(async () => true),
+      });
+      const { deps, calls } = createDeps({
+        checkAndRecoverSandboxProcesses: finalizationHandlerDeps.checkAndRecoverSandboxProcesses,
+        readRegistryAgent: () => "hermes",
+      });
+      const result = await run({
+        ...baseOptions(deps),
+        agent: { name: "hermes" },
+        portableProfileSelected: true,
+      });
+      expect(result.stateResult).toMatchObject({
+        type: "pause",
+        metadata: { state: phase, reason: "recovery_check_incomplete" },
+      });
+      expect(calls.reportReadiness).toHaveBeenCalledExactlyOnceWith(false);
+      expect(calls.error).toHaveBeenCalledWith(expect.stringContaining("secret-boundary"));
+      expect(calls.error).toHaveBeenCalledWith(
+        expect.stringContaining("nemoclaw my-assistant doctor"),
+      );
+      expect(calls.error).toHaveBeenCalledWith(
+        expect.stringContaining("nemoclaw onboard --resume"),
+      );
+      expect(calls.verify).not.toHaveBeenCalled();
+      expect(calls.dashboard).not.toHaveBeenCalled();
+      expect(calls.log).not.toHaveBeenCalledWith(expect.stringContaining("ready"));
+    },
+  );
 
-    expect(calls.warmupScopeUpgrade).toHaveBeenCalledOnce();
-    expect(calls.warmupScopeUpgrade.mock.results[0]).toEqual({ type: "return", value: undefined });
-    // The approval pass still runs after it (degrades to v1, not skipped).
-    expect(calls.autoPairScopeApproval).toHaveBeenCalledOnce();
-    expect(calls.dashboard).toHaveBeenCalledOnce();
-    expect(result.verificationDiagnostics).toEqual(["  ✓ verified"]);
-  });
+  it.each([
+    {
+      reason: "portable-hermes-registry-authority-unavailable" as const,
+      expected: "lifecycle receipt and registered gateway authority could not be matched",
+      action: "nemoclaw my-assistant doctor",
+      additional: "Preserve the registry and lifecycle receipt files unchanged",
+      forbidden: "identity-qualified recovery guidance",
+      resume: false,
+    },
+    {
+      reason: "portable-hermes-native-gateway-unavailable" as const,
+      expected: "receipt-owned native gateway is not qualified and healthy",
+      action: "nemoclaw my-assistant recover",
+      additional: "nemoclaw onboard --resume",
+      forbidden: "untrusted runtime diagnostic",
+      resume: true,
+    },
+    {
+      reason: "portable-hermes-lifecycle-lock-unavailable" as const,
+      expected: "lifecycle lock is unavailable",
+      action: "Wait for the active sandbox operation to finish",
+      additional: "nemoclaw onboard --resume",
+      forbidden: "untrusted runtime diagnostic",
+      resume: true,
+    },
+  ])("renders redacted actionable Portable Hermes $reason guidance (#11892)", async (row) => {
+    const { deps, calls } = createDeps({
+      checkAndRecoverSandboxProcesses: vi.fn(async () => ({
+        ready: false as const,
+        reason: row.reason,
+      })),
+    });
 
-  // Scenario 3 (#4504-v2): the warm-up is agent-agnostic — the first-run scope
-  // upgrade is provoked regardless of which agent the sandbox runs (the
-  // contract says run it unconditionally; idempotent once operator.write is
-  // paired).
-  it("provokes the v2 scope upgrade regardless of agent type (#4504)", async () => {
-    const { deps: depsHermes, calls: callsHermes } = createDeps();
-    await runFinalizationHandlers({ ...baseOptions(depsHermes), agent: { name: "hermes" } });
-    expect(callsHermes.warmupScopeUpgrade).toHaveBeenCalledWith("my-assistant");
+    const result = await handleFinalizationPhase({
+      ...baseOptions(deps),
+      agent: { name: "hermes" },
+      portableProfileSelected: true,
+    });
 
-    const { deps: depsOpenclaw, calls: callsOpenclaw } = createDeps();
-    await runFinalizationHandlers({ ...baseOptions(depsOpenclaw), agent: { name: "openclaw" } });
-    expect(callsOpenclaw.warmupScopeUpgrade).toHaveBeenCalledWith("my-assistant");
+    expect(result.stateResult).toMatchObject({
+      type: "pause",
+      metadata: { state: "finalizing", reason: "recovery_check_incomplete" },
+    });
+    expect(calls.error).toHaveBeenCalledWith(expect.stringContaining(row.expected));
+    expect(calls.error).toHaveBeenCalledWith(expect.stringContaining(row.action));
+    expect(calls.error).toHaveBeenCalledWith(expect.stringContaining(row.additional));
+    expect(calls.error).not.toHaveBeenCalledWith(expect.stringContaining(row.forbidden));
+    expect(calls.error.mock.calls.flat().join("\n").includes("nemoclaw onboard --resume")).toBe(
+      row.resume,
+    );
+    expect(calls.error).not.toHaveBeenCalledWith(
+      expect.stringContaining("untrusted runtime diagnostic"),
+    );
   });
 });

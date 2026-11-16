@@ -4,7 +4,10 @@
 import type { GatewayReadinessProjection } from "../../readiness/gateway";
 import type { GatewayReuseState } from "../../state/gateway";
 import type { Session } from "../../state/onboard-session";
-import { getGatewayPortCheckOptions } from "../docker-driver-gateway-env";
+import {
+  configuredRuntimeProviderOwnsHostReadiness,
+  getGatewayPortCheckOptions,
+} from "../docker-driver-gateway-env";
 import * as fatalRuntimePreflight from "../fatal-runtime-preflight";
 import type { GatewayOwner } from "../gateway-ownership";
 import {
@@ -17,6 +20,7 @@ export interface OnboardGatewayReadinessCollectorDeps {
   gatewayName(): string;
   gatewayPort(): number;
   resolveOwner(): GatewayOwner;
+  exitProcess?: fatalRuntimePreflight.FatalRuntimePreflightContext["exitProcess"];
   probeAttachment: Parameters<
     typeof fatalRuntimePreflight.collectOnboardGatewayReadiness
   >[0]["probeAttachment"];
@@ -28,18 +32,22 @@ export interface PreparePreflightGatewayAuthorityDeps {
   persistTrustedGatewayOwner(owner: GatewayOwner): void;
   gatewayPort: number;
   portConflict: Omit<GatewayPortConflictDeps, "gatewayPort" | "externallySupervised">;
-  getGatewayReuseSnapshot(): GatewayReuseSnapshot;
-  selectNamedGatewayForReuseIfNeeded(snapshot: GatewayReuseSnapshot): GatewayReuseSnapshot;
+  getGatewayReuseSnapshot(): Promise<GatewayReuseSnapshot>;
+  managedGatewayObservationAuthoritative(): boolean;
+  selectNamedGatewayForReuseIfNeeded(snapshot: GatewayReuseSnapshot): Promise<GatewayReuseSnapshot>;
   refreshDockerDriverGatewayReuseState(state: GatewayReuseState): Promise<GatewayReuseState>;
 }
 
 export interface PreflightGatewayAuthority {
   externallySupervised: boolean;
   gatewayReuseState: GatewayReuseState;
+  managedGatewayObservationAuthoritative: boolean;
 }
 
-export interface OnboardPreflightGatewayAuthorityDeps
-  extends Pick<OnboardGatewayReadinessCollectorDeps, "gatewayName" | "gatewayPort"> {
+export interface OnboardPreflightGatewayAuthorityDeps extends Pick<
+  OnboardGatewayReadinessCollectorDeps,
+  "gatewayName" | "gatewayPort"
+> {
   collectGatewayReadiness(
     deps: OnboardGatewayReadinessCollectorDeps,
   ): Promise<fatalRuntimePreflight.CollectedGatewayReadiness>;
@@ -59,19 +67,20 @@ export interface OnboardPreflightGatewayAuthorityDeps
   ): GatewayOwner;
   checkPortAvailable: GatewayPortConflictDeps["checkPortAvailable"];
   isDockerDriverGatewayPortListener: GatewayPortConflictDeps["isDockerDriverGatewayPortListener"];
-  getGatewayReuseSnapshot(): GatewayReuseSnapshot;
-  selectNamedGatewayForReuseIfNeeded(snapshot: GatewayReuseSnapshot): GatewayReuseSnapshot;
+  getGatewayReuseSnapshot(): Promise<GatewayReuseSnapshot>;
+  selectNamedGatewayForReuseIfNeeded(snapshot: GatewayReuseSnapshot): Promise<GatewayReuseSnapshot>;
   refreshDockerDriverGatewayReuseState(state: GatewayReuseState): Promise<GatewayReuseState>;
 }
 
 export function createOnboardPreflightGatewayAuthority(deps: OnboardPreflightGatewayAuthorityDeps) {
-  const collectGateway = () => {
+  const collectGateway = (exitProcess?: OnboardGatewayReadinessCollectorDeps["exitProcess"]) => {
     const ownerDeps = deps.getGatewayOwnerDeps();
     return deps.collectGatewayReadiness({
       gatewayName: deps.gatewayName,
       gatewayPort: deps.gatewayPort,
       resolveOwner: ownerDeps.resolveGatewayOwner,
       probeAttachment: ownerDeps.probeGatewayAttachment,
+      ...(exitProcess ? { exitProcess } : {}),
     });
   };
   const collectGatewayReadiness = async () => (await collectGateway()).projection;
@@ -85,7 +94,7 @@ export function createOnboardPreflightGatewayAuthority(deps: OnboardPreflightGat
     ) =>
       fatalRuntimePreflight.runReadinessGatedRuntimePreflight(options, {
         nonInteractive: deps.isNonInteractive(),
-        collectGatewayReadiness: collectGateway,
+        collectGatewayReadiness: () => collectGateway(exitProcess),
         ...(exitProcess ? { exitProcess } : {}),
       }),
     prepareGatewayAuthority: () =>
@@ -106,6 +115,7 @@ export function createOnboardPreflightGatewayAuthority(deps: OnboardPreflightGat
           exitProcess: (code) => process.exit(code),
         },
         getGatewayReuseSnapshot: deps.getGatewayReuseSnapshot,
+        managedGatewayObservationAuthoritative: configuredRuntimeProviderOwnsHostReadiness,
         selectNamedGatewayForReuseIfNeeded: deps.selectNamedGatewayForReuseIfNeeded,
         refreshDockerDriverGatewayReuseState: deps.refreshDockerDriverGatewayReuseState,
       }),
@@ -115,7 +125,7 @@ export function createOnboardPreflightGatewayAuthority(deps: OnboardPreflightGat
 export function collectOnboardGatewayReadiness(
   deps: OnboardGatewayReadinessCollectorDeps,
 ): Promise<fatalRuntimePreflight.CollectedGatewayReadiness> {
-  return fatalRuntimePreflight.collectOnboardGatewayReadiness(deps);
+  return fatalRuntimePreflight.collectOnboardGatewayReadiness(deps, deps.exitProcess);
 }
 
 function isManagedGateway(readiness: GatewayReadinessProjection): boolean {
@@ -135,17 +145,27 @@ export async function preparePreflightGatewayAuthority(
   const gatewayReadiness = await deps.collectGatewayReadiness();
   fatalRuntimePreflight.assertOnboardGatewayReadiness(gatewayReadiness);
   const externallySupervised = !isManagedGateway(gatewayReadiness);
-  await failFastOnForeignGatewayPortConflict({
-    gatewayPort: deps.gatewayPort,
-    externallySupervised,
-    ...deps.portConflict,
-  });
+  const managedGatewayObservationAuthoritative = deps.managedGatewayObservationAuthoritative();
+  if (!managedGatewayObservationAuthoritative) {
+    await failFastOnForeignGatewayPortConflict({
+      gatewayPort: deps.gatewayPort,
+      externallySupervised,
+      ...deps.portConflict,
+    });
+  }
 
-  const observedSnapshot = deps.getGatewayReuseSnapshot();
-  const gatewayReuseState = externallySupervised
-    ? observedSnapshot.gatewayReuseState
+  if (externallySupervised) {
+    return {
+      externallySupervised,
+      gatewayReuseState: "missing",
+      managedGatewayObservationAuthoritative,
+    };
+  }
+  const observedSnapshot = await deps.getGatewayReuseSnapshot();
+  const gatewayReuseState = managedGatewayObservationAuthoritative
+    ? (await deps.selectNamedGatewayForReuseIfNeeded(observedSnapshot)).gatewayReuseState
     : await deps.refreshDockerDriverGatewayReuseState(
-        deps.selectNamedGatewayForReuseIfNeeded(observedSnapshot).gatewayReuseState,
+        (await deps.selectNamedGatewayForReuseIfNeeded(observedSnapshot)).gatewayReuseState,
       );
-  return { externallySupervised, gatewayReuseState };
+  return { externallySupervised, gatewayReuseState, managedGatewayObservationAuthoritative };
 }

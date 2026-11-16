@@ -13,7 +13,6 @@ import {
   type PreUpgradeBackupSelectInput,
   resolveNotReadyOutcome,
   selectPreUpgradeBackupForCreate,
-  UnsafeCustomImagePluginBackupError,
 } from "./not-ready-recreate";
 import {
   fingerprintSandboxRegistryEntry,
@@ -102,6 +101,7 @@ describe("selectPreUpgradeBackupForCreate", () => {
       sourceConfirmedAbsent: true,
       targetGeneration: "3c9a1b7e-target",
       ...overrides,
+      reservationSessionId: overrides.reservationSessionId ?? "session-recreate",
     };
   }
 
@@ -283,57 +283,68 @@ describe("selectPreUpgradeBackupForCreate", () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/installer restore flag not set/));
   });
 
+  it("does not describe a route-only create reservation as an existing sandbox", () => {
+    expect(
+      select({
+        registryEntry: {
+          name: "my-assistant",
+          pendingRouteReservation: true,
+          reservationSessionId: "session-create",
+          provider: "nvidia-prod",
+          model: "model",
+        },
+      }),
+    ).toBeNull();
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(getLatestBackupSpy).not.toHaveBeenCalled();
+  });
+
+  it("retains the warning for an existing sandbox during a route reservation", () => {
+    expect(
+      select({
+        registryEntry: {
+          name: "my-assistant",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          pendingRouteReservation: true,
+        },
+      }),
+    ).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/installer restore flag not set/));
+  });
+
+  it("retains the warning for a verified create checkpoint on a pending route", () => {
+    expect(
+      select({
+        registryEntry: {
+          name: "my-assistant",
+          gatewayName: GATEWAY_NAME,
+          gatewayPort: GATEWAY_PORT,
+          pendingRouteReservation: true,
+          reservationSessionId: "session-create",
+          lifecycleGeneration: "generation-1",
+          lifecycleLiveIdentityFingerprint: "a".repeat(64),
+          pendingCreateIdentity: {
+            schemaVersion: 1,
+            state: "verified-create",
+            gatewayName: GATEWAY_NAME,
+            gatewayPort: GATEWAY_PORT,
+            sandboxName: "my-assistant",
+            lifecycleGeneration: "generation-1",
+            sandboxIdentityFingerprint: "a".repeat(64),
+            route: "none",
+          },
+        },
+      }),
+    ).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/installer restore flag not set/));
+    expect(getLatestBackupSpy).not.toHaveBeenCalled();
+  });
+
   it("does not ask for a source proof when installer restore intent is unset (#7736)", () => {
     const onProofRequested = vi.fn();
 
     expect(select({ onProofRequested, sourceProof: null })).toBeNull();
     expect(onProofRequested).not.toHaveBeenCalled();
-  });
-
-  const CUSTOM_IMAGE_ENTRY: SandboxEntry = {
-    name: "my-assistant",
-    agent: "openclaw",
-    fromDockerfile: "/tmp/Dockerfile.custom",
-  };
-
-  it("blocks a legacy custom OpenClaw backup before installer recreation (#6108)", () => {
-    process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
-    getLatestBackupSpy.mockReturnValue({
-      agentType: "openclaw",
-      dir: "/sandbox/.openclaw",
-      backupPath: BACKUP_PATH,
-      openclawImagePluginInstalls: [],
-    } as unknown as ReturnType<typeof sandboxState.getLatestBackup>);
-
-    expect(() => select({ existingSandboxEntry: CUSTOM_IMAGE_ENTRY })).toThrow(
-      UnsafeCustomImagePluginBackupError,
-    );
-
-    expect(note).not.toHaveBeenCalled();
-  });
-
-  it("accepts an authoritative custom OpenClaw backup for installer recreation (#6108)", () => {
-    process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
-    getLatestBackupSpy.mockReturnValue({
-      agentType: "openclaw",
-      dir: "/sandbox/.openclaw",
-      backupPath: BACKUP_PATH,
-      reconcileOpenClawImagePluginProvenance: true,
-      openclawImagePluginInstalls: [],
-    } as unknown as ReturnType<typeof sandboxState.getLatestBackup>);
-
-    expect(select({ existingSandboxEntry: CUSTOM_IMAGE_ENTRY })).toBe(BACKUP_PATH);
-  });
-
-  it("blocks custom OpenClaw installer recreation when no valid backup is readable (#6108)", () => {
-    process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
-    getLatestBackupSpy.mockReturnValue(null);
-
-    expect(() => select({ existingSandboxEntry: CUSTOM_IMAGE_ENTRY })).toThrow(
-      UnsafeCustomImagePluginBackupError,
-    );
-
-    expect(note).not.toHaveBeenCalled();
   });
 
   it("returns null and notes fresh-state recreate when installer restore intent finds no backup", () => {
@@ -445,49 +456,6 @@ describe("resolveNotReadyOutcome", () => {
       kind: "proceed",
       restoreBackupPath: BACKUP_PATH,
     });
-  });
-
-  it("blocks live not-ready custom OpenClaw recreation with a legacy backup (#6108)", () => {
-    process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
-    getLatestBackupSpy.mockReturnValue({
-      agentType: "openclaw",
-      dir: "/sandbox/.openclaw",
-      backupPath: BACKUP_PATH,
-      openclawImagePluginInstalls: [],
-    } as unknown as ReturnType<typeof sandboxState.getLatestBackup>);
-
-    const outcome = resolveNotReadyOutcome("my-assistant", note, {
-      name: "my-assistant",
-      agent: "openclaw",
-      fromDockerfile: "/tmp/Dockerfile.custom",
-    });
-
-    expect(outcome.kind).toBe("blocked");
-    expect(outcome).toMatchObject({
-      hints: expect.arrayContaining([expect.stringContaining("lacks verified plugin provenance")]),
-    });
-    expect(note).not.toHaveBeenCalled();
-  });
-
-  it("blocks an orphan sandbox when the requested target is custom OpenClaw (#6108)", () => {
-    process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
-    getLatestBackupSpy.mockReturnValue({
-      agentType: "openclaw",
-      dir: "/sandbox/.openclaw",
-      backupPath: BACKUP_PATH,
-      openclawImagePluginInstalls: [],
-    } as unknown as ReturnType<typeof sandboxState.getLatestBackup>);
-
-    const outcome = resolveNotReadyOutcome("orphan", note, null, true);
-
-    expect(outcome.kind).toBe("blocked");
-    expect(outcome).toMatchObject({
-      hints: expect.arrayContaining([
-        expect.stringContaining("new sandbox name"),
-        expect.stringContaining("NEMOCLAW_RECREATE_WITHOUT_BACKUP=1"),
-      ]),
-    });
-    expect(note).not.toHaveBeenCalled();
   });
 });
 

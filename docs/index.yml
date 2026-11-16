@@ -86,7 +86,7 @@ navigation:
                   - page: "Use Google Gemini"
                     path: _build/agent-variants/inference/use-google-gemini.openclaw.generated.mdx
                     slug: use-google-gemini
-                  - page: "Set Up Model Router"
+                  - page: "Retired Model Router"
                     path: _build/agent-variants/inference/set-up-model-router.openclaw.generated.mdx
                     slug: set-up-model-router
               - section: "Local Inference"
@@ -134,7 +134,7 @@ navigation:
                   - page: "Use Shared Gateway Routes"
                     path: _build/agent-variants/inference/use-shared-gateway-routes.openclaw.generated.mdx
                     slug: use-shared-gateway-routes
-                  - page: "View the Active Inference Route"
+                  - page: "View the Selected Inference Path"
                     path: _build/agent-variants/inference/view-active-inference-route.openclaw.generated.mdx
                     slug: view-active-inference-route
                   - page: "Switch Models"
@@ -236,7 +236,7 @@ navigation:
                     path: _build/agent-variants/manage-sandboxes/set-up-slack.openclaw.generated.mdx
                     slug: set-up-slack
                   - page: "Set Up Google Chat"
-                    path: manage-sandboxes/set-up-google-chat.mdx
+                    path: _build/agent-variants/manage-sandboxes/set-up-google-chat.openclaw.generated.mdx
                     slug: set-up-google-chat
                   - page: "Set Up WeChat"
                     path: _build/agent-variants/manage-sandboxes/set-up-wechat.openclaw.generated.mdx
@@ -277,7 +277,7 @@ navigation:
                   - page: "Understand Sandbox State"
                     path: _build/agent-variants/manage-sandboxes/workspace-files.openclaw.generated.mdx
                     slug: understand-sandbox-state
-                  - page: "Create and Restore Snapshots"
+                  - page: "Persist Sandbox State"
                     path: _build/agent-variants/manage-sandboxes/backup-restore.openclaw.generated.mdx
                     slug: create-and-restore-snapshots
                   - page: "Transfer State Manually"
@@ -327,6 +327,9 @@ navigation:
               - page: "Deploy to a Headless Server"
                 path: _build/agent-variants/deployment/deploy-to-headless-server.openclaw.generated.mdx
                 slug: deploy-to-headless-server
+              - page: "Register an External Component"
+                path: _build/agent-variants/deployment/register-external-component.openclaw.generated.mdx
+                slug: register-external-component
               - page: "Gateway Lifecycle Authority"
                 path: _build/agent-variants/deployment/gateway-lifecycle-authority.openclaw.generated.mdx
                 slug: gateway-lifecycle-authority
@@ -376,7 +379,7 @@ navigation:
             collapsed: open-by-default
             contents:
               - page: "Platform Support"
-                path: reference/platform-support.mdx
+                path: _build/agent-variants/reference/platform-support.openclaw.generated.mdx
                 slug: platform-support
               - page: "Enterprise Readiness"
                 path: _build/agent-variants/reference/enterprise-readiness.openclaw.generated.mdx
@@ -431,6 +434,54 @@ navigation:
               - page: "License"
                 path: _build/agent-variants/resources/license.openclaw.generated.mdx
                 slug: license
+      - title: NemoClaw for Pi
+        subtitle: Guide for Pi agents
+        slug: pi
+        layout:
+          - page: "Home"
+            path: index.mdx
+            slug: home
+          - changelog: ./changelog
+            title: Release Notes
+            slug: release-notes
+          - section: "Get Started"
+            slug: get-started
+            collapsed: open-by-default
+            contents:
+              - page: "Quickstart with Pi"
+                path: get-started/quickstart-pi.mdx
+                slug: quickstart
+          - section: "Inference"
+            slug: inference
+            collapsed: open-by-default
+            contents:
+              - page: "Configure Model Limits"
+                path: _build/agent-variants/inference/configure-model-limits.pi.generated.mdx
+                slug: configure-model-limits
+          - section: "Operate Pi"
+            slug: manage-sandboxes
+            collapsed: open-by-default
+            contents:
+              - page: "Run and Manage Pi"
+                path: manage-sandboxes/run-pi.mdx
+                slug: run-pi
+          - section: "Reference"
+            slug: reference
+            collapsed: open-by-default
+            contents:
+              - page: "CLI Commands Reference"
+                path: reference/pi-commands.mdx
+                slug: commands
+              - page: "Pi Support and Security"
+                path: reference/pi-support.mdx
+                slug: pi-support
+          - section: "Resources"
+            slug: resources
+            contents:
+              - link: "Report Vulnerabilities"
+                href: https://github.com/NVIDIA/NemoClaw/blob/main/SECURITY.md
+              - link: "Discord"
+                href: https://discord.gg/XFpfPv9Uvx
       - title: NemoClaw for Deep Agents
         subtitle: Guide for LangChain Deep Agents Code
         slug: deepagents
@@ -507,7 +558,7 @@ navigation:
                   - page: "Use Google Gemini"
                     path: _build/agent-variants/inference/use-google-gemini.deepagents.generated.mdx
                     slug: use-google-gemini
-                  - page: "Set Up Model Router"
+                  - page: "Retired Model Router"
                     path: _build/agent-variants/inference/set-up-model-router.deepagents.generated.mdx
                     slug: set-up-model-router
               - section: "Local Inference"
@@ -552,7 +603,7 @@ navigation:
                   - page: "Use Shared Gateway Routes"
                     path: _build/agent-variants/inference/use-shared-gateway-routes.deepagents.generated.mdx
                     slug: use-shared-gateway-routes
-                  - page: "View the Active Inference Route"
+                  - page: "View the Selected Inference Path"
                     path: _build/agent-variants/inference/view-active-inference-route.deepagents.generated.mdx
                     slug: view-active-inference-route
                   - page: "Switch Models"
@@ -629,7 +680,7 @@ navigation:
                   - page: "Understand Sandbox State"
                     path: _build/agent-variants/manage-sandboxes/workspace-files.deepagents.generated.mdx
                     slug: understand-sandbox-state
-                  - page: "Create and Restore Snapshots"
+                  - page: "Persist Sandbox State"
                     path: _build/agent-variants/manage-sandboxes/backup-restore.deepagents.generated.mdx
                     slug: create-and-restore-snapshots
                   - page: "Transfer State Manually"
@@ -667,6 +718,9 @@ navigation:
               - page: "Deploy to a Headless Server"
                 path: _build/agent-variants/deployment/deploy-to-headless-server.deepagents.generated.mdx
                 slug: deploy-to-headless-server
+              - page: "Register an External Component"
+                path: _build/agent-variants/deployment/register-external-component.deepagents.generated.mdx
+                slug: register-external-component
               - page: "Gateway Lifecycle Authority"
                 path: _build/agent-variants/deployment/gateway-lifecycle-authority.deepagents.generated.mdx
                 slug: gateway-lifecycle-authority
@@ -719,7 +773,7 @@ navigation:
             collapsed: open-by-default
             contents:
               - page: "Platform Support"
-                path: reference/platform-support.mdx
+                path: _build/agent-variants/reference/platform-support.deepagents.generated.mdx
                 slug: platform-support
               - page: "Enterprise Readiness"
                 path: _build/agent-variants/reference/enterprise-readiness.deepagents.generated.mdx
@@ -850,7 +904,7 @@ navigation:
                   - page: "Use Hermes Provider"
                     path: inference/use-hermes-provider.mdx
                     slug: use-hermes-provider
-                  - page: "Set Up Model Router"
+                  - page: "Retired Model Router"
                     path: _build/agent-variants/inference/set-up-model-router.hermes.generated.mdx
                     slug: set-up-model-router
               - section: "Local Inference"
@@ -898,7 +952,7 @@ navigation:
                   - page: "Use Shared Gateway Routes"
                     path: _build/agent-variants/inference/use-shared-gateway-routes.hermes.generated.mdx
                     slug: use-shared-gateway-routes
-                  - page: "View the Active Inference Route"
+                  - page: "View the Selected Inference Path"
                     path: _build/agent-variants/inference/view-active-inference-route.hermes.generated.mdx
                     slug: view-active-inference-route
                   - page: "Switch Models"
@@ -978,6 +1032,9 @@ navigation:
                   - page: "Set Up Slack"
                     path: _build/agent-variants/manage-sandboxes/set-up-slack.hermes.generated.mdx
                     slug: set-up-slack
+                  - page: "Set Up Google Chat"
+                    path: _build/agent-variants/manage-sandboxes/set-up-google-chat.hermes.generated.mdx
+                    slug: set-up-google-chat
                   - page: "Set Up WeChat"
                     path: _build/agent-variants/manage-sandboxes/set-up-wechat.hermes.generated.mdx
                     slug: set-up-wechat
@@ -1017,7 +1074,7 @@ navigation:
                   - page: "Understand Sandbox State"
                     path: _build/agent-variants/manage-sandboxes/workspace-files.hermes.generated.mdx
                     slug: understand-sandbox-state
-                  - page: "Create and Restore Snapshots"
+                  - page: "Persist Sandbox State"
                     path: _build/agent-variants/manage-sandboxes/backup-restore.hermes.generated.mdx
                     slug: create-and-restore-snapshots
                   - page: "Transfer State Manually"
@@ -1067,6 +1124,9 @@ navigation:
               - page: "Deploy to a Headless Server"
                 path: _build/agent-variants/deployment/deploy-to-headless-server.hermes.generated.mdx
                 slug: deploy-to-headless-server
+              - page: "Register an External Component"
+                path: _build/agent-variants/deployment/register-external-component.hermes.generated.mdx
+                slug: register-external-component
               - page: "Gateway Lifecycle Authority"
                 path: _build/agent-variants/deployment/gateway-lifecycle-authority.hermes.generated.mdx
                 slug: gateway-lifecycle-authority
@@ -1113,7 +1173,7 @@ navigation:
             collapsed: open-by-default
             contents:
               - page: "Platform Support"
-                path: reference/platform-support.mdx
+                path: _build/agent-variants/reference/platform-support.hermes.generated.mdx
                 slug: platform-support
               - page: "Enterprise Readiness"
                 path: _build/agent-variants/reference/enterprise-readiness.hermes.generated.mdx
@@ -1124,6 +1184,9 @@ navigation:
               - page: "Extension Taxonomy and SDK Readiness"
                 path: _build/agent-variants/reference/extension-taxonomy-sdk-readiness.hermes.generated.mdx
                 slug: extension-taxonomy-sdk-readiness
+              - page: "Headless Lifecycle Package"
+                path: reference/headless-lifecycle-package.mdx
+                slug: headless-lifecycle-package
               - page: "CLI Commands Reference"
                 path: _build/agent-variants/reference/commands.hermes.generated.mdx
                 slug: commands

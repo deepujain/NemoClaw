@@ -9,7 +9,7 @@ import { isDeepStrictEqual } from "node:util";
 
 import type { CheckpointPortableRuntimeAuthority } from "../../state/onboard-checkpoint-types";
 import { hasPortableUninstallAuthority } from "../../onboard/portable-retirement-authority";
-import { withMcpLifecycleLockSync } from "../../state/mcp-lifecycle-lock-acquisition";
+import { withMcpLifecycleLock } from "../../state/mcp-lifecycle-lock-acquisition";
 import {
   inspectPortableRetirementRecovery,
   PORTABLE_RETIREMENT_STATE_ENTRIES,
@@ -22,7 +22,7 @@ import {
 } from "../../state/portable-uninstall-retirement";
 
 export { PORTABLE_RETIREMENT_STATE_ENTRIES, withPortableHostFence };
-import { withProcessBoundRegistryLockAt } from "../../state/registry/lock";
+import { withProcessBoundRegistryLockAtAsync } from "../../state/registry/lock";
 import {
   readGatewayRegistryFile,
   registryEntryGatewayPort,
@@ -38,6 +38,14 @@ import {
   type PortablePodmanLifecycleTransport,
 } from "../../onboard/experimental/portable-demo-lifecycle";
 import { portablePodmanCommandEnvironment } from "../../onboard/experimental/portable-runtime-readiness";
+import {
+  inspectHermesPortableUninstallSandboxNames,
+  runHermesPortableUninstall,
+  type HermesPortableUninstallDeps,
+} from "./hermes-portable-uninstall";
+import { HERMES_PORTABLE_UNINSTALL_JOURNAL_FILE } from "./hermes-portable-uninstall-transaction";
+
+export { HERMES_PORTABLE_UNINSTALL_JOURNAL_FILE };
 
 const REGISTRY_CONTAINER_NAME = "nemoclaw-portable-registry";
 const REGISTRY_LABEL_NAME = "com.nvidia.nemoclaw.portable";
@@ -52,6 +60,10 @@ const PORTABLE_SELECTOR_NAMES = [
   "CONTAINER_SSHKEY",
 ] as const;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
 
 interface PortableRegistryRemoval {
   readonly present: boolean;
@@ -72,8 +84,15 @@ export interface PortableRuntimeCleanupDeps extends PortableDemoLifecycleDeps {
     args: readonly string[],
     env: NodeJS.ProcessEnv,
   ) => PortablePodmanLifecycleCommandResult;
-  readonly withLifecycleLock?: <T>(sandboxName: string, operation: () => T, stateDir: string) => T;
-  readonly withRegistryLock?: <T>(registryFile: string, operation: () => T) => T;
+  readonly withLifecycleLock?: <T>(
+    sandboxName: string,
+    operation: () => T | Promise<T>,
+    stateDir: string,
+  ) => Promise<T>;
+  readonly withRegistryLock?: <T>(
+    registryFile: string,
+    operation: () => T | Promise<T>,
+  ) => Promise<T>;
   readonly inspectRetirement?: (homeDir: string) => PortableRetirementRecovery | null;
   readonly prepareRetirement?: (
     homeDir: string,
@@ -81,6 +100,9 @@ export interface PortableRuntimeCleanupDeps extends PortableDemoLifecycleDeps {
   ) => PreparedPortableRetirement;
   readonly publishRetirement?: (prepared: PreparedPortableRetirement) => void;
   readonly resumeRetirement?: (homeDir: string) => void;
+  readonly hermesPortable?: HermesPortableUninstallDeps;
+  readonly inspectHermesPortableSandboxNames?: typeof inspectHermesPortableUninstallSandboxNames;
+  readonly runHermesPortableUninstall?: typeof runHermesPortableUninstall;
 }
 
 export interface PortableRuntimeCleanupResult {
@@ -114,23 +136,23 @@ function isMissingContainer(result: PortablePodmanLifecycleCommandResult): boole
   );
 }
 
-function withPortableFences<T>(
+async function withPortableFences<T>(
   input: PortableRuntimeCleanupInput,
   sandboxNames: readonly string[],
   deps: PortableRuntimeCleanupDeps,
-  operation: () => T,
-): T {
+  operation: () => T | Promise<T>,
+): Promise<T> {
   const lifecycleStateDir = path.join(input.stateDir, "state");
   const withLifecycleLock =
     deps.withLifecycleLock ??
-    (<Value>(sandboxName: string, inner: () => Value, stateDir: string) =>
-      withMcpLifecycleLockSync(sandboxName, inner, { stateDir }));
-  const withRegistryLock = deps.withRegistryLock ?? withProcessBoundRegistryLockAt;
-  const acquireNext = (index: number): T => {
+    (<Value>(sandboxName: string, inner: () => Value | Promise<Value>, stateDir: string) =>
+      withMcpLifecycleLock(sandboxName, inner, { stateDir }));
+  const withRegistryLock = deps.withRegistryLock ?? withProcessBoundRegistryLockAtAsync;
+  const acquireNext = (index: number): Promise<T> => {
     const sandboxName = sandboxNames[index];
     return sandboxName
       ? withLifecycleLock(sandboxName, () => acquireNext(index + 1), lifecycleStateDir)
-      : withRegistryLock(input.registryFile, operation);
+      : withRegistryLock(input.registryFile, async () => operation());
   };
   return acquireNext(0);
 }
@@ -200,7 +222,7 @@ function requireCompleteReceiptRegistryOwnership(
 
 function currentReceipts(stateDir: string): PortableDemoLifecycleReceiptRecord[] {
   return listPortableDemoSandboxLifecycleReceipts(stateDir).sort((left, right) =>
-    left.sandboxName.localeCompare(right.sandboxName),
+    compareCodeUnits(left.sandboxName, right.sandboxName),
   );
 }
 
@@ -208,6 +230,16 @@ function currentReceipts(stateDir: string): PortableDemoLifecycleReceiptRecord[]
 export function hasPortableRuntimeCleanup(stateDir: string): boolean {
   const homeDir = path.dirname(stateDir);
   const registryFile = path.join(stateDir, "sandboxes.json");
+  if (
+    inspectHermesPortableUninstallSandboxNames({
+      env: process.env,
+      homeDir,
+      registryFile,
+      stateDir,
+    })
+  ) {
+    return true;
+  }
   return hasPortableUninstallAuthority(
     {
       homeDir,
@@ -256,15 +288,38 @@ function recordedRegistrySandboxNames(registryBytes: Buffer): string[] {
 }
 
 /** Remove receipt-owned portable resources under lifecycle and registry locks through retirement. */
-export function runPortableRuntimeCleanupTransaction(
+export async function runPortableRuntimeCleanupTransaction(
   input: PortableRuntimeCleanupInput,
   continueAfterSandboxRemoval: (
     removed: number,
     sandboxNames: readonly string[],
     gatewayName: string,
-  ) => boolean,
+  ) => boolean | Promise<boolean>,
   deps: PortableRuntimeCleanupDeps = {},
-): PortableRuntimeCleanupResult | null {
+): Promise<PortableRuntimeCleanupResult | null> {
+  const hermesInput = {
+    env: input.env,
+    homeDir: input.homeDir,
+    registryFile: input.registryFile,
+    stateDir: input.stateDir,
+  };
+  const hermesSandboxNames = (
+    deps.inspectHermesPortableSandboxNames ?? inspectHermesPortableUninstallSandboxNames
+  )(hermesInput);
+  if (hermesSandboxNames) {
+    const names = [...hermesSandboxNames].sort(compareCodeUnits);
+    return withPortableFences(input, names, deps, async () => {
+      const result = await (deps.runHermesPortableUninstall ?? runHermesPortableUninstall)(
+        hermesInput,
+        deps.hermesPortable,
+      );
+      return {
+        registryRemoved: false,
+        sandboxContainersRemoved: result.sandboxContainersRemoved,
+        selectorsRemoved: [],
+      };
+    });
+  }
   const inspectRetirement = deps.inspectRetirement ?? inspectPortableRetirementRecovery;
   const recovery = inspectRetirement(input.homeDir);
   if (recovery) {
@@ -285,7 +340,7 @@ export function runPortableRuntimeCleanupTransaction(
     input,
     receipts.map((receipt) => receipt.sandboxName),
     deps,
-    () => {
+    async () => {
       const current = currentReceipts(input.stateDir);
       const currentRegistry = readGatewayRegistryFile(input.homeDir, input.registryFile);
       if (!isDeepStrictEqual(current, receipts) || !isDeepStrictEqual(currentRegistry, registry)) {
@@ -320,11 +375,11 @@ export function runPortableRuntimeCleanupTransaction(
       for (const target of prepared) target.removeAndVerify();
       const sandboxContainersRemoved = prepared.filter((target) => target.present).length;
       if (
-        !continueAfterSandboxRemoval(
+        !(await continueAfterSandboxRemoval(
           sandboxContainersRemoved,
           receipts.map((receipt) => receipt.sandboxName),
           gatewayName,
-        )
+        ))
       )
         return null;
       if (

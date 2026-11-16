@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -117,24 +116,36 @@ describe("onboard session", () => {
     expect(dirStat.mode & 0o777).toBe(0o700);
   });
 
-  it.each([
-    true,
-    false,
-  ])("persists explicit observability intent when enabled=$enabled", (observabilityEnabled) => {
-    session.saveSession(
-      session.createSession({
-        observabilityEnabled,
-        observabilityRequestedExplicitly: true,
-      }),
+  it("refuses malformed persisted APF compatibility selection without replacing it (#9833)", () => {
+    session.saveSession(session.createSession({ apfInterceptorRequested: true }));
+    const malformed = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8"));
+    malformed.apfInterceptorRequested = "true";
+    fs.writeFileSync(session.SESSION_FILE, JSON.stringify(malformed), { mode: 0o600 });
+    const refusal = /saved APF selection is invalid/u;
+    expect(() => session.loadSession()).toThrow(refusal);
+    expect(fs.readFileSync(session.SESSION_FILE, "utf8")).toContain(
+      '"apfInterceptorRequested":"true"',
     );
-    const loaded = requireLoadedSession(session.loadSession());
-    const summary = requireDebugSummary(session.summarizeForDebug());
-
-    expect(loaded.observabilityEnabled).toBe(observabilityEnabled);
-    expect(loaded.observabilityRequestedExplicitly).toBe(true);
-    expect(summary.observabilityEnabled).toBe(observabilityEnabled);
-    expect(summary.observabilityRequestedExplicitly).toBe(true);
   });
+
+  it.each([true, false])(
+    "persists explicit observability intent when enabled=$enabled",
+    (observabilityEnabled) => {
+      session.saveSession(
+        session.createSession({
+          observabilityEnabled,
+          observabilityRequestedExplicitly: true,
+        }),
+      );
+      const loaded = requireLoadedSession(session.loadSession());
+      const summary = requireDebugSummary(session.summarizeForDebug());
+
+      expect(loaded.observabilityEnabled).toBe(observabilityEnabled);
+      expect(loaded.observabilityRequestedExplicitly).toBe(true);
+      expect(summary.observabilityEnabled).toBe(observabilityEnabled);
+      expect(summary.observabilityRequestedExplicitly).toBe(true);
+    },
+  );
 
   it("defaults legacy observability intent and provenance off", () => {
     const legacy = session.createSession() as unknown as Record<string, unknown>;
@@ -252,6 +263,7 @@ describe("onboard session", () => {
         model: "qwen3.5:9b",
         endpointUrl: "http://127.0.0.1:11435/v1",
         credentialEnv: "NEMOCLAW_OLLAMA_PROXY_TOKEN",
+        preferredInferenceApi: "openai-completions",
         sandboxName: "rejected-review",
         sandboxPromptProgress: {
           sandboxName: true,
@@ -289,6 +301,7 @@ describe("onboard session", () => {
       model: null,
       endpointUrl: null,
       credentialEnv: null,
+      preferredInferenceApi: null,
       sandboxName: null,
       sandboxPromptProgress: { sandboxName: false },
       lastStepStarted: null,
@@ -416,7 +429,6 @@ describe("onboard session", () => {
       preferredInferenceApi: "openai-completions",
       compatibleEndpointReasoning: "true",
       nimContainer: "nim-123",
-      policyPresets: ["pypi", "npm"],
       apiKey: "nvapi-secret",
       metadata: {
         gatewayName: "nemoclaw",
@@ -434,7 +446,6 @@ describe("onboard session", () => {
     expect(loaded.preferredInferenceApi).toBe("openai-completions");
     expect(loaded.compatibleEndpointReasoning).toBe("true");
     expect(loaded.nimContainer).toBe("nim-123");
-    expect(loaded.policyPresets).toEqual(["pypi", "npm"]);
     expect(requireDebugSummary(session.summarizeForDebug()).compatibleEndpointReasoning).toBe(
       "true",
     );
@@ -504,31 +515,18 @@ describe("onboard session", () => {
   // Session secret boundary from #6225. Endpoint query coverage for #6224
   // lives in onboard-session-redaction.test.ts.
 
-  it("round-trips writer-shaped legacy migration hashes and drops non-string entries (#6225)", () => {
-    // Digest shape mirrors legacyValueHash() in src/lib/onboard.ts, the only
-    // production writer of this map. This test covers session filtering and
-    // persistence; the writer owns converting credential values to digests.
-    const legacyValue = "nvapi-sentinel6225-legacy-value-do-not-persist";
-    const digest = createHash("sha256").update(legacyValue).digest("hex");
-    session.saveSession(session.createSession());
-    expect(
-      JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8")).migratedLegacyValueHashes,
-    ).toBeNull();
+  it("drops legacy migration hashes when a session is resumed (#12859)", () => {
+    const stale = {
+      ...session.createSession(),
+      migratedLegacyValueHashes: { NVIDIA_API_KEY: "a".repeat(64) },
+    };
+    const resumed = requireLoadedSession(session.normalizeSession(stale));
+    expect(resumed).not.toHaveProperty("migratedLegacyValueHashes");
 
-    session.markStepComplete("provider_selection", {
-      migratedLegacyValueHashes: {
-        NVIDIA_API_KEY: digest,
-        BROKEN_NUMERIC: 123,
-        BROKEN_NULL: null,
-      } as unknown as Record<string, string>,
-    });
-
-    const raw = fs.readFileSync(session.SESSION_FILE, "utf8");
-    expect(raw).toContain(digest);
-    expect(raw).not.toContain("BROKEN_NUMERIC");
-    const loaded = requireLoadedSession(session.loadSession());
-    expect(loaded.migratedLegacyValueHashes).toEqual({ NVIDIA_API_KEY: digest });
-    expect(loaded.migratedLegacyValueHashes?.NVIDIA_API_KEY).toMatch(/^[0-9a-f]{64}$/);
+    session.saveSession(resumed);
+    expect(JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8"))).not.toHaveProperty(
+      "migratedLegacyValueHashes",
+    );
   });
 
   it("serializes missing and explicit-null credentialEnv identically (#6228)", () => {
@@ -738,7 +736,7 @@ describe("onboard session", () => {
     session.saveSession(created);
 
     const raw = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf-8"));
-    expect(raw.messagingPlan.networkPolicy).toEqual({ presets: [], entries: [] });
+    expect(raw.messagingPlan.networkPolicy).toBeUndefined();
     expect(raw.messagingPlan.agentRender).toBeUndefined();
     expect(raw.messagingPlan.buildSteps).toBeUndefined();
     expect(raw.messagingPlan.runtimeSetup).toBeUndefined();
@@ -976,6 +974,18 @@ describe("onboard session", () => {
     const loaded = requireLoadedSession(session.loadSession());
     expect(loaded.metadata.hostMounts).toEqual(hostMounts);
     expect(loaded.metadata.hostMounts).not.toBe(hostMounts);
+  });
+
+  it("keeps only the selected GPU mode and device in persisted GPU intent", () => {
+    session.saveSession(session.createSession());
+    const persisted = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8"));
+    persisted.sandboxGpuSelection = { mode: "auto", device: null, token: "do-not-retain" };
+    fs.writeFileSync(session.SESSION_FILE, JSON.stringify(persisted));
+
+    const loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.sandboxGpuSelection).toEqual({ mode: "auto", device: null });
+    session.saveSession(loaded);
+    expect(fs.readFileSync(session.SESSION_FILE, "utf8")).not.toContain("do-not-retain");
   });
 
   it("preserves a fail-closed marker for malformed host mount metadata", () => {
@@ -1222,31 +1232,25 @@ describe("onboard session", () => {
     }
   });
 
-  it("treats recent malformed lock as transient and does not remove it", () => {
-    fs.mkdirSync(path.dirname(session.LOCK_FILE), { recursive: true });
-    // Write a malformed lock with the current timestamp (< 30 s old).
-    fs.writeFileSync(session.LOCK_FILE, "{not-json", { mode: 0o600 });
+  it.each(["", "{not-json"])(
+    "preserves a fresh incomplete lock and reclaims abandoned debris: %j",
+    (contents) => {
+      fs.mkdirSync(path.dirname(session.LOCK_FILE), { recursive: true });
+      fs.writeFileSync(session.LOCK_FILE, contents, { mode: 0o600 });
+      expect(session.acquireOnboardLock("nemoclaw onboard --resume")).toMatchObject({
+        acquired: false,
+        stale: true,
+      });
+      expect(fs.readFileSync(session.LOCK_FILE, "utf8")).toBe(contents);
 
-    const acquired = session.acquireOnboardLock("nemoclaw onboard --resume");
-    expect(acquired.acquired).toBe(false);
-    expect(acquired.stale).toBe(true);
-    // Recent malformed lock is preserved because another process may be mid-write.
-    expect(fs.existsSync(session.LOCK_FILE)).toBe(true);
-  });
-
-  it("removes a stale malformed lock file older than 30 seconds (#2765)", () => {
-    fs.mkdirSync(path.dirname(session.LOCK_FILE), { recursive: true });
-    fs.writeFileSync(session.LOCK_FILE, "{not-json", { mode: 0o600 });
-    const past = new Date(Date.now() - 60_000);
-    fs.utimesSync(session.LOCK_FILE, past, past);
-
-    const acquired = session.acquireOnboardLock("nemoclaw onboard --resume");
-    expect(acquired.acquired).toBe(true);
-    expect(fs.existsSync(session.LOCK_FILE)).toBe(true);
-    const written = JSON.parse(fs.readFileSync(session.LOCK_FILE, "utf8"));
-    expect(written.pid).toBe(process.pid);
-    session.releaseOnboardLock();
-  });
+      const past = new Date(Date.now() - 60_000);
+      fs.utimesSync(session.LOCK_FILE, past, past);
+      expect(session.acquireOnboardLock("nemoclaw onboard --resume").acquired).toBe(true);
+      expect(JSON.parse(fs.readFileSync(session.LOCK_FILE, "utf8")).pid).toBe(process.pid);
+      session.releaseOnboardLock();
+      expect(fs.existsSync(session.LOCK_FILE)).toBe(false);
+    },
+  );
 
   it("does not remove a fresh lock that replaces stale malformed lock debris during cleanup", () => {
     fs.mkdirSync(path.dirname(session.LOCK_FILE), { recursive: true });
@@ -1287,12 +1291,20 @@ describe("onboard session", () => {
     }
   });
 
-  it("ignores malformed lock files when releasing the onboard lock", () => {
+  it("preserves a foreign lock that uses the local PID when no descriptor is held", () => {
     fs.mkdirSync(path.dirname(session.LOCK_FILE), { recursive: true });
-    fs.writeFileSync(session.LOCK_FILE, "{not-json", { mode: 0o600 });
+    const contents = JSON.stringify({
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      command: "foreign owner",
+      processGeneration: "foreign-generation",
+      hostIdentity: "foreign-host",
+      pidNamespaceIdentity: "foreign-namespace",
+    });
+    fs.writeFileSync(session.LOCK_FILE, contents, { mode: 0o600 });
 
     session.releaseOnboardLock();
-    expect(fs.existsSync(session.LOCK_FILE)).toBe(true);
+    expect(fs.readFileSync(session.LOCK_FILE, "utf8")).toBe(contents);
   });
 
   it("redacts sensitive values from persisted failure messages", () => {
@@ -1423,14 +1435,6 @@ describe("onboard session", () => {
     const created = session.createSession({ messagingPlan: plan });
     expect(created.messagingPlan).toEqual(plan);
     expect(created.provider).toBeNull();
-  });
-
-  it("filters non-string array entries in createSession overrides", () => {
-    const created = session.createSession({
-      policyPresets: ["pypi", 7, null, "npm"] as unknown as string[],
-    });
-
-    expect(created.policyPresets).toEqual(["pypi", "npm"]);
   });
 
   it("summarizes the session for debug output", () => {

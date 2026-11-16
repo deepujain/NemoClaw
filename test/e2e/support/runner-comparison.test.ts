@@ -1045,43 +1045,40 @@ describe("runner comparison summary", () => {
     );
   });
 
-  it.each([
-    "vmRssKb",
-    "rssAnonKb",
-    "rssFileKb",
-    "rssShmemKb",
-    "vmSwapKb",
-  ] as const)("rejects a negative %s in an enriched summary", (field) => {
-    const summary = expectCurrentSummary(
-      summarizeRunnerComparison([
-        currentSample(),
-        currentSample({
-          sequence: 1,
-          kind: "phase",
-          phase: "export",
-          at: "2026-07-22T10:01:00.000Z",
-          largestProcess: {
-            class: "docker-buildkit",
-            rssKb: 1100,
-            breakdown: processBreakdown(),
-          },
-        }),
-        currentSample({
-          sequence: 2,
-          kind: "finalize",
-          at: "2026-07-22T10:02:00.000Z",
-          cpu: { logicalCpuCount: 4, idleTicks: 80, totalTicks: 200 },
-        }),
-      ]),
-    );
-    const poisoned = structuredClone(summary);
-    expect(poisoned.largestProcess.breakdown).not.toBeNull();
-    poisoned.largestProcess.breakdown![field] = -1;
+  it.each(["vmRssKb", "rssAnonKb", "rssFileKb", "rssShmemKb", "vmSwapKb"] as const)(
+    "rejects a negative %s in an enriched summary",
+    (field) => {
+      const summary = expectCurrentSummary(
+        summarizeRunnerComparison([
+          currentSample(),
+          currentSample({
+            sequence: 1,
+            kind: "phase",
+            phase: "export",
+            at: "2026-07-22T10:01:00.000Z",
+            largestProcess: {
+              class: "docker-buildkit",
+              rssKb: 1100,
+              breakdown: processBreakdown(),
+            },
+          }),
+          currentSample({
+            sequence: 2,
+            kind: "finalize",
+            at: "2026-07-22T10:02:00.000Z",
+            cpu: { logicalCpuCount: 4, idleTicks: 80, totalTicks: 200 },
+          }),
+        ]),
+      );
+      const poisoned = structuredClone(summary);
+      expect(poisoned.largestProcess.breakdown).not.toBeNull();
+      poisoned.largestProcess.breakdown![field] = -1;
 
-    expect(() => parseRunnerComparisonSummary(`${JSON.stringify(poisoned, null, 2)}\n`)).toThrow(
-      "non-negative safe integer",
-    );
-  });
+      expect(() => parseRunnerComparisonSummary(`${JSON.stringify(poisoned, null, 2)}\n`)).toThrow(
+        "non-negative safe integer",
+      );
+    },
+  );
 
   it("preserves a null breakdown when procfs details were unavailable", () => {
     const summary = expectCurrentSummary(
@@ -1116,7 +1113,83 @@ describe("runner comparison summary", () => {
   });
 });
 
+function runLiveUpgradeComparison(
+  cwd: string,
+  target = "openshell-gateway-upgrade",
+  workflowOwned = false,
+): ReturnType<typeof spawnSync> {
+  return spawnSync(
+    process.execPath,
+    [
+      "--import",
+      TSX_IMPORT,
+      "--input-type=module",
+      "-e",
+      `import { initializeLiveUpgradeRunnerComparison, initializeRunnerComparison } from ${JSON.stringify(CLI)};
+       ${workflowOwned ? "initializeRunnerComparison();" : ""}
+       const finalize = initializeLiveUpgradeRunnerComparison();
+       finalize();`,
+    ],
+    {
+      cwd,
+      encoding: "utf8",
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        NEMOCLAW_RUN_LIVE_E2E: "1",
+        E2E_TARGET_ID: target,
+        E2E_ARTIFACT_DIR: "artifacts",
+      },
+    },
+  );
+}
+
 describe("runner comparison private artifacts", () => {
+  it("retains and finalizes the live upgrade ledger when the workflow did not create it", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "runner-comparison-upgrade-"));
+    try {
+      expectSuccess(runLiveUpgradeComparison(directory));
+      const samples = parseRunnerComparisonLedger(
+        fs.readFileSync(path.join(directory, "artifacts", RUNNER_COMPARISON_LEDGER_FILE), "utf8"),
+      );
+      expect(samples).toEqual([
+        expect.objectContaining({ kind: "initialize" }),
+        expect.objectContaining({ kind: "finalize" }),
+      ]);
+      expect(fs.existsSync(path.join(directory, "artifacts", RUNNER_COMPARISON_SUMMARY_FILE))).toBe(
+        true,
+      );
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a workflow-owned upgrade ledger without finalizing it", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "runner-comparison-upgrade-"));
+    try {
+      expectSuccess(runLiveUpgradeComparison(directory, "openshell-gateway-upgrade", true));
+      const samples = parseRunnerComparisonLedger(
+        fs.readFileSync(path.join(directory, "artifacts", RUNNER_COMPARISON_LEDGER_FILE), "utf8"),
+      );
+      expect(samples).toEqual([expect.objectContaining({ kind: "initialize" })]);
+      expect(fs.existsSync(path.join(directory, "artifacts", RUNNER_COMPARISON_SUMMARY_FILE))).toBe(
+        false,
+      );
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves other live targets without a fixture-owned comparison ledger", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "runner-comparison-upgrade-"));
+    try {
+      expectSuccess(runLiveUpgradeComparison(directory, "rebuild-hermes"));
+      expect(fs.existsSync(path.join(directory, "artifacts"))).toBe(false);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("creates a new private regular file and refuses every existing path (#7145)", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-private-create-"));
     try {

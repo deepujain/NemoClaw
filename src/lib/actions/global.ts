@@ -5,9 +5,12 @@ import {
   type GarbageCollectImagesOptions,
   type UpgradeSandboxesOptions,
 } from "../domain/lifecycle/options";
-import { recoverNamedGatewayRuntime as recoverNamedGatewayRuntimeAction } from "../gateway-runtime-action";
+import {
+  type NamedGatewayLifecycleState,
+  recoverNamedGatewayRuntime as recoverNamedGatewayRuntimeAction,
+} from "../gateway-runtime-action";
 import type { OnboardFlags } from "../onboard/command-support";
-import { runDeployAction as executeDeployAction } from "./deploy";
+import { completeAutomaticGatewayPortAfterOnboard } from "../onboard/gateway/automatic-port-completion";
 import {
   backupAll as executeBackupAllAction,
   garbageCollectImages as executeGarbageCollectImagesAction,
@@ -15,7 +18,12 @@ import {
 import { runOnboardAction as executeOnboardAction, type OnboardActionRuntimeDeps } from "./onboard";
 import { help, version } from "./root-help";
 
-type GatewayRecovery = { recovered: boolean };
+export type GatewayRecovery = {
+  recovered: boolean;
+  attempted?: boolean;
+  before?: NamedGatewayLifecycleState;
+  after?: NamedGatewayLifecycleState;
+};
 
 type GlobalCliActionRuntimeHooks = {
   recoverNamedGatewayRuntime?: () => Promise<GatewayRecovery>;
@@ -35,14 +43,20 @@ export async function runOnboardAction(
   runtimeDeps: OnboardActionRuntimeDeps = {},
 ): Promise<void> {
   await executeOnboardAction(flags, runtimeDeps);
+  completeAutomaticGatewayPortAfterOnboard();
 }
 
-export async function runDeployAction(instanceName?: string): Promise<void> {
-  await executeDeployAction(instanceName);
-}
-
-export async function runBackupAllAction(): Promise<void> {
+export async function runBackupAllAction(
+  options: { retireLegacyForwards?: boolean } = {},
+): Promise<void> {
   await executeBackupAllAction();
+  if (options.retireLegacyForwards) {
+    const { retireRegisteredLegacyDashboardForwards } = await import("./sandbox/forward-recovery");
+    const result = await retireRegisteredLegacyDashboardForwards();
+    console.log(
+      `Legacy dashboard forwards: ${result.retired} retired, ${result.unchanged} unchanged, ${result.skipped} skipped.`,
+    );
+  }
 }
 
 export async function runUpgradeSandboxesAction(
@@ -83,7 +97,7 @@ export function recordExtraProvider(name: string): boolean {
   if (typeof runtimeHooks.recordExtraProvider === "function") {
     return runtimeHooks.recordExtraProvider(name);
   }
-  const { addExtraProvider } = require("../state/registry") as {
+  const { addExtraProvider } = require("../state/registry/extra-providers") as {
     addExtraProvider: (name: string) => boolean;
   };
   return addExtraProvider(name);
@@ -93,7 +107,7 @@ export function forgetExtraProvider(name: string): boolean {
   if (typeof runtimeHooks.forgetExtraProvider === "function") {
     return runtimeHooks.forgetExtraProvider(name);
   }
-  const { removeExtraProvider } = require("../state/registry") as {
+  const { removeExtraProvider } = require("../state/registry/extra-providers") as {
     removeExtraProvider: (name: string) => boolean;
   };
   return removeExtraProvider(name);

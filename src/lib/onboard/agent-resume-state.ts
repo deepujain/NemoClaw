@@ -30,6 +30,7 @@ export function clearAgentScopedResumeState(session: Session, selectedAgentName:
   session.preferredInferenceApi = null;
   session.nimContainer = null;
   session.routerPid = null;
+  session.routerPort = null;
   session.routerCredentialHash = null;
   session.webSearchConfig = null;
   session.messagingPlan = null;
@@ -49,7 +50,6 @@ export function clearAgentScopedResumeState(session: Session, selectedAgentName:
       updatedAt: new Date().toISOString(),
     };
   }
-  session.policyPresets = null;
 
   const resetSteps = [
     "provider_selection",

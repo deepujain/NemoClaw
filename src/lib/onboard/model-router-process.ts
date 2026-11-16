@@ -5,7 +5,101 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import * as http from "node:http";
 import path from "node:path";
-import type { Session } from "../state/onboard-session";
+
+export type ModelRouterStopOutcome =
+  | "stopped"
+  | "not-running"
+  | "not-router"
+  | "unavailable"
+  | "failed";
+
+// Hold the same kernel process identity across graceful shutdown and escalation.
+// A reused numeric PID can never redirect either signal to a replacement.
+export const MODEL_ROUTER_PIDFD_STOP_SCRIPT = String.raw`
+import os
+import select
+import signal
+import sys
+
+if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+    print("unavailable")
+    raise SystemExit(0)
+
+pid, port = int(sys.argv[1]), sys.argv[2]
+try:
+    descriptor = os.pidfd_open(pid)
+except ProcessLookupError:
+    print("not-running")
+    raise SystemExit(0)
+except OSError:
+    print("unavailable")
+    raise SystemExit(0)
+
+try:
+    with open(f"/proc/{pid}/cmdline", "rb") as source:
+        command = source.read(65537)
+    if len(command) > 65536 or (command and not command.endswith(b"\0")):
+        print("failed")
+        raise SystemExit(0)
+    args = [value.decode() for value in command.split(b"\0") if value]
+    names = [os.path.basename(value) for value in args[:2]]
+    matches_port = any(
+        (value == "--port" and args[index + 1:index + 2] == [port])
+        or value == "--port=" + port
+        for index, value in enumerate(args)
+    )
+    if "model-router" not in names or "proxy" not in args or not matches_port:
+        print("not-router")
+        raise SystemExit(0)
+    exited = select.poll()
+    exited.register(descriptor, select.POLLIN)
+    signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+    if not exited.poll(3000):
+        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+    print("stopped" if exited.poll(1000) else "failed")
+except (ProcessLookupError, FileNotFoundError):
+    print("not-running")
+except Exception:
+    # After acquiring the descriptor, never authorize a numeric-PID fallback.
+    print("failed")
+finally:
+    os.close(descriptor)
+`;
+
+export function stopModelRouterWithPidfd(pid: number, port: number): ModelRouterStopOutcome {
+  if (
+    !Number.isSafeInteger(pid) ||
+    pid <= 0 ||
+    !Number.isInteger(port) ||
+    port < 1 ||
+    port > 65535
+  ) {
+    return "failed";
+  }
+  if (process.platform !== "linux") return "unavailable";
+  try {
+    const result = execFileSync(
+      "python3",
+      ["-I", "-c", MODEL_ROUTER_PIDFD_STOP_SCRIPT, String(pid), String(port)],
+      {
+        encoding: "utf8",
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5000,
+        maxBuffer: 1024,
+      },
+    ).trim();
+    if (["stopped", "not-running", "not-router", "unavailable"].includes(result)) {
+      return result as ModelRouterStopOutcome;
+    }
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return "unavailable";
+    }
+    // A timeout may follow delivery of SIGTERM. Do not signal again by PID.
+  }
+  return "failed";
+}
 
 export const ROUTER_HEALTH_TIMEOUT_MS = 3000;
 
@@ -15,9 +109,10 @@ export type ModelRouterProcessOwnershipDeps = {
 };
 
 export type StopModelRouterProcessDeps = ModelRouterProcessOwnershipDeps & {
-  isHealthy?: (port: number, timeoutMs?: number) => Promise<boolean>;
+  isResponsive?: (port: number, timeoutMs?: number) => Promise<boolean>;
   kill?: (pid: number, signal: NodeJS.Signals) => void;
   sleep?: (delayMs: number) => Promise<void>;
+  stopWithHandle?: (pid: number, port: number) => ModelRouterStopOutcome;
 };
 
 type ModelRouterCommandLineReaderDeps = {
@@ -35,81 +130,104 @@ export type ModelRouterProcessLookup =
 export type RouterHealthSnapshot = {
   healthy: boolean;
   body: string | null;
+  capturedBodyBytes: number;
+  elapsedMs: number;
+  outcome: "complete" | "timeout" | "transport_error" | "body_limit" | "aborted";
+  statusCode: number | null;
 };
 
 const ROUTER_HEALTH_BODY_MAX_BYTES = 64 * 1024;
 
 /**
- * Fetch /health and keep the response body for diagnosis (#8962). Unlike
- * `isRouterHealthy`, this waits for the body, so callers pass a longer
- * timeout; `startModelRouter` uses 30 seconds. LiteLLM's /health probes
- * every upstream endpoint per request and can answer well after the
- * 3-second liveness budget. The timeout is a wall-clock deadline, not a
- * socket idle timeout, so a responder that trickles bytes cannot hold the
- * caller past it; whatever body arrived by then is returned.
+ * Fetch semantic /health and keep a bounded body for diagnosis. LiteLLM
+ * probes every upstream endpoint for this request, so callers must allow the
+ * upstream checks to finish and must not overlap observations. The timeout is
+ * a wall-clock deadline, not a socket idle timeout.
  */
 export async function getRouterHealthSnapshot(
   port: number,
   timeoutMs = ROUTER_HEALTH_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<RouterHealthSnapshot> {
   return new Promise<RouterHealthSnapshot>((resolve) => {
+    const startedAt = performance.now();
     let settled = false;
     const chunks: Buffer[] = [];
     let size = 0;
-    let responseHealthy = false;
+    let bodyLimitExceeded = false;
+    let statusCode: number | null = null;
     const bufferedBody = () => (chunks.length > 0 ? Buffer.concat(chunks).toString("utf8") : null);
-    const settle = (snapshot: RouterHealthSnapshot) => {
+    const settle = (outcome: RouterHealthSnapshot["outcome"]) => {
       if (settled) return;
       settled = true;
       clearTimeout(deadline);
-      resolve(snapshot);
+      signal?.removeEventListener("abort", abortRequest);
+      resolve({
+        healthy:
+          outcome === "complete" && statusCode !== null && statusCode >= 200 && statusCode < 300,
+        body: bufferedBody(),
+        capturedBodyBytes: size,
+        elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        outcome,
+        statusCode,
+      });
     };
     const request = http
       .get(`http://127.0.0.1:${port}/health`, (res: http.IncomingMessage) => {
-        responseHealthy = (res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300;
+        statusCode = res.statusCode ?? null;
         res.on("data", (chunk: Buffer) => {
           const remaining = ROUTER_HEALTH_BODY_MAX_BYTES - size;
           const kept = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining);
-          chunks.push(kept);
-          size += kept.length;
-          if (size >= ROUTER_HEALTH_BODY_MAX_BYTES) {
-            res.destroy();
-            settle({ healthy: responseHealthy, body: bufferedBody() });
+          if (kept.length > 0) {
+            chunks.push(kept);
+            size += kept.length;
           }
+          if (chunk.length > remaining) bodyLimitExceeded = true;
         });
-        res.on("end", () => settle({ healthy: responseHealthy, body: bufferedBody() }));
-        res.on("error", () => settle({ healthy: responseHealthy, body: bufferedBody() }));
+        res.on("end", () => settle(bodyLimitExceeded ? "body_limit" : "complete"));
+        res.on("error", () => settle("transport_error"));
       })
-      .on("error", () => settle({ healthy: responseHealthy, body: bufferedBody() }));
+      .on("error", () => settle("transport_error"));
     const deadline = setTimeout(() => {
       request.destroy();
-      settle({ healthy: responseHealthy, body: bufferedBody() });
+      settle("timeout");
     }, timeoutMs);
     deadline.unref?.();
+    const abortRequest = () => {
+      request.destroy();
+      settle("aborted");
+    };
+    if (signal?.aborted) abortRequest();
+    else signal?.addEventListener("abort", abortRequest, { once: true });
   });
 }
 
-export async function isRouterHealthy(
+/** Check the cheap LiteLLM liveness route without running upstream model probes. */
+export async function isRouterResponsive(
   port: number,
   timeoutMs = ROUTER_HEALTH_TIMEOUT_MS,
 ): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     let settled = false;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
     const settle = (healthy: boolean) => {
       if (settled) return;
       settled = true;
+      if (deadline) clearTimeout(deadline);
       resolve(healthy);
     };
     const request = http
-      .get(`http://127.0.0.1:${port}/health`, (res: http.IncomingMessage) => {
+      .get(`http://127.0.0.1:${port}/health/liveliness`, (res: http.IncomingMessage) => {
         res.resume();
         settle((res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300);
+        request.destroy();
       })
       .on("error", () => settle(false));
-    request.setTimeout(timeoutMs, () => {
+    deadline = setTimeout(() => {
       request.destroy();
       settle(false);
-    });
+    }, timeoutMs);
+    deadline.unref?.();
   });
 }
 
@@ -187,11 +305,11 @@ export function doesModelRouterProcessOwnPort(
 }
 
 /**
- * Stop the recorded Model Router process and return only after its PID no
- * longer reports as running and its health endpoint is not healthy. The
- * session stores a numeric PID, not a PID-stable OS handle. Ownership
- * validation and SIGTERM delivery are separate OS operations, so PID reuse can
- * still redirect SIGTERM. Never send SIGKILL without a PID-stable handle.
+ * Stop the owned Model Router and require its liveness endpoint to stop responding.
+ * Linux verifies exit through a held kernel process handle. Without that handle,
+ * the fallback requires the numeric PID to stop reporting as running; ownership
+ * validation and SIGTERM delivery can still race PID reuse on that path. Never
+ * send SIGKILL without a PID-stable handle.
  */
 export async function stopModelRouterProcess(
   pid: number,
@@ -200,15 +318,15 @@ export async function stopModelRouterProcess(
 ): Promise<void> {
   const isRunning = deps.isRunning ?? isProcessRunning;
   const readCommandLine = deps.readCommandLine ?? readModelRouterProcessCommandLine;
-  const isHealthy = deps.isHealthy ?? isRouterHealthy;
+  const isResponsive = deps.isResponsive ?? isRouterResponsive;
   const kill = deps.kill ?? ((targetPid, signal) => process.kill(targetPid, signal));
   const sleep =
     deps.sleep ?? ((delayMs) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
 
   if (!isRunning(pid)) {
-    if (!(await isHealthy(port, 1000))) return;
+    if (!(await isResponsive(port, 1000))) return;
     throw new Error(
-      `NemoClaw refuses to replace the Model Router: recorded PID ${pid} no longer reports as running but port ${port} remains healthy.`,
+      `NemoClaw refuses to replace the Model Router: recorded PID ${pid} no longer reports as running but port ${port} remains responsive.`,
     );
   }
   if (
@@ -222,10 +340,21 @@ export async function stopModelRouterProcess(
     );
   }
 
+  const stopWithHandle =
+    deps.stopWithHandle ?? (deps.kill ? () => "unavailable" : stopModelRouterWithPidfd);
+  const handled = stopWithHandle(pid, port);
+  if (handled !== "unavailable") {
+    if (handled !== "stopped" && handled !== "not-running") {
+      throw new Error(`Model Router identity-bound shutdown failed for PID ${pid}: ${handled}.`);
+    }
+    if (!(await isResponsive(port, 1000))) return;
+    throw new Error(`Model Router stopped, but port ${port} remains responsive.`);
+  }
+
   try {
     kill(pid, "SIGTERM");
   } catch (error) {
-    if (!isRunning(pid) && !(await isHealthy(port, 1000))) return;
+    if (!isRunning(pid) && !(await isResponsive(port, 1000))) return;
     throw new Error(
       `NemoClaw could not send SIGTERM to Model Router PID ${pid}: ${
         error instanceof Error ? error.message : String(error)
@@ -234,12 +363,12 @@ export async function stopModelRouterProcess(
   }
   for (let _attempt = 0; _attempt < 10; _attempt++) {
     await sleep(500);
-    if (!isRunning(pid) && !(await isHealthy(port, 1000))) return;
+    if (!isRunning(pid) && !(await isResponsive(port, 1000))) return;
   }
 
   if (!isRunning(pid)) {
     throw new Error(
-      `Model Router PID ${pid} no longer reports as running after SIGTERM, but port ${port} remains healthy.`,
+      `Model Router PID ${pid} no longer reports as running after SIGTERM, but port ${port} remains responsive.`,
     );
   }
   if (
@@ -288,16 +417,4 @@ export function inspectModelRouterProcessForPort(
     if (args && isModelRouterCommandLineForPort(args, port)) return { status: "found", pid };
   }
   return { status: "absent" };
-}
-
-export async function stopTrackedModelRouterForAgentChange(
-  session: Pick<Session, "routerPid"> | null,
-  port: number,
-  deps: ModelRouterProcessOwnershipDeps & {
-    stopProcess?: (pid: number, port: number) => Promise<void>;
-  } = {},
-): Promise<void> {
-  const recordedPid = session?.routerPid ?? null;
-  if (!doesModelRouterProcessOwnPort(recordedPid, port, deps)) return;
-  await (deps.stopProcess ?? stopModelRouterProcess)(recordedPid as number, port);
 }

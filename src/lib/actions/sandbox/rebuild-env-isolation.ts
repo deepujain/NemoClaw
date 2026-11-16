@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { resolveRecordedDashboardUrlForPort } from "../../dashboard/url";
+
 // #5735: A rebuild recreates a sandbox from its persisted registry/session
 // config. Ambient onboarding-selection env vars left over from an *unrelated*
 // onboard (e.g. the installer's just-completed Deep Agents onboard right before
@@ -31,6 +33,8 @@
 //   - NEMOCLAW_SANDBOX_GPU / NEMOCLAW_SANDBOX_GPU_DEVICE
 //                           → src/lib/onboard/sandbox-gpu-mode.ts
 //   - NEMOCLAW_TOOL_DISCLOSURE → src/lib/tool-disclosure.ts
+//   - NEMOCLAW_HERMES_SWITCHYARD_ROUTING_B64 → src/lib/onboard/switchyard/setup.ts
+//   - NEMOCLAW_HERMES_SWITCHYARD_BINDINGS_B64 → src/lib/onboard/managed-startup/profile-builder.ts
 // This list MUST stay in sync with those reads; a contract test in
 // rebuild-env-isolation.test.ts pins the exact set so adding a new
 // onboard-selection env var forces a conscious update here.
@@ -59,6 +63,8 @@ export const AMBIENT_RECREATE_ENV_VARS = [
   "NEMOCLAW_SANDBOX_GPU",
   "NEMOCLAW_SANDBOX_GPU_DEVICE",
   "NEMOCLAW_TOOL_DISCLOSURE",
+  "NEMOCLAW_HERMES_SWITCHYARD_ROUTING_B64",
+  "NEMOCLAW_HERMES_SWITCHYARD_BINDINGS_B64",
 ] as const;
 
 /**
@@ -135,5 +141,72 @@ export function isolateAmbientRecreateEnv(env: NodeJS.ProcessEnv = process.env):
         env[name] = value;
       }
     }
+  };
+}
+
+/**
+ * Explain an exported `CHAT_UI_URL` that a rebuild ignores (#13177).
+ *
+ * Rebuild replays the dashboard origin recorded at onboarding so a leftover
+ * export cannot silently change what the dashboard accepts. When the export
+ * differs from the replayed URL, return the warning lines to print; otherwise
+ * return no lines.
+ */
+export function describeIgnoredDashboardOriginEnv(input: {
+  readonly sandboxName: string;
+  readonly cliName: string;
+  readonly replayedChatUiUrl: string;
+  readonly env?: NodeJS.ProcessEnv;
+}): string[] {
+  const requested = (input.env ?? process.env).CHAT_UI_URL?.trim() ?? "";
+  const withoutTrailingSlash = (value: string): string => value.replace(/\/+$/, "");
+  if (
+    requested === "" ||
+    withoutTrailingSlash(requested) === withoutTrailingSlash(input.replayedChatUiUrl)
+  ) {
+    return [];
+  }
+  return [
+    `Ignoring CHAT_UI_URL='${sanitizeEnvValueForDisplay(requested)}' — rebuilding '${input.sandboxName}' with its recorded dashboard URL '${input.replayedChatUiUrl}'.`,
+    `To change the dashboard origin, run: CHAT_UI_URL=<url> ${input.cliName} onboard --name ${input.sandboxName}, then ${input.cliName} ${input.sandboxName} rebuild.`,
+  ];
+}
+
+/**
+ * Choose the `CHAT_UI_URL` that an OpenClaw rebuild hands to its inner onboard
+ * (#13177), or null when the rebuild does not manage an OpenClaw dashboard.
+ *
+ * A managed replacement profile already resolved the origin, including the
+ * fallback for profiles recorded before the registry stored it; reuse it so the
+ * profile and the replacement's registry entry agree. Otherwise replay the
+ * registry's recorded origin on the replacement dashboard port.
+ */
+export function planRecordedDashboardOriginForRecreate(input: {
+  readonly sandboxName: string;
+  readonly cliName: string;
+  readonly recordedExternalUrl: string | null | undefined;
+  readonly rebuildAgent: string | null;
+  readonly controlUiPort: number | null;
+  readonly replacementDashboard?: { readonly agent: string; readonly url?: string };
+  readonly env?: NodeJS.ProcessEnv;
+}): { readonly chatUiUrl: string; readonly warnings: string[] } | null {
+  if ((input.rebuildAgent ?? "openclaw") !== "openclaw" || input.controlUiPort === null) {
+    return null;
+  }
+  const chatUiUrl =
+    input.replacementDashboard?.agent === "openclaw" && input.replacementDashboard.url
+      ? input.replacementDashboard.url
+      : resolveRecordedDashboardUrlForPort({
+          recordedExternalUrl: input.recordedExternalUrl ?? null,
+          port: input.controlUiPort,
+        });
+  return {
+    chatUiUrl,
+    warnings: describeIgnoredDashboardOriginEnv({
+      sandboxName: input.sandboxName,
+      cliName: input.cliName,
+      replayedChatUiUrl: chatUiUrl,
+      env: input.env,
+    }),
   };
 }

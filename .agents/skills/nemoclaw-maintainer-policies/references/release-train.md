@@ -24,9 +24,11 @@ Daily release labels coordinate release work. They do not classify issues and th
 
 ## Release-Prep Docs
 
-Use one cumulative documentation PR for all merged changes selected for the release. Continue the
-managed Pi PR when one exists. If no managed PR exists and only release documentation remains, use
-one direct documentation-only PR.
+Use one cumulative documentation PR for all merged changes selected for the release. The canonical
+[documentation automation contract](../../../../docs/AUTOMATION.md#post-merge-documentation-catch-up)
+owns its creation, refresh, coverage boundary, branch ownership, and recovery behavior. Continue
+that PR when one exists.
+If no managed PR exists and only release documentation remains, use one direct documentation-only PR.
 
 That PR must include all required user documentation and one canonical
 `docs/changelog/YYYY-MM-DD.mdx` entry headed `## vX.Y.Z`. In the normal evening flow, merge it before
@@ -34,15 +36,25 @@ generating the release plan so the entry is in the planned candidate. If direct 
 skill has already produced a plan whose candidate lacks the entry or another required documentation
 change, merge the documentation PR and generate a new plan for the resulting candidate.
 
-Require the exact candidate's `Docs / Post-Merge Catch-Up` run to finish with a successful
-`Publish documentation catch-up` job. That success records an independently reviewed, approved
-empty Pi patch for the candidate. If Pi finds a change, the workflow opens a managed PR and
-publication does not succeed.
+A push that changes only `docs/**`, `fern/docs.yml`, or `fern/assets/**` does not start
+`Docs / Author Post-Merge Catch-Up`. Merging the cumulative docs PR therefore does not start a final model
+run or create an empty-patch receipt.
 
-For the candidate only, require no open managed PR and no remote branch named
-`automation/post-merge-docs-<first-12-candidate-characters>`. A managed PR or branch for a later
-commit does not invalidate an earlier candidate. The release entry and approved-empty Pi result
-cannot be waived.
+Before tag confirmation, show the maintainer:
+
+- the latest included cumulative docs PR, its final PR commit, and its merge commit;
+- the final automated refresh coverage commit;
+- every commit and merged PR after that coverage point through the candidate;
+- whether the docs PR changed only allowed documentation paths;
+- the docs PR review decision and complete check state;
+- every open managed docs PR; and
+- the canonical release entry and path.
+
+The maintainer must choose to proceed, create or update a docs PR for the uncovered range, or stop.
+Record a proceed decision in the signed release brief. A current-main plan requires the release
+entry. An accepted urgent QA qualification may use an historical ancestor and must bind its
+explicit release-entry exception into the signed release brief. Do not create a separate exception
+record.
 
 ## Cutoff
 
@@ -50,65 +62,45 @@ The daily cutoff is the maintainer-defined point where the release tag is prepar
 
 At cutoff:
 
+Start [independent readiness checks](../../nemoclaw-maintainer-cut-release-tag/references/candidate-evidence.md#start-independent-checks-at-kickoff)
+at kickoff. Overlap authorized documentation preparation with image waits. This changes preparation
+order, not the candidate evidence or maintainer decisions required below.
+
 1. List merged PRs carrying the target version label.
 2. Confirm each is intended for the release.
 3. List open PRs and issues still carrying the target label as post-tag stragglers.
 4. Complete [Release-Prep Docs](#release-prep-docs) for the intended release range.
-5. Generate the immutable release plan with the exact `--version vX.Y.Z` to capture the candidate
-   commit.
-6. Verify the candidate's required documentation, image, and exact staging Launchable evidence. If
-   documentation is missing, complete [Release-Prep Docs](#release-prep-docs), merge that PR,
-   generate a new plan, and repeat the evidence checks for the new candidate.
+5. Generate the immutable release plan with the `--version vX.Y.Z` to capture `origin/main`.
+   For accepted urgent QA qualification, select an historical ancestor with `--candidate` and
+   bind a nonblank `--exception` reason.
+6. Show the candidate's documentation coverage and required image evidence. If the maintainer
+   requests documentation work, complete [Release-Prep Docs](#release-prep-docs), merge that PR,
+   generate a new plan, and show the evidence for the new candidate.
 7. Show the newest full E2E context and record the maintainer's focused, full, or proceed decision.
-8. Build the Markdown release brief from the exact range and evidence.
+8. Build the Markdown release brief from the range and evidence.
 9. Cut the release tag only with the plan's explicit maintainer confirmation.
 
 Merges may continue after planning. Keep the planned candidate when it remains an ancestor of
 `origin/main`, the previous release has not changed, and its own required evidence remains valid.
 Regenerate the plan only when the intended range, version, or candidate changes.
 
-## Required Image and Launchable Evidence
+## Required Image Evidence
 
-Before confirmation, require both exact-candidate results:
+Before confirmation, require a successful candidate E2E `base-image-publication` job. Its
+checked-in verifier selects the newest applicable image-changing commit in first-parent history,
+requires every managed publisher, and validates the immutable Deep Agents Code base contract.
+Record the E2E workflow and aggregate-job URLs and the run attempt; do not repeat its publisher
+queries in the tag skill.
 
-1. A successful exact-candidate E2E `base-image-publication` job. Its checked-in verifier selects
-   the newest applicable image-changing commit in first-parent history, requires every managed
-   publisher, and validates the immutable Deep Agents Code base contract. Record the E2E workflow
-   and aggregate-job URLs and the run attempt; do not repeat its publisher queries in the tag skill.
-2. A successful `Exact staging Brev Launchable` job for the exact candidate SHA. The trusted job
-   builds the candidate image, deploys the configured standing Launchable, verifies environment
-   access and the exact booted image, verifies the baked runtime, runs hosted and sandbox inference
-   through the preinstalled full E2E suite, deletes its Brev workspace, and confirms absence.
-
-Record:
-
-- the Launchable workflow and job URLs;
-- the attempt and producer run;
-- the concrete boot image;
-- the image-repository SHA;
-- the baked-runtime identity;
-- the full E2E result; and
-- the workspace-cleanup result.
-
-A successful job retains `launchable-e2e.json`, `full-e2e.log`, and `cleanup.json`. The cleanup record
-exists only after the job confirms workspace absence. A preparation failure can produce no artifact;
-a later failure can retain only `lane.log` and the phase artifacts created before exit.
-
-Neither result can be waived by the general E2E decision. A successful `Release qualification`
-aggregate does not replace either exact-candidate result. The Launchable job may come from a
-Launchable-only or full manual run against trusted `main`.
-
-Before dispatch, apply the Launchable credential and resource boundary in
-[`test/e2e/README.md`](../../../../test/e2e/README.md#push-and-manual-pr-e2e). The trusted workflow
-requires repository `maintain` or `admin` permission before the Launchable source checkout.
+The general E2E decision cannot waive required image evidence. A successful `Release
+qualification` aggregate does not replace the candidate result.
 
 ## General E2E Decision
 
-The general E2E decision records whether the maintainer chooses focused tests, the full suite, or the
-displayed general E2E status. General E2E informs the maintainer; it does not decide whether a tag
-can exist. Show the newest full run's full SHA, status, conclusion, attempt, created, started, and
-last-updated timestamps, age at inspection, workflow URL, `Release qualification` URL, and any
-failed, cancelled, skipped, queued, or active results.
+General E2E informs the maintainer; it does not decide whether a tag can exist. Follow
+[Report the Release Context](../../nemoclaw-maintainer-e2e/SKILL.md#report-the-release-context)
+to inspect and report the newest full run and any maintainer-requested runs.
+Record that evidence in the release decision.
 
 Offer three choices:
 
@@ -125,39 +117,48 @@ and no requested run remains unresolved. Otherwise, record one plain-language re
 different, missing, non-successful, or unresolved status and explains why the maintainer is
 proceeding.
 
-This decision applies only to general E2E. It cannot cover missing documentation, required image
-evidence, or `Exact staging Brev Launchable`. Do not maintain a separate exception schema or ledger.
+This decision applies only to E2E. It cannot replace the release entry, documentation coverage
+decision, or required image evidence. Do not maintain a separate exception schema or ledger.
 
 ## Signed Release Brief
 
-Create `../nemoclaw-release-vX.Y.Z/release-brief.md` from the exact plan range. Include:
+Create `../nemoclaw-release-vX.Y.Z/release-brief.md` from the plan range. Include:
 
-- exact range, commit and risky-file counts, risky areas, and suggested QA focus from the handoff
+- range, commit and risky-file counts, risky areas, and suggested QA focus from the handoff
   helper;
 - the complete canonical release entry and its path;
-- Pi documentation workflow and job URLs, artifact name, and normalized approved-empty review;
-- the base-image aggregate and exact staging Launchable URLs, identities, full E2E result, and
-  cleanup result;
+- the latest included cumulative docs PR, coverage commit, later commits and PRs, changed-path
+  result, review and check state, open managed docs PRs, and maintainer decision;
+- the base-image aggregate URL and identity;
 - the newest full E2E result and every requested run;
 - the maintainer's E2E decision; and
 - `Exceptions: None` or the plain-language exception reason.
 
-Pass that exact Markdown to `release:cut` with `--message-file`. It becomes the signed annotated tag
+Pass that Markdown to `release:cut` with `--message-file`. It becomes the signed annotated tag
 message and is the release evidence record. Do not create a separate exception file.
 
 Require the full confirmation phrase from the plan. After the script reads the remote tag back and
-confirms that it peels to the candidate, report the tag as cut and return.
+confirms that it peels to the candidate, report the tag as cut. Then continue the same task.
 
 ## Post-Tag States
 
-Moving `latest`, carrying labels forward, publishing public documentation, rebuilding and publishing release
-images, promoting `lkg`, and publishing the Announcement do not extend tag cutting. Some share a
-workflow or depend on another post-tag state. Report only already-known results and mark the rest
-pending or unknown; do not poll before returning the tag result.
+The tag event starts `Release / Latest Tag`, `Docs / Publish Public`, and `Images / Publish Base and Managed Images`.
+Monitor the exact tag and candidate runs concurrently. Draft the Announcement while they run.
+
+Report the tag as cut before this follow-through. Post-tag results never change tag success. Verify
+the owned effects instead of relying only on workflow conclusions:
+
+- `latest` and release-label carry-forward;
+- the public documentation `publish` job; and
+- the production managed-image promotion job, with Pi candidate results reported separately.
+
+Read `lkg` after production image classification. Never move `lkg` automatically. When production
+promotion succeeds, ask for separate maintainer authorization. After an authorized move, monitor
+`Release / LKG Brev Image` and its returned downstream production-image run.
 
 Tag-triggered image publication performs a release rebuild and can fail after the tag exists. Repair
-and rerun that workflow independently. Do not describe it as promotion-only and do not move the
-semver tag.
+and rerun that workflow independently. Ask before a rerun. Do not describe it as promotion-only and
+do not move the semver tag.
 
 ## Carry Forward
 

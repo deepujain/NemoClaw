@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { validateSwitchyardBindingState } from "../hermes-switchyard-routing";
+
 import {
   listMessagingCredentialMetadata,
   type MessagingCredentialMetadata,
 } from "../messaging/channels";
-import type { MessagingTokenDef } from "./messaging-prep";
+import { hasConfiguredMessagingCredential, type MessagingTokenDef } from "./messaging-prep";
 import { resolveQrSelectedChannels } from "./messaging-state";
 import type {
   ResolveSandboxCreateIntentInput,
@@ -22,29 +24,31 @@ function filterEnabledChannelNames(
 
 function filterMessagingProviderRequestsByEnabledChannel(
   requests: readonly SandboxCreateMessagingProviderRequest[],
+  selectedChannelNames: ReadonlySet<string> | null,
   disabledChannelNames: ReadonlySet<string>,
 ): SandboxCreateMessagingProviderRequest[] {
-  return requests.filter(({ channel }) => !channel || !disabledChannelNames.has(channel));
+  return requests.filter(
+    ({ channel }) =>
+      !channel ||
+      ((!selectedChannelNames || selectedChannelNames.has(channel)) &&
+        !disabledChannelNames.has(channel)),
+  );
 }
 
-function resolveTokenProviderChannelMap(
+export function filterMessagingProvidersForSandboxCreate(
+  providerNames: readonly string[],
   requests: readonly SandboxCreateMessagingProviderRequest[],
-): Map<string, string> {
+  activeChannelNames: Iterable<string>,
+  disabledChannelNames: Iterable<string>,
+): string[] {
   const providerChannels = new Map<string, string>();
   for (const { channel, name } of requests) {
     if (channel) providerChannels.set(name, channel);
   }
-  return providerChannels;
-}
-
-function filterMessagingProvidersByEnabledChannel(
-  providerNames: string[],
-  providerChannels: ReadonlyMap<string, string>,
-  disabledChannelNames: ReadonlySet<string>,
-): string[] {
-  return providerNames.filter((providerName) => {
+  const eligibleChannels = new Set([...activeChannelNames, ...disabledChannelNames]);
+  return [...new Set(providerNames)].filter((providerName) => {
     const channel = providerChannels.get(providerName);
-    return !channel || !disabledChannelNames.has(channel);
+    return !channel || eligibleChannels.has(channel);
   });
 }
 
@@ -64,6 +68,7 @@ function resolveActiveMessagingChannels({
   | "primaryMessagingCredentialEnvKeys"
   | "reusableMessagingChannels"
 >): string[] {
+  const selectedChannelNames = enabledChannels == null ? null : new Set(enabledChannels);
   const primaryCredentialEnvKeys = new Set(primaryMessagingCredentialEnvKeys);
   const qrSelectedChannels = resolveQrSelectedChannels(
     [...channels],
@@ -76,9 +81,15 @@ function resolveActiveMessagingChannels({
         ...messagingProviderRequests
           .filter(({ credentialConfigured }) => credentialConfigured)
           .flatMap(({ channel, envKey }) => {
-            return channel && primaryCredentialEnvKeys.has(envKey) ? [channel] : [];
+            return channel &&
+              (!selectedChannelNames || selectedChannelNames.has(channel)) &&
+              primaryCredentialEnvKeys.has(envKey)
+              ? [channel]
+              : [];
           }),
-        ...reusableMessagingChannels,
+        ...reusableMessagingChannels.filter(
+          (channel) => !selectedChannelNames || selectedChannelNames.has(channel),
+        ),
         ...qrSelectedChannels,
       ]),
     ],
@@ -118,12 +129,12 @@ export function resolveSandboxCreateMessagingProviderRequests(
   messagingTokenDefs: readonly MessagingTokenDef[],
   getMessagingChannelForEnvKey: (envKey: string) => string | null,
 ): SandboxCreateMessagingProviderRequest[] {
-  return messagingTokenDefs.map(({ name, envKey, providerType, token }) => ({
-    name,
-    envKey,
-    ...(providerType ? { providerType } : {}),
-    credentialConfigured: Boolean(token),
-    channel: getMessagingChannelForEnvKey(envKey),
+  return messagingTokenDefs.map((tokenDef) => ({
+    name: tokenDef.name,
+    envKey: tokenDef.envKey,
+    ...(tokenDef.providerType ? { providerType: tokenDef.providerType } : {}),
+    credentialConfigured: hasConfiguredMessagingCredential(tokenDef),
+    channel: getMessagingChannelForEnvKey(tokenDef.envKey),
   }));
 }
 
@@ -131,6 +142,10 @@ export function resolveSandboxCreateIntent({
   basePolicyPath,
   sandboxName,
   inferenceProvider,
+  nativeLocalProviderAttachment,
+  nativeNvidiaProviderAttachment,
+  nativeHostedProviderAttachment,
+  hermesSwitchyard: requestedSwitchyard,
   hostLocalInferenceRouteOnly = false,
   channels,
   enabledChannels,
@@ -150,14 +165,14 @@ export function resolveSandboxCreateIntent({
   sandboxGpuLogMessage,
   extraPlaceholderKeys = [],
   agentName,
-  policyTier,
-  baselineExclusions = [],
+  policyTier = null,
 }: ResolveSandboxCreateIntentInput): SandboxCreateIntent {
+  const selectedChannelNames = enabledChannels == null ? null : new Set(enabledChannels);
   const enabledMessagingProviderRequests = filterMessagingProviderRequestsByEnabledChannel(
     messagingProviderRequests,
+    selectedChannelNames,
     disabledChannelNames,
   );
-  const providerChannels = resolveTokenProviderChannelMap(messagingProviderRequests);
   const activeMessagingChannels = resolveActiveMessagingChannels({
     channels,
     disabledChannelNames,
@@ -166,21 +181,34 @@ export function resolveSandboxCreateIntent({
     primaryMessagingCredentialEnvKeys,
     reusableMessagingChannels,
   });
-  const enabledReusableMessagingProviders = filterMessagingProvidersByEnabledChannel(
-    [...new Set(reusableMessagingProviders)],
-    providerChannels,
+  const enabledReusableMessagingProviders = filterMessagingProvidersForSandboxCreate(
+    reusableMessagingProviders,
+    messagingProviderRequests,
+    activeMessagingChannels,
     disabledChannelNames,
   );
 
   const normalizedInferenceProvider = inferenceProvider?.trim() || null;
+  const hermesSwitchyard = requestedSwitchyard
+    ? validateSwitchyardBindingState(requestedSwitchyard)
+    : undefined;
 
   return {
     sandboxName,
-    inferenceProvider: normalizedInferenceProvider,
+    inferenceProvider: hermesSwitchyard ? null : normalizedInferenceProvider,
+    ...(hermesSwitchyard ? { hermesSwitchyard } : {}),
+    ...(nativeLocalProviderAttachment ? { nativeLocalProviderAttachment } : {}),
+    ...(nativeNvidiaProviderAttachment ? { nativeNvidiaProviderAttachment } : {}),
+    ...(nativeHostedProviderAttachment ? { nativeHostedProviderAttachment } : {}),
     activeMessagingChannels,
     messagingProviderRequests: messagingProviderRequests.map((request) => ({ ...request })),
     reusableMessagingProviders: enabledReusableMessagingProviders,
-    extraProviders: [...new Set(extraProviders ?? [])].filter(Boolean),
+    extraProviders: [
+      ...new Set([
+        ...(extraProviders ?? []),
+        ...(hermesSwitchyard?.bindings.providers.map((p) => p.providerName) ?? []),
+      ]),
+    ].filter(Boolean),
     staleExtraProviders: [...new Set(staleExtraProviders ?? [])].filter(Boolean),
     hermesToolGateways: [...hermesToolGateways],
     policy: {
@@ -192,12 +220,14 @@ export function resolveSandboxCreateIntent({
           ? { hostGpuAvailable: sandboxGpuConfig.hostGpuDetected }
           : {}),
         additionalPresets: [...hermesToolGateways],
-        ...(hostLocalInferenceRouteOnly ? { hostLocalInferenceRouteOnly: true as const } : {}),
+        ...(hostLocalInferenceRouteOnly || nativeLocalProviderAttachment
+          ? { hostLocalInferenceRouteOnly: true as const }
+          : {}),
         ...(agentName !== undefined ? { agentName } : {}),
         policyTier,
-        baselineExclusions: [...baselineExclusions].map((exclusion) => ({ ...exclusion })),
       },
     },
+    sandboxGpuDevice: sandboxGpuConfig.sandboxGpuDevice?.trim() || null,
     gpuCreateArgs: [...gpuCreateArgs],
     resourceCreateArgs: [...resourceCreateArgs],
     ...(hostMounts.length > 0

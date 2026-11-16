@@ -1,22 +1,52 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 
 import type { SandboxEntry } from "../../state/registry";
 import type { SandboxInferenceRouteHealth } from "./inference-route-health";
 import type { SandboxStatusPreflightResult } from "./status-preflight";
-import { collectSandboxStatusSnapshot, getSandboxStatusReport } from "./status-snapshot";
+import * as gatewayState from "./gateway-state";
+import * as gatewayIdentity from "../../onboard/gateway-binding/identity";
+import {
+  collectSandboxStatusSnapshot,
+  getSandboxStatusReport,
+  resolveSandboxStatusSessionGatewayName,
+  withUnlockedSandboxStatusRead,
+} from "./status-snapshot";
 
 const sandbox: SandboxEntry = {
   name: "alpha",
   agent: "openclaw",
-  policies: [],
   provider: "nvidia",
   model: "nvidia/nemotron",
   openshellDriver: "docker",
   dashboardPort: 18789,
 };
+
+describe("sandbox status session gateway", () => {
+  it.each([
+    [{ gatewayName: "nemoclaw-8091" }, "nemoclaw-8091"],
+    [{ gatewayPort: 8092 }, "nemoclaw-8092"],
+    [{}, "nemoclaw-9090"],
+  ] as const)(
+    "preserves recorded bindings and uses the selected gateway for %j",
+    (binding, expected) => {
+      const selected = vi
+        .spyOn(gatewayIdentity, "resolveGatewayName")
+        .mockReturnValue("nemoclaw-9090");
+      try {
+        expect(resolveSandboxStatusSessionGatewayName({ ...sandbox, ...binding })).toBe(expected);
+      } finally {
+        selected.mockRestore();
+      }
+    },
+  );
+});
 
 const stoppedPreflight: SandboxStatusPreflightResult = {
   failure: {
@@ -33,6 +63,12 @@ const clearPreflight: SandboxStatusPreflightResult = {
   failureLayer: null,
   suppressInferenceProbe: false,
   exitCode: 0,
+};
+
+const intentionalStopPreflight: SandboxStatusPreflightResult = {
+  ...clearPreflight,
+  intentionalStopConfirmed: true,
+  suppressInferenceProbe: true,
 };
 
 const conflictPreflight: SandboxStatusPreflightResult = {
@@ -55,6 +91,7 @@ const healthyRoute: SandboxInferenceRouteHealth = {
 function recoveredLookup() {
   return Promise.resolve({
     state: "present",
+    phase: "Ready",
     output: "Phase: Ready",
     recoveredSandbox: true,
     recoverySandboxVia: "started-stopped-original",
@@ -66,20 +103,151 @@ function snapshotDeps(recoveryResult: unknown) {
   const probeSandboxInferenceGatewayHealthImpl = vi.fn(async () => healthyRoute);
   return {
     getSandbox: () => sandbox,
-    listSandboxes: () => ({ sandboxes: [sandbox], defaultSandbox: sandbox.name }),
+    listPublishedSandboxesAcrossGatewayRoots: () => [sandbox],
+    listPublishedSandboxNamesAcrossGatewayRoots: () => [sandbox.name],
     reconcile: recoveredLookup,
-    captureOpenshellForStatusImpl: async () => {
-      throw new Error("live route lookup not needed");
+    inferenceRouteObserver: {
+      observeInferenceRoute: async () => {
+        throw new Error("live route lookup not needed");
+      },
     },
     probeProviderHealthImpl,
     probeSandboxInferenceGatewayHealthImpl,
-    probeSandboxInferenceInvocationImpl: vi.fn(() => ({ ok: true }) as const),
-    recoverSandboxProcesses: vi.fn(() => recoveryResult) as never,
+    probeSandboxInferenceInvocationImpl: vi.fn(async () => ({ ok: true }) as const),
+    recoverSandboxProcesses: vi.fn(async () => recoveryResult) as never,
   };
 }
 
 describe("collectSandboxStatusSnapshot Docker recovery", () => {
-  it("recovers the delivery chain when OpenShell already reports the restarted container (#7824)", async () => {
+  it("uses an explicit cross-root sandbox entry instead of the local registry fallback", async () => {
+    const crossRootSandbox: SandboxEntry = { ...sandbox, openshellDriver: "mxc" };
+    const getSandbox = vi.fn(() => null);
+    const reconcile = vi.fn(async () => ({
+      state: "present" as const,
+      phase: "Error",
+      output: "Phase: Error",
+    }));
+    const deps = {
+      ...snapshotDeps({
+        checked: false,
+        wasRunning: null,
+        recovered: false,
+        forwardRecovered: false,
+      }),
+      getSandbox,
+      reconcile,
+    };
+
+    const snapshot = await collectSandboxStatusSnapshot("alpha", {
+      deps,
+      sandboxEntry: crossRootSandbox,
+      suppressInferenceProbe: true,
+    });
+
+    expect(getSandbox).not.toHaveBeenCalled();
+    expect(reconcile).toHaveBeenCalledWith("alpha");
+    expect(snapshot.sb).toEqual(crossRootSandbox);
+    expect(snapshot.recordedRoute).toEqual({
+      provider: crossRootSandbox.provider,
+      model: crossRootSandbox.model,
+    });
+  });
+
+  it("clears stale stop intent in the cross-root registry that owns the sandbox", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-status-cross-root-"));
+    const registryDir = path.join(home, ".nemoclaw", "gateways", "8245");
+    const registryFile = path.join(registryDir, "sandboxes.json");
+    const crossRootSandbox: SandboxEntry = {
+      ...sandbox,
+      agent: "langchain-deepagents-code",
+      gatewayPort: 8245,
+      stopped: true,
+    };
+    fs.mkdirSync(registryDir, { recursive: true });
+    fs.writeFileSync(
+      registryFile,
+      JSON.stringify({
+        defaultSandbox: null,
+        defaultSelectionRevision: 1,
+        sandboxes: { alpha: crossRootSandbox },
+      }),
+    );
+    vi.stubEnv("HOME", home);
+
+    try {
+      const snapshot = await collectSandboxStatusSnapshot("alpha", {
+        sandboxEntry: crossRootSandbox,
+        preflight: clearPreflight,
+        deps: {
+          ...snapshotDeps({
+            checked: false,
+            wasRunning: null,
+            recovered: false,
+            forwardRecovered: false,
+          }),
+          reconcile: async () => ({
+            state: "present" as const,
+            phase: "Ready",
+            output: "Phase: Ready",
+          }),
+        },
+      });
+
+      const persisted = JSON.parse(fs.readFileSync(registryFile, "utf8")) as {
+        sandboxes: { alpha: SandboxEntry };
+      };
+      expect(snapshot.lookup.state).toBe("present");
+      expect(persisted.sandboxes.alpha.stopped).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps unlocked status observations free of gateway and recovery mutations (#11903)", async () => {
+    const lookup = {
+      state: "present" as const,
+      phase: "Ready",
+      output: "Phase: Ready",
+      recoveredSandbox: true,
+    };
+    const reconcile = vi
+      .spyOn(gatewayState, "getReconciledSandboxGatewayState")
+      .mockResolvedValue(lookup as never);
+    const { reconcile: _defaultReconcile, ...baseDeps } = snapshotDeps({
+      checked: true,
+      wasRunning: false,
+      recovered: true,
+      forwardRecovered: true,
+    });
+    const recordSandboxStopIntent = vi.fn(() => false);
+    const deps = { ...baseDeps, recordSandboxStopIntent };
+
+    try {
+      await withUnlockedSandboxStatusRead(() =>
+        collectSandboxStatusSnapshot("alpha", {
+          sandboxEntry: { ...sandbox, stopped: true },
+          preflight: clearPreflight,
+          suppressInferenceProbe: true,
+          deps,
+        }),
+      );
+
+      expect(reconcile).toHaveBeenCalledWith(
+        "alpha",
+        expect.objectContaining({
+          gatewayRecovery: "observe",
+          selectOwningGateway: false,
+        }),
+      );
+      expect(recordSandboxStopIntent).not.toHaveBeenCalled();
+      expect(deps.recoverSandboxProcesses).not.toHaveBeenCalled();
+    } finally {
+      reconcile.mockRestore();
+    }
+  });
+
+  it("leaves agent delivery recovery to the native image runtime", async () => {
     const deps = {
       ...snapshotDeps({
         checked: true,
@@ -90,55 +258,8 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
       reconcile: () =>
         Promise.resolve({
           state: "present" as const,
+          phase: "Ready",
           output: "Phase: Ready",
-        }),
-    };
-
-    const snapshot = await collectSandboxStatusSnapshot("alpha", { deps });
-
-    expect(deps.recoverSandboxProcesses).toHaveBeenCalledWith("alpha", { quiet: true });
-    expect(snapshot.lookup.state).toBe("present");
-  });
-
-  it("fails closed when the visible restarted container cannot recover OpenClaw (#7824)", async () => {
-    const deps = {
-      ...snapshotDeps({
-        checked: true,
-        wasRunning: false,
-        recovered: false,
-        forwardRecovered: false,
-      }),
-      reconcile: () =>
-        Promise.resolve({
-          state: "present" as const,
-          output: "Phase: Ready",
-        }),
-    };
-
-    const snapshot = await collectSandboxStatusSnapshot("alpha", { deps });
-
-    expect(snapshot.lookup.state).toBe("sandbox_recovery_failed");
-    expect(snapshot.lookup.output).toContain(
-      "Sandbox 'alpha' is present, but its agent delivery chain could not be proven",
-    );
-    expect(deps.probeSandboxInferenceGatewayHealthImpl).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    "Provisioning",
-    "Failed",
-  ])("keeps the existing %s phase diagnosis ahead of markerless recovery (#7824)", async (phase) => {
-    const deps = {
-      ...snapshotDeps({
-        checked: true,
-        wasRunning: false,
-        recovered: false,
-        forwardRecovered: false,
-      }),
-      reconcile: () =>
-        Promise.resolve({
-          state: "present" as const,
-          output: `Phase: ${phase}`,
         }),
     };
 
@@ -147,6 +268,53 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
     expect(deps.recoverSandboxProcesses).not.toHaveBeenCalled();
     expect(snapshot.lookup.state).toBe("present");
   });
+
+  it("does not reinterpret a ready sandbox when native recovery is unavailable", async () => {
+    const deps = {
+      ...snapshotDeps({
+        checked: true,
+        wasRunning: false,
+        recovered: false,
+        forwardRecovered: false,
+      }),
+      reconcile: () =>
+        Promise.resolve({
+          state: "present" as const,
+          phase: "Ready",
+          output: "Phase: Ready",
+        }),
+    };
+
+    const snapshot = await collectSandboxStatusSnapshot("alpha", { deps });
+
+    expect(deps.recoverSandboxProcesses).not.toHaveBeenCalled();
+    expect(snapshot.lookup.state).toBe("present");
+  });
+
+  it.each(["Provisioning", "Failed"])(
+    "keeps the existing %s phase diagnosis ahead of markerless recovery (#7824)",
+    async (phase) => {
+      const deps = {
+        ...snapshotDeps({
+          checked: true,
+          wasRunning: false,
+          recovered: false,
+          forwardRecovered: false,
+        }),
+        reconcile: () =>
+          Promise.resolve({
+            state: "present" as const,
+            phase,
+            output: `Phase: ${phase}`,
+          }),
+      };
+
+      const snapshot = await collectSandboxStatusSnapshot("alpha", { deps });
+
+      expect(deps.recoverSandboxProcesses).not.toHaveBeenCalled();
+      expect(snapshot.lookup.state).toBe("present");
+    },
+  );
 
   it("keeps a host preflight failure ahead of markerless recovery (#7824)", async () => {
     const deps = {
@@ -159,6 +327,7 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
       reconcile: () =>
         Promise.resolve({
           state: "present" as const,
+          phase: "Ready",
           output: "Phase: Ready",
         }),
     };
@@ -170,6 +339,33 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
 
     expect(deps.recoverSandboxProcesses).not.toHaveBeenCalled();
     expect(snapshot.lookup.state).toBe("present");
+  });
+
+  it("does not recover delivery after provider-confirmed intentional stop (#11025)", async () => {
+    const deps = {
+      ...snapshotDeps({
+        checked: true,
+        wasRunning: false,
+        recovered: true,
+        forwardRecovered: true,
+      }),
+      reconcile: () =>
+        Promise.resolve({
+          state: "present" as const,
+          phase: "Ready",
+          output: "Phase: Ready",
+        }),
+    };
+
+    const snapshot = await collectSandboxStatusSnapshot("alpha", {
+      deps,
+      preflight: intentionalStopPreflight,
+    });
+
+    expect(deps.recoverSandboxProcesses).not.toHaveBeenCalled();
+    expect(snapshot.lookup.state).toBe("present");
+    expect(snapshot.inferenceHealth).toBeNull();
+    expect(deps.probeSandboxInferenceGatewayHealthImpl).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -191,17 +387,6 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
         forwardRecovered: false,
         secretBoundaryRefused: true,
         secretBoundaryReason: "persisted secret boundary refused recovery",
-      },
-    ],
-    [
-      "mcp-reconciliation",
-      {
-        checked: true,
-        wasRunning: true,
-        recovered: false,
-        forwardRecovered: false,
-        mcpReconciliationRefused: true,
-        mcpReconciliationReason: "MCP intent mismatch",
       },
     ],
     [
@@ -255,7 +440,9 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
     const snapshot = await collectSandboxStatusSnapshot("alpha", { deps });
 
     expect(snapshot.lookup.state).toBe("present");
-    expect(deps.probeSandboxInferenceGatewayHealthImpl).toHaveBeenCalledWith("alpha");
+    expect(deps.probeSandboxInferenceGatewayHealthImpl).toHaveBeenCalledWith("alpha", {
+      gatewayName: "nemoclaw",
+    });
   });
 
   it("keeps a terminal runtime result neutral", async () => {
@@ -273,7 +460,46 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
   });
 });
 
-describe("getSandboxStatusReport Docker recovery preflight refresh", () => {
+describe("getSandboxStatusReport", () => {
+  it("uses cross-root sandbox authority for the JSON status report", async () => {
+    const crossRootSandbox: SandboxEntry = {
+      ...sandbox,
+      openshellDriver: "mxc",
+      gatewayPort: 19000,
+    };
+    const findSandboxAcrossGatewayRoots = vi.fn(() => ({
+      entry: crossRootSandbox,
+      gatewayPort: 19000,
+      registryFile: "/test/.nemoclaw-gateway-19000/sandboxes.json",
+    }));
+    const { getSandbox: _getSandbox, ...deps } = snapshotDeps({
+      checked: false,
+      wasRunning: null,
+      recovered: false,
+      forwardRecovered: false,
+    });
+
+    const report = await getSandboxStatusReport("alpha", {
+      ...deps,
+      findSandboxAcrossGatewayRoots,
+      getGatewayPresets: async () => [],
+      getSandboxStatusPreflightImpl: vi.fn(async () => clearPreflight),
+      reconcile: vi.fn(async () => ({
+        state: "present" as const,
+        phase: "Error",
+        output: "Phase: Error",
+      })),
+    });
+
+    expect(findSandboxAcrossGatewayRoots).toHaveBeenCalledWith("alpha");
+    expect(report.found).toBe(true);
+    expect(report.openshellDriver).toBe("mxc");
+    expect(report.recordedRoute).toEqual({
+      provider: crossRootSandbox.provider,
+      model: crossRootSandbox.model,
+    });
+  });
+
   it("clears a stale stopped-container preflight after successful recovery", async () => {
     const getSandboxStatusPreflightImpl = vi
       .fn()

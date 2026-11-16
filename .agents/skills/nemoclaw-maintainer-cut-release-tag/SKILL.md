@@ -1,6 +1,6 @@
 ---
 name: nemoclaw-maintainer-cut-release-tag
-description: Cuts one signed NemoClaw semver tag after required candidate checks and the maintainer's E2E decision. Use when preparing or publishing a vX.Y.Z release tag.
+description: "Prepare and cut one signed NemoClaw semver release tag, then follow release workflows and draft the Announcement."
 user_invocable: true
 ---
 
@@ -9,224 +9,62 @@ user_invocable: true
 
 # Cut Release Tag
 
-Cut one signed annotated semver tag from a generated plan. Use the release scripts for tag writes
-and `nemoclaw-maintainer-e2e` for maintainer-requested workflow dispatches. Do not improvise raw tag,
-push, version-bump, or other release-state GitHub writes.
+Cut one signed annotated semver tag from a generated plan. Use the release scripts for tag writes.
+Use [Run Maintainer E2E](../nemoclaw-maintainer-e2e/SKILL.md) for maintainer-requested workflow
+dispatches. Do not improvise tag, push, version-bump, or other release-state GitHub writes.
 
 Treat these as separate states:
 
-- **Tag can be cut:** all required documentation, image, and exact staging Launchable checks pass.
-  The release brief records the maintainer's general E2E decision and contains no unresolved prompts.
+- **Tag can be cut:** the release entry and required image checks pass.
+  The maintainer chooses to proceed with the displayed documentation coverage and general E2E state.
+  The release brief records both decisions and contains no unresolved prompts.
 - **Tag cut:** the remote signed tag exists and peels to the planned candidate.
-- **Post-tag work:** `latest`, release labels, public documentation, release images, `lkg`, and the Announcement
-  continue outside this skill. Do not wait for them here; some share a downstream workflow.
+- **Post-tag follow-through:** after reporting the tag as cut, continue the same task. Monitor
+  `latest`, release labels, public documentation, and release images. Draft the Announcement and
+  report `lkg` state.
 
 ## Hard Rules
 
-- Use the exact requested version. Generate the plan with `--version vX.Y.Z`; never infer a bump.
+- Use the requested version. Generate the plan with `--version vX.Y.Z`; never infer a bump.
 - Tag only the candidate captured in the plan.
-- Require the release entry and exact-candidate approved-empty Pi documentation result. They cannot
-  be waived.
+- By default, plan `origin/main` without an exception. For urgent QA qualification, a maintainer may
+  select a historical ancestor with `--candidate <full-sha> --exception <reason>`.
+- Require the release entry for a current-main plan. A historical plan records its explicit
+  release-entry exception in the signed release brief.
+- Treat documentation coverage as maintainer context, not a tag gate. Show the coverage point,
+  later commits and PRs, review and check state, changed paths, and open managed docs PRs.
+- Record the maintainer's documentation decision in the signed release brief.
 - Require applicable GHCR base and managed-image publication evidence.
-- Require a successful exact-candidate `Exact staging Brev Launchable` job. It must verify the
-  deployed image, baked runtime, hosted and sandbox inference, preinstalled full E2E suite, and
-  workspace cleanup. The general E2E decision cannot waive these requirements.
-- Treat general E2E as maintainer context, not a tag gate. Show the newest full E2E result and let the
+- Treat E2E as maintainer context, not a tag gate. Show the newest full E2E result and let the
   maintainer run focused tests, run the full suite, or proceed with the displayed status.
 - Record every displayed or requested E2E result and the decision in the release brief, the signed
   Markdown release record. Record a plain-language exception reason when the status is exceptional
   or a requested run remains unresolved.
-- Pass the exact final release brief to `release:cut` with `--message-file`. The file becomes the
+- Pass the final release brief to `release:cut` with `--message-file`. The file becomes the
   signed tag annotation; do not maintain another exception record.
 - Ask the maintainer to paste the plan's full confirmation phrase before cutting.
 - Push only the planned semver tag. Never push or move `latest` or `lkg` here.
+- Report the tag as cut immediately after remote readback. This report is a progress checkpoint, not
+  the final response.
+- Continue the same task through post-tag follow-through. Do not make a post-tag result a tag gate.
+- Ask before a workflow rerun. Never create a GitHub Discussion.
 - Never move, delete, or replace an existing remote semver tag unless the maintainer starts a
   protected-tag remediation.
 - Follow the [release-train policy](../nemoclaw-maintainer-policies/references/release-train.md) and
   the shared [Git and GitHub Access Hard Stop](../_shared/git-github-hard-stop.md).
 
-## Workflow
+## Work to the requested outcome
 
-Copy this checklist and update it as you work:
+- **Prepare:** follow [Prepare the Release](references/prepare-release.md) and its linked candidate
+  evidence. Start independent read-only checks early and prepare authorized documentation during
+  image waits. Keep the planned candidate immutable.
+- **Cut:** after the final brief is reviewable and the required confirmation is supplied, follow
+  [Cut and Follow Through](references/cut-and-follow-through.md). Its tag readback establishes tag success.
+- **Follow through:** continue the same task through automatic release workflows, the local
+  Announcement draft, and `lkg` classification using the same reference.
+- **Recover:** use [Recovery](references/recovery.md) for failed evidence or post-tag work. Retain the
+  specific rerun authorization and immutable-tag boundaries.
 
-```text
-Release tag:
-- [ ] 1. Generate the exact-version plan and release-brief template
-- [ ] 2. Verify required candidate evidence
-- [ ] 3. Show E2E context and record the maintainer's decision
-- [ ] 4. Finish and review the Markdown release brief
-- [ ] 5. Confirm, cut, and read back the signed tag
-```
-
-### 1. Generate the Plan and Brief Template
-
-Run:
-
-```bash
-npm run release:plan -- --version vX.Y.Z
-```
-
-The script writes `../nemoclaw-release-vX.Y.Z/plan.json`. Show the maintainer:
-
-- previous tag and peeled commit;
-- requested version;
-- candidate commit and headline;
-- exact range from the previous commit through the candidate; and
-- the full confirmation phrase derived from the version and candidate.
-
-After later reads of remote state, keep this candidate when all of these remain true:
-
-- the candidate is still an ancestor of `origin/main`;
-- the previous release tag still peels to the commit recorded in the plan;
-- the candidate's own documentation evidence remains valid; and
-- the candidate's own required evidence remains valid.
-
-New commits on `main` do not invalidate that plan. A managed documentation PR or branch for a later
-commit does not invalidate it either. Regenerate the plan only when the release range, version, or
-candidate must change.
-
-The plan is immutable once written. The helper creates the brief only when it is absent; fill that
-same brief in place. A same-version candidate change starts a new release workspace, such as
-`../nemoclaw-release-vX.Y.Z-replan-2/`. Never overwrite a plan or pair a new plan with an old brief.
-Pass that workspace explicitly:
-
-```bash
-npm run release:plan -- --version vX.Y.Z \
-  --output ../nemoclaw-release-vX.Y.Z-replan-2/plan.json
-```
-
-Use the returned plan directory for the brief and cutter commands that follow.
-
-Create the brief template now, before collecting evidence, so each result can be recorded as it is
-read:
-
-```bash
-node --experimental-strip-types --no-warnings \
-  .agents/skills/nemoclaw-maintainer-day/scripts/handoff-summary.ts \
-  --plan ../nemoclaw-release-vX.Y.Z/plan.json \
-  --output ../nemoclaw-release-vX.Y.Z/release-brief.md
-```
-
-The helper refuses to overwrite an existing brief. Fill this generated file in place; do not rerun
-the helper after evidence has been added.
-
-### 2. Verify Required Candidate Evidence
-
-Read and follow [Candidate Evidence](references/candidate-evidence.md). It owns the executable reads
-for the release entry, approved-empty Pi result, candidate-specific managed documentation state, applicable
-base-image verifier, and exact staging Launchable result.
-
-Do not offer the general E2E proceed option until every candidate-evidence check passes. Record the
-returned paths, URLs, run identities, and image identities in the release brief.
-
-The exact staging Launchable result is nonwaivable. A successful job retains
-`launchable-e2e.json`, `full-e2e.log`, and `cleanup.json`; the cleanup record exists only after the
-job confirms workspace absence. A preparation failure can produce no artifact. A later failure can
-retain only `lane.log` and the phase artifacts created before exit.
-
-### 3. Present General E2E and Ask for a Decision
-
-Use `nemoclaw-maintainer-e2e` to find the newest completed or active full E2E run. Show these details
-instead of reducing the run to one passing/failing label:
-
-- candidate SHA and full-run SHA;
-- status and conclusion;
-- workflow attempt, created, started, and last-updated timestamps, plus age at inspection;
-- workflow URL and `Release qualification` job URL; and
-- any failed, cancelled, skipped, queued, or still-running results.
-
-Offer exactly these choices:
-
-1. Run focused tests selected by the maintainer.
-2. Run the full suite.
-3. Proceed with the status as shown.
-
-After a requested run, show its same fields and add every result to the release brief. A requested
-run remains unresolved while it is queued or running, or after it ends without success. It becomes
-resolved only when a successful result covers the same requested scope.
-
-Use `Exceptions: None` only when the maintainer accepts a successful full result for the candidate
-and no requested run remains unresolved. Otherwise, ask for and record one concise plain-language
-reason. The reason must say what differs or remains unresolved and why the maintainer is proceeding.
-Selecting “Proceed with the status as shown” is the decision, not the reason. Stop and ask the
-maintainer why before continuing when a reason is required.
-This exception applies only to general E2E. It never covers documentation, required image evidence,
-or `Exact staging Brev Launchable`.
-
-### 4. Finish and Review the Release Brief
-
-Replace every `TODO_RELEASE_BRIEF` prompt in that Markdown file with:
-
-- the complete canonical release entry and its repository path;
-- Pi documentation workflow and job URLs, artifact name, and normalized approved-empty review;
-- exact-candidate E2E workflow, attempt, and successful `base-image-publication` job URL;
-- exact staging Brev workflow and job URLs, candidate SHA, producer run, concrete boot image,
-  baked-runtime identity, full E2E result, and workspace-cleanup result;
-- the newest full E2E result and every focused or full rerun result, including SHA, time, age, status,
-  conclusion, and URLs;
-- the maintainer's E2E choice; and
-- a final `Exceptions: None` line or `Exceptions: <plain-language reason>` line.
-
-Keep the helper's compact range counts and QA focus. Do not duplicate every commit or risky file;
-the canonical release entry and compare range already preserve that detail.
-
-Do not put secrets in the brief. Show the complete rendered file to the maintainer. Because this
-exact public Markdown becomes the signed tag annotation, make any correction in the file before
-asking for confirmation.
-
-### 5. Confirm, Cut, and Return
-
-Ask the maintainer to paste the plan's exact phrase:
-
-```text
-CONFIRM RELEASE vX.Y.Z <full-candidate-sha>
-```
-
-After receiving that exact phrase, run the self-contained
-[Final Documentation Recheck](references/candidate-evidence.md#final-documentation-recheck). It
-reads the candidate from the immutable plan again, so it does not depend on the Step 2 shell. Stop on
-a failed read or pending state, consume that confirmation, and request a new one after readiness is
-restored. Otherwise, run the cutter immediately; do not insert another wait between the reads and
-the push.
-
-Then run:
-
-```bash
-npm run release:cut -- \
-  --plan ../nemoclaw-release-vX.Y.Z/plan.json \
-  --message-file ../nemoclaw-release-vX.Y.Z/release-brief.md \
-  --confirm "CONFIRM RELEASE vX.Y.Z <full-candidate-sha>"
-```
-
-Require the script's remote readback to show that the signed annotated tag exists and peels to the
-planned candidate. Return immediately with the tag, candidate, plan path, brief path, and readback.
-
-Report any already-known `latest`, release-label, public-documentation, release-image, `lkg`, and Announcement
-state, and mark the rest pending or unknown. Do not poll. These states are separate from tag
-completion, but `latest` and label carry-forward share the release workflow. The tag-triggered image
-workflow performs a release rebuild and publication; it can fail after the tag is cut and can be
-retried without moving the semver tag. Do not call it promotion-only.
-
-## Recovery
-
-- Missing release entry or approved-empty Pi result: finish the candidate's documentation work and
-  obtain a successful exact-candidate run. Do not bypass it.
-- Candidate-specific documentation PR or branch exists: when the patch is required, merge it and generate a
-  new plan for the resulting commit. When maintainers reject the patch, close the PR, remove its
-  branch with the required repository authorization, and rerun exact-candidate documentation before
-  requesting a new confirmation.
-- Required GHCR evidence fails: repair and rerun only the affected image work. Do not replace it
-  with the general E2E proceed decision.
-- `Exact staging Brev Launchable` or its workspace cleanup fails: inspect the available `lane.log`,
-  `launchable-e2e.json`, `full-e2e.log`, and `cleanup.json` artifacts. Correct the failure and rerun
-  the Launchable job only while the candidate still equals `origin/main`. After `main` advances, a
-  new dispatch cannot test the older candidate; prepare and plan a new documented candidate instead.
-  Do not replace this evidence with the general E2E proceed decision.
-- General E2E is old, incomplete, failed, or from another SHA: show it and offer focused, full, or
-  proceed. Record the decision and reason in the brief.
-- Candidate is no longer on `origin/main`, the previous release changed, or the version is no longer
-  available: stop and generate a new plan.
-- Signing or access fails: report the exact error and follow the shared hard-stop guidance. Do not
-  improvise tag commands.
-- A post-tag workflow fails: report that state and its rerun path separately. Do not move the
-  already-published semver tag.
+The release confirmation protects a signed public tag. Do not apply that confirmation requirement
+to preliminary reads or already-authorized preparation. Report tag success as a progress checkpoint;
+report final completion only after the follow-through conditions are classified.

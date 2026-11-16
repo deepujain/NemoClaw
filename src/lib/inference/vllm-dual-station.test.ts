@@ -106,6 +106,7 @@ vi.mock("./vllm-api-key", () => ({
 }));
 
 import { detectVllmProfile, installVllm, persistConfiguredManagedVllmRuntimeReceipt } from "./vllm";
+import { mockDockerSpawnWithLogs } from "./vllm-install.test-support";
 import { DUAL_STATION_VLLM_RUNTIME, type DualStationVllmPlan } from "./vllm-station-cluster";
 import {
   createDualStationSshBindingFixture,
@@ -133,14 +134,26 @@ function plan(): DualStationVllmPlan {
       home: "/home/nvidia",
       uid: 1000,
       gid: 1000,
-      gpu: { index: 0, name: "NVIDIA GB300", uuid: "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" },
+      gpu: {
+        index: 0,
+        name: "NVIDIA GB300",
+        uuid: "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        totalMemoryMiB: 100_000,
+        freeMemoryMiB: 95_000,
+      },
     },
     peer: {
       hostname: "station-b",
       home: "/home/nvidia",
       uid: 1000,
       gid: 1000,
-      gpu: { index: 0, name: "NVIDIA GB300", uuid: "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" },
+      gpu: {
+        index: 0,
+        name: "NVIDIA GB300",
+        uuid: "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        totalMemoryMiB: 100_000,
+        freeMemoryMiB: 95_000,
+      },
     },
     rails: [
       {
@@ -471,7 +484,7 @@ describe("dual DGX Station vLLM install orchestration", () => {
     });
     mocks.probeCapability.mockImplementation(() => {
       capabilityCalls += 1;
-      expect(lifecycleActive).toBe(capabilityCalls === 2);
+      expect(lifecycleActive).toBe(capabilityCalls >= 2);
       return {
         kind: "ready",
         plan: clusterPlan,
@@ -515,7 +528,7 @@ describe("dual DGX Station vLLM install orchestration", () => {
     expect(mocks.persistRuntimeReceipt).toHaveBeenCalledWith(clusterPlan);
     expect(mocks.withLifecycle).toHaveBeenCalledTimes(2);
     expect(lifecycleActive).toBe(false);
-    expect(mocks.probeCapability).toHaveBeenCalledTimes(2);
+    expect(mocks.probeCapability).toHaveBeenCalledTimes(3);
     expect(mocks.stageModelSnapshot).toHaveBeenCalledWith(clusterPlan);
 
     const readinessArgs = mocks.runCurlProbe.mock.calls[0][0] as string[];
@@ -533,6 +546,93 @@ describe("dual DGX Station vLLM install orchestration", () => {
     expect(mocks.dockerSpawn.mock.calls[0][1].env.VLLM_API_KEY).toBeUndefined();
     expect(mocks.dockerSpawn.mock.calls[0][1].env.DOCKER_CONTEXT).toBe("default");
     expect(mocks.dockerImageInspectFormat.mock.calls[0][2].env.DOCKER_CONTEXT).toBe("default");
+  });
+
+  it("rejects a busy selected Station GPU before pulls, staging, or startup", async () => {
+    const clusterPlan = plan();
+    clusterPlan.peer.gpu.freeMemoryMiB = 89_000;
+    mocks.probeCapability.mockReturnValue({
+      kind: "ready",
+      plan: clusterPlan,
+      peerModelSnapshot: "staging-required",
+    });
+    const profile = detectVllmProfile({ platform: "station", type: "nvidia" });
+
+    await expect(
+      installVllm(profile!, { hasImage: true, nonInteractive: true, promptFn: vi.fn() }),
+    ).resolves.toEqual({ ok: false });
+
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("station-b"));
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("GPU-bbbbbbbb"));
+    expect(mocks.dockerPullWithProgressWatchdog).not.toHaveBeenCalled();
+    expect(mocks.preflightGpuRuntime).not.toHaveBeenCalled();
+    expect(mocks.dockerSpawn).not.toHaveBeenCalled();
+    expect(mocks.stageModelSnapshot).not.toHaveBeenCalled();
+    expect(mocks.startManaged).not.toHaveBeenCalled();
+  });
+
+  it("accepts volatile free-memory changes without treating them as topology changes", async () => {
+    const initialPlan = plan();
+    const stagedPlan = plan();
+    const launchPlan = plan();
+    stagedPlan.local.gpu.freeMemoryMiB = 94_000;
+    launchPlan.local.gpu.freeMemoryMiB = 93_000;
+    mocks.probeCapability
+      .mockReturnValueOnce({
+        kind: "ready",
+        plan: initialPlan,
+        peerModelSnapshot: "ready",
+      })
+      .mockReturnValueOnce({
+        kind: "ready",
+        plan: stagedPlan,
+        peerModelSnapshot: "ready",
+      })
+      .mockReturnValueOnce({
+        kind: "ready",
+        plan: launchPlan,
+        peerModelSnapshot: "ready",
+      });
+    const profile = detectVllmProfile({ platform: "station", type: "nvidia" });
+
+    await expect(
+      installVllm(profile!, { hasImage: true, nonInteractive: true, promptFn: vi.fn() }),
+    ).resolves.toEqual({ ok: true });
+
+    expect(mocks.startManaged).toHaveBeenCalledWith(launchPlan, { apiKey: API_KEY });
+    expect(mocks.persistRuntimeReceipt).toHaveBeenCalledWith(launchPlan);
+  });
+
+  it("refuses a busy final Station sample before key creation or launch", async () => {
+    const initialPlan = plan();
+    const stagedPlan = plan();
+    const launchPlan = plan();
+    launchPlan.peer.gpu.freeMemoryMiB = 89_000;
+    mocks.probeCapability
+      .mockReturnValueOnce({
+        kind: "ready",
+        plan: initialPlan,
+        peerModelSnapshot: "ready",
+      })
+      .mockReturnValueOnce({
+        kind: "ready",
+        plan: stagedPlan,
+        peerModelSnapshot: "ready",
+      })
+      .mockReturnValueOnce({
+        kind: "ready",
+        plan: launchPlan,
+        peerModelSnapshot: "ready",
+      });
+    const profile = detectVllmProfile({ platform: "station", type: "nvidia" });
+
+    await expect(
+      installVllm(profile!, { hasImage: true, nonInteractive: true, promptFn: vi.fn() }),
+    ).resolves.toEqual({ ok: false });
+
+    expect(mocks.ensureApiKey).not.toHaveBeenCalled();
+    expect(mocks.startManaged).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("station-b"));
   });
 
   it("rolls back a newly started pair when durable rollback state cannot be written", async () => {
@@ -604,7 +704,7 @@ describe("dual DGX Station vLLM install orchestration", () => {
         DUAL_STATION_VLLM_RUNTIME.modelRevision,
       ]),
     );
-    expect(mocks.probeCapability).toHaveBeenCalledTimes(2);
+    expect(mocks.probeCapability).toHaveBeenCalledTimes(3);
   });
 
   it("installs the public Nemotron Ultra model without an HF token", async () => {
@@ -623,7 +723,7 @@ describe("dual DGX Station vLLM install orchestration", () => {
       }),
     ).resolves.toEqual({ ok: true });
 
-    expect(mocks.probeCapability).toHaveBeenCalledTimes(2);
+    expect(mocks.probeCapability).toHaveBeenCalledTimes(3);
     expect(beforeInstall).toHaveBeenCalledWith("nemotron-ultra");
     expect(mocks.preflightOwnership).toHaveBeenCalled();
     expect(mocks.dockerSpawn).toHaveBeenCalled();
@@ -702,7 +802,7 @@ describe("dual DGX Station vLLM install orchestration", () => {
       mocks.stageModelSnapshot.mock.invocationCallOrder[0],
     );
     expect(mocks.startManaged.mock.invocationCallOrder[0]).toBeGreaterThan(
-      mocks.probeCapability.mock.invocationCallOrder[1],
+      mocks.probeCapability.mock.invocationCallOrder[2],
     );
   });
 
@@ -801,6 +901,61 @@ describe("dual DGX Station vLLM install orchestration", () => {
     );
   });
 
+  it("prints the redacted prior startup error before rolling back a crash loop (#14017)", async () => {
+    const profile = detectVllmProfile({ platform: "station", type: "nvidia" })!;
+    const startedAt = "2026-10-31T10:00:00.123456789Z";
+    const pipTail = Array.from(
+      { length: 79 },
+      (_, index) => `Requirement already satisfied: package-${String(index)}`,
+    ).concat("WARNING: Running pip as the 'root' user");
+    mocks.runCurlProbe.mockReturnValue({ ok: false, httpStatus: 503, message: "loading" });
+    mocks.dockerCapture.mockImplementation((args: readonly string[]) => {
+      switch (args[0]) {
+        case "ps":
+          return profile.containerName;
+        case "inspect":
+          return args[2]?.includes(".State.StartedAt") ? startedAt : "3";
+        case "logs":
+          return pipTail.join("\n");
+        default:
+          return "";
+      }
+    });
+    mocks.dockerSpawn.mockImplementation(
+      mockDockerSpawnWithLogs(
+        "2026-10-31T09:59:59.999999999Z \u001b[31mvllm: error: unrecognized arguments: --disable-log-requests\u001b[0m\n" +
+          `2026-10-31T09:59:59.999999999Z VLLM_API_KEY=${API_KEY}\u0007\u0000\n`,
+      ),
+    );
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    let diagnosticsAtRollback = "";
+    mocks.cleanup.mockImplementation(() => {
+      diagnosticsAtRollback = stderrSpy.mock.calls.map(([text]) => String(text)).join("");
+      return { ok: true, removedContainerIds: [HEAD_ID, WORKER_ID] };
+    });
+
+    try {
+      await expect(
+        installVllm(profile, { hasImage: true, nonInteractive: true, promptFn: vi.fn() }),
+      ).resolves.toEqual({ ok: false });
+
+      expect(mocks.cleanup).toHaveBeenCalledWith(plan());
+      expect(errorSpy).toHaveBeenCalledWith(
+        "  vLLM install failed: vLLM container restarted 3 times before readiness",
+      );
+      expect(diagnosticsAtRollback).toContain(
+        "vllm: error: unrecognized arguments: --disable-log-requests",
+      );
+      expect(diagnosticsAtRollback).toContain("Requirement already satisfied: package-78");
+      expect(diagnosticsAtRollback).toContain("WARNING: Running pip as the 'root' user");
+      expect(diagnosticsAtRollback).toContain("VLLM_API_KEY=");
+      expect(diagnosticsAtRollback).not.toContain(API_KEY);
+      expect(diagnosticsAtRollback).not.toMatch(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
   it("commits legacy retirement only after readiness, auth, and final pair validation", async () => {
     mocks.startManaged.mockReturnValue({
       ok: true,
@@ -864,29 +1019,29 @@ describe("dual DGX Station vLLM install orchestration", () => {
         }),
       expectedCommitCalls: 1,
     },
-  ])("restores legacy state when external $failure fails", async ({
-    configureFailure,
-    expectedCommitCalls,
-  }) => {
-    mocks.startManaged.mockReturnValue({
-      ok: true,
-      baseUrl: HEAD_BASE_URL,
-      headContainerId: HEAD_ID,
-      workerContainerId: WORKER_ID,
-      reusedExisting: false,
-      legacyMigration: LEGACY_MIGRATION,
-    });
-    configureFailure();
-    const profile = detectVllmProfile({ platform: "station", type: "nvidia" });
+  ])(
+    "restores legacy state when external $failure fails",
+    async ({ configureFailure, expectedCommitCalls }) => {
+      mocks.startManaged.mockReturnValue({
+        ok: true,
+        baseUrl: HEAD_BASE_URL,
+        headContainerId: HEAD_ID,
+        workerContainerId: WORKER_ID,
+        reusedExisting: false,
+        legacyMigration: LEGACY_MIGRATION,
+      });
+      configureFailure();
+      const profile = detectVllmProfile({ platform: "station", type: "nvidia" });
 
-    await expect(
-      installVllm(profile!, { hasImage: true, nonInteractive: true, promptFn: vi.fn() }),
-    ).resolves.toEqual({ ok: false });
+      await expect(
+        installVllm(profile!, { hasImage: true, nonInteractive: true, promptFn: vi.fn() }),
+      ).resolves.toEqual({ ok: false });
 
-    expect(mocks.rollbackLegacyMigration).toHaveBeenCalledWith(plan(), LEGACY_MIGRATION);
-    expect(mocks.cleanup).not.toHaveBeenCalled();
-    expect(mocks.commitLegacyMigration).toHaveBeenCalledTimes(expectedCommitCalls);
-  });
+      expect(mocks.rollbackLegacyMigration).toHaveBeenCalledWith(plan(), LEGACY_MIGRATION);
+      expect(mocks.cleanup).not.toHaveBeenCalled();
+      expect(mocks.commitLegacyMigration).toHaveBeenCalledTimes(expectedCommitCalls);
+    },
+  );
 
   it("rolls back a new pair when unauthenticated model inventory is exposed", async () => {
     mocks.runCurlProbe.mockImplementation((args: string[]) => ({

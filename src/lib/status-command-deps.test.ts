@@ -1,11 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import * as receiptAuthority from "./onboard/experimental/hermes-portable-receipt";
+import { GATEWAY_PORT } from "./core/ports";
+import { resolveGatewayName } from "./onboard/gateway-binding";
+import * as registry from "./state/registry";
 import { buildStatusCommandDeps } from "./status-command-deps";
 
 function writeExecutable(target: string, body: string): void {
@@ -27,12 +32,44 @@ describe("buildStatusCommandDeps", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     if (previousOverride === undefined) {
       delete process.env.NEMOCLAW_OPENSHELL_BIN;
     } else {
       process.env.NEMOCLAW_OPENSHELL_BIN = previousOverride;
     }
     fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("classifies copied Hermes authority for status before probe migration (#10423)", () => {
+    const classify = vi
+      .spyOn(receiptAuthority, "inspectPortableAgentReceiptAuthorityForClassification")
+      .mockReturnValue({
+        kind: "hermes",
+        snapshot: {
+          receipt: {
+            phase: "active",
+            sandboxName: "alpha",
+            gatewayName: "nemoclaw",
+            lifecycleGeneration: "generation-1",
+            openshellExecutableAuthority: { version: "0.0.106" },
+          },
+        } as never,
+      });
+    vi.spyOn(registry, "getSandbox").mockReturnValue({
+      name: "alpha",
+      agent: "hermes",
+      gatewayName: "nemoclaw",
+      gatewayPort: 8080,
+      lifecycleGeneration: "generation-1",
+      openshellDriver: "docker",
+      openshellVersion: "0.0.106",
+    } as never);
+
+    const deps = buildStatusCommandDeps(tmp);
+
+    expect(deps.getHermesPortablePhase?.("alpha")).toBe("active");
+    expect(classify).toHaveBeenCalledOnce();
   });
 
   it("detects Telegram conflict signatures from the gateway log", () => {
@@ -101,7 +138,41 @@ exit 0
     expect(deps.readGatewayLog?.("alpha")).toBeNull();
   });
 
-  it("parses live gateway inference through the OpenShell override", () => {
+  it.skipIf(process.platform !== "linux")(
+    "uses each status row's gateway instead of the selected registry root",
+    () => {
+      writeExecutable(openshell, "#!/usr/bin/env bash\nexit 0\n");
+      const sandboxName = `status-count-${process.pid}`;
+      const lookup = vi.spyOn(registry, "getSandbox").mockReturnValue(null);
+      const command = `openshell sandbox exec --name ${sandboxName} --tty -- /bin/bash -i`;
+      const selectedGateway = resolveGatewayName(GATEWAY_PORT);
+      const siblingGatewayPort = GATEWAY_PORT === 9090 ? 9091 : 9090;
+      const siblingGateway = resolveGatewayName(siblingGatewayPort);
+      const startSession = (gateway: string) =>
+        spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+          argv0: command,
+          env: { ...process.env, OPENSHELL_GATEWAY: gateway },
+          stdio: "ignore",
+        });
+      const selected = startSession(selectedGateway);
+      const sibling = startSession(siblingGateway);
+      const sibling2 = startSession(siblingGateway);
+      try {
+        const deps = buildStatusCommandDeps(tmp);
+        expect(
+          deps.getActiveSessionCount?.({ name: sandboxName, gatewayPort: siblingGatewayPort }),
+        ).toBe(2);
+        expect(deps.getActiveSessionCount?.({ name: sandboxName })).toBe(1);
+        expect(lookup).not.toHaveBeenCalled();
+      } finally {
+        selected.kill();
+        sibling.kill();
+        sibling2.kill();
+      }
+    },
+  );
+
+  it("parses live gateway inference through the OpenShell override", async () => {
     writeExecutable(
       openshell,
       `#!/usr/bin/env bash
@@ -118,7 +189,10 @@ exit 0
 
     const deps = buildStatusCommandDeps(tmp);
 
-    expect(deps.getLiveInference()).toEqual({ provider: "nvidia-prod", model: "nvidia/nemotron" });
+    await expect(deps.getLiveInference()).resolves.toEqual({
+      provider: "nvidia-prod",
+      model: "nvidia/nemotron",
+    });
     expect(fs.readFileSync(callsFile, "utf-8")).toContain("inference get");
   });
 });

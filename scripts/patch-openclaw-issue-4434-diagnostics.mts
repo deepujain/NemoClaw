@@ -1,9 +1,9 @@
-#!/usr/bin/env -S node --experimental-strip-types
+#!/usr/bin/env node
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 /*
- * Temporary NemoClaw compatibility shim for OpenClaw 2026.7.1 TUI error output.
+ * Temporary NemoClaw compatibility shim for OpenClaw 2026.9.1 TUI error output.
  * Remove this when upstream OpenClaw reports structured unreachable-inference
  * diagnostics for sandbox fetch failures and inference timeouts.
  */
@@ -48,7 +48,7 @@ function fail(message: string): never {
 
 function listJsFiles(dir: string): string[] {
   return (fs.readdirSync(dir, { withFileTypes: true }) as DirentLike[])
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
+    .filter((entry) => entry.isFile() && /\.m?js$/u.test(entry.name))
     .map((entry) => path.join(dir, entry.name));
 }
 

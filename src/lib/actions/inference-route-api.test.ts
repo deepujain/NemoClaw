@@ -39,9 +39,7 @@ function session(overrides: Partial<Session> = {}): Session {
     routerPid: null,
     routerCredentialHash: null,
     webSearchConfig: null,
-    policyPresets: null,
     messagingPlan: null,
-    migratedLegacyValueHashes: null,
     hermesToolGateways: null,
     gpuPassthrough: false,
     telegramConfig: null,
@@ -95,7 +93,7 @@ describe("readOpenClawPrimaryRouteApi", () => {
 });
 
 describe("resolveRuntimeInferenceApi", () => {
-  it("uses matching onboard session route API before config fallbacks", () => {
+  it("uses the current config route API before matching onboard history", () => {
     expect(
       resolve(
         {
@@ -106,6 +104,17 @@ describe("resolveRuntimeInferenceApi", () => {
             },
           },
         },
+        {
+          session: session({ preferredInferenceApi: "openai-completions" }),
+        },
+      ),
+    ).toBe("anthropic-messages");
+  });
+
+  it("uses matching onboard history only when current config has no route API", () => {
+    expect(
+      resolve(
+        {},
         {
           session: session({ preferredInferenceApi: "openai-completions" }),
         },

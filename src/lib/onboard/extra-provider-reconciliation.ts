@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { assertNoOpenShellGatewayEndpointOverride } from "../openshell-gateway-endpoint-guard";
-import { reportsExactProviderNotFound } from "./extra-provider-diagnostic-parser";
+import { isTavilyProviderProfileId } from "../inference/web-search/provider-profile";
+import type { OpenShellProviderAdapter } from "../adapters/openshell/provider-adapter";
+import { createCliOpenShellProviderAdapter } from "../adapters/openshell/provider-adapter-cli";
+import { namedOpenShellGateway } from "../adapters/openshell/sandbox-observer";
 
 type ExtraProviderRunOpenshell = (
   args: string[],
@@ -11,16 +13,19 @@ type ExtraProviderRunOpenshell = (
   status: number | null;
   error?: Error;
   output?: unknown;
-  stdout?: unknown;
-  stderr?: unknown;
+  stdout?: string | Buffer | null;
+  stderr?: string | Buffer | null;
 };
 
 export type ReconcileExtraProvidersDeps = {
   runOpenshell?: ExtraProviderRunOpenshell;
+  providerAdapter?: OpenShellProviderAdapter;
   listExtraProviders?: () => string[];
   removeExtraProvider?: (name: string) => boolean;
   nowMs?: () => number;
   warn?: (message: string) => void;
+  /** Null disables inheritance; omission preserves registration-only reconciliation. */
+  webSearchProvider?: "brave" | "tavily" | null;
 };
 
 export type ExtraProviderReconciliationPlan = {
@@ -31,11 +36,8 @@ export type ExtraProviderReconciliationPlan = {
 type IndeterminateProbeReason =
   | "aggregate-time-budget"
   | "ambiguous-diagnostic"
-  | "diagnostic-capture-limit"
   | "probe-process-error"
-  | "probe-threw"
-  | "timeout-or-signal"
-  | "unexpected-exit";
+  | "timeout-or-signal";
 
 function defaultRunOpenshell(
   args: string[],
@@ -67,15 +69,7 @@ function defaultRemoveExtraProvider(name: string): boolean {
   return removeExtraProvider(name);
 }
 
-function outputText(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (Buffer.isBuffer(value)) return value.toString();
-  if (Array.isArray(value)) return value.map(outputText).filter(Boolean).join("\n");
-  return value === null || value === undefined ? "" : String(value);
-}
-
 const PROVIDER_PROBE_TIMEOUT_MS = 5_000;
-const PROVIDER_PROBE_DIAGNOSTIC_LIMIT = 64 * 1024;
 const PROVIDER_RECONCILIATION_BUDGET_MS = 15_000;
 
 function monotonicNowMs(): number {
@@ -85,58 +79,52 @@ function monotonicNowMs(): number {
 type ProviderProbeOutcome = {
   keep: boolean;
   reason?: IndeterminateProbeReason;
+  excluded?: boolean;
 };
 
 type ProviderProbeContext = {
   gatewayName: string;
   name: string;
-  runOpenshell: ExtraProviderRunOpenshell;
+  providerAdapter: OpenShellProviderAdapter;
   nowMs: () => number;
   deadlineMs: number;
+  excludeTavily?: boolean;
 };
 
-function diagnosticPartsFromProbeResult(result: ReturnType<ExtraProviderRunOpenshell>): string[] {
-  const primaryDiagnosticParts = [result.stderr, result.stdout].map(outputText).filter(Boolean);
-  return primaryDiagnosticParts.length > 0
-    ? primaryDiagnosticParts
-    : [outputText(result.output)].filter(Boolean);
-}
-
-function probeExtraProvider(context: ProviderProbeContext): ProviderProbeOutcome {
+async function probeExtraProvider(context: ProviderProbeContext): Promise<ProviderProbeOutcome> {
   const remainingMs = context.deadlineMs - context.nowMs();
-  if (remainingMs <= 0) return { keep: true, reason: "aggregate-time-budget" };
-
-  let result: ReturnType<ExtraProviderRunOpenshell>;
-  try {
-    result = context.runOpenshell(["provider", "get", "-g", context.gatewayName, context.name], {
-      ignoreError: true,
-      maxBuffer: PROVIDER_PROBE_DIAGNOSTIC_LIMIT,
-      stdio: ["ignore", "pipe", "pipe"],
-      suppressOutput: true,
-      timeout: Math.max(1, Math.min(PROVIDER_PROBE_TIMEOUT_MS, Math.floor(remainingMs))),
-    });
-  } catch {
-    return { keep: true, reason: "probe-threw" };
+  if (remainingMs <= 0) {
+    if (context.excludeTavily)
+      throw new Error("Cannot verify disabled Tavily provider selection before sandbox creation.");
+    return { keep: true, reason: "aggregate-time-budget" };
   }
-  if (result.error) return { keep: true, reason: "probe-process-error" };
-  if (result.status === 0) return { keep: true };
-  // OpenShell CLI command errors use exit 1. A null status means timeout or
-  // signal termination, while any other exit is outside this diagnostic
-  // contract; both are indeterminate and must preserve the provider.
-  if (result.status === null) return { keep: true, reason: "timeout-or-signal" };
-  if (result.status !== 1) return { keep: true, reason: "unexpected-exit" };
 
-  const diagnosticParts = diagnosticPartsFromProbeResult(result);
-  if (diagnosticParts.some((part) => Buffer.byteLength(part) >= PROVIDER_PROBE_DIAGNOSTIC_LIMIT)) {
-    return { keep: true, reason: "diagnostic-capture-limit" };
+  const result = await context.providerAdapter.getProvider({
+    target: namedOpenShellGateway(context.gatewayName),
+    providerName: context.name,
+    timeoutMs: Math.max(1, Math.min(PROVIDER_PROBE_TIMEOUT_MS, Math.floor(remainingMs))),
+  });
+  if (result.ok) {
+    const excluded = context.excludeTavily === true && isTavilyProviderProfileId(result.value.type);
+    return { keep: !excluded, excluded };
   }
-  return reportsExactProviderNotFound(
-    diagnosticParts.join("\n"),
-    context.name,
-    PROVIDER_PROBE_DIAGNOSTIC_LIMIT,
-  )
-    ? { keep: false }
-    : { keep: true, reason: "ambiguous-diagnostic" };
+  if (
+    result.error.kind === "validation" ||
+    (result.error.kind === "transport" && result.error.reason === "identity_mismatch")
+  ) {
+    throw new Error(result.error.message);
+  }
+  if (result.error.kind === "command" && result.error.reason === "not_found") {
+    return { keep: false };
+  }
+  if (context.excludeTavily) {
+    throw new Error("Cannot verify disabled Tavily provider selection before sandbox creation.");
+  }
+  if (result.error.kind === "timeout") return { keep: true, reason: "timeout-or-signal" };
+  if (result.error.kind === "transport" && result.error.reason === "process_start") {
+    return { keep: true, reason: "probe-process-error" };
+  }
+  return { keep: true, reason: "ambiguous-diagnostic" };
 }
 
 /**
@@ -157,18 +145,18 @@ function probeExtraProvider(context: ProviderProbeContext): ProviderProbeOutcome
  * Removal condition: delete this defensive prune once OpenShell/NemoClaw gateway
  * reset owns extra-provider lifecycle cleanup before sandbox creation (#6501).
  */
-export function planRegisteredExtraProviders(
+export async function planRegisteredExtraProviders(
   gatewayName: string,
   deps: ReconcileExtraProvidersDeps = {},
-): ExtraProviderReconciliationPlan {
+): Promise<ExtraProviderReconciliationPlan> {
   const recorded = (deps.listExtraProviders ?? defaultListExtraProviders)();
   if (recorded.length === 0) {
     return { extraProviders: [], staleExtraProviders: [] };
   }
   if (!gatewayName) throw new Error("OpenShell gateway name is required.");
-  assertNoOpenShellGatewayEndpointOverride();
-
   const runOpenshell = deps.runOpenshell ?? defaultRunOpenshell;
+  const providerAdapter =
+    deps.providerAdapter ?? createCliOpenShellProviderAdapter({ run: runOpenshell });
   const nowMs = deps.nowMs ?? monotonicNowMs;
   const warn = deps.warn ?? ((message: string) => console.warn(message));
   const deadlineMs = nowMs() + PROVIDER_RECONCILIATION_BUDGET_MS;
@@ -183,17 +171,18 @@ export function planRegisteredExtraProviders(
   const reconciled: string[] = [];
   const staleExtraProviders: string[] = [];
   for (const name of recorded) {
-    const outcome = probeExtraProvider({
+    const outcome = await probeExtraProvider({
       gatewayName,
       name,
-      runOpenshell,
+      providerAdapter,
       nowMs,
       deadlineMs,
+      excludeTavily: deps.webSearchProvider !== undefined && deps.webSearchProvider !== "tavily",
     });
     if (outcome.reason) recordIndeterminate(outcome.reason);
     if (outcome.keep) {
       reconciled.push(name);
-    } else {
+    } else if (!outcome.excluded) {
       staleExtraProviders.push(name);
     }
   }
@@ -215,14 +204,4 @@ export function applyExtraProviderReconciliation(
 ): void {
   const removeExtraProvider = deps.removeExtraProvider ?? defaultRemoveExtraProvider;
   for (const name of plan.staleExtraProviders) removeExtraProvider(name);
-}
-
-export function reconcileRegisteredExtraProviders(
-  gatewayName: string,
-  deps: ReconcileExtraProvidersDeps = {},
-): string[] {
-  // Compatibility wrapper for focused #6501 tests; remove with that defensive prune.
-  const plan = planRegisteredExtraProviders(gatewayName, deps);
-  applyExtraProviderReconciliation(plan, deps);
-  return [...plan.extraProviders];
 }
